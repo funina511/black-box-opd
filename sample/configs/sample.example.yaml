@@ -1,0 +1,89 @@
+# Sample / data-preparation configuration (example).
+#
+# Copy to a real path and fill in the local paths. Every path is required unless
+# marked optional; the pipeline preflight reports missing values instead of
+# silently falling back to a default.
+
+# --- DAPO prompt source -----------------------------------------------------
+prompts:
+  # Reuse an already downloaded file (fastest, reproducible). Leave empty to
+  # download from HuggingFace with the pinned revision below.
+  input_parquet: ""
+  repo_id: BytedTsinghua-SIA/DAPO-Math-17k
+  filename: data/dapo-math-17k.parquet
+  revision: 65877096c24ffa7abc4e4fa5edb95cf3413a5674
+  # DAPO ships ~100 copies of every problem; the de-duplicated count is expected
+  # to be 17917 and the run fails when it is not (guards against a changed file).
+  expected_unique: 17917
+  on_conflict: error           # error | keep-first | drop
+  seed: 42
+  dev_size: 512                # held out as the dev monitor set
+  out_dir: /abs/path/data/dapo_all_v1
+  # Set true for the CARD "full train" comparison: every unique problem goes to
+  # train and the dev set must be supplied through dev_file.
+  card_full_train: false
+  dev_file: ""
+
+# --- Teacher sampling -------------------------------------------------------
+teacher:
+  # openai       : talk to an OpenAI-compatible server (scripts/serve_teacher.sh).
+  # vllm_offline : load the teacher inside the sampler - one process, no port and
+  #                no server to keep alive (recommended when the weights live on
+  #                this machine and prolonged sessions / sudo are not available).
+  engine: openai
+  # --- engine: openai ---
+  base_url: http://127.0.0.1:18080/v1
+  api_key_env: GAD_TEACHER_API_KEY
+  model: Qwen3-30B-A3B-Instruct-2507
+  concurrency: 16
+  timeout: 600
+  retries: 3
+  # --- engine: vllm_offline ---
+  model_path: /abs/path/models/Qwen3-30B-A3B-Instruct-2507
+  tensor_parallel_size: 4
+  max_model_len: 12288           # must cover prompt + max_tokens
+  gpu_memory_utilization: 0.90
+  dtype: bfloat16
+  batch_size: 128                # prompts per llm.generate call (throughput only)
+  gpus: "1,2,3,4"                # CUDA_VISIBLE_DEVICES for the sampler process
+  enforce_eager: false
+  # --- shared ---
+  m: 4                          # answers per prompt (CARD uses 4)
+  temperature: 0.7
+  top_p: 0.95
+  max_tokens: 8192
+  enable_thinking: false         # forwarded as chat_template_kwargs.enable_thinking
+  # Sampling goes to the *teacher*; the student template switch must match what
+  # the three training stages use, otherwise the distillation pairs differ.
+  index_out: /abs/path/data/dapo_all_v1/teacher_index.jsonl
+  # stdout/stderr of the sampler (and of the in-process vLLM workers) go here, so
+  # an unread terminal can never block the run with a full pty buffer.
+  log_file: /abs/path/data/dapo_all_v1/logs/sample.log
+  log_every: 100
+
+# --- GAD training data ------------------------------------------------------
+gad_data:
+  select: all                  # all | correct (all = keep every prompt with a teacher answer,
+                               #   the ablation pool; correct = keep only teacher-correct prompts,
+                               #   which is the original's correct-nontruncated pool)
+  select_val: all              # dev/monitor split; the original leaves its val set unfiltered
+  out_train: /abs/path/data/dapo_all_v1/gad_train.parquet
+  out_val: /abs/path/data/dapo_all_v1/gad_dev.parquet
+
+# --- Model / tokenizer used for length statistics ---------------------------
+student:
+  model_path: /abs/path/models/Qwen3-8B
+  tokenizer_path: /abs/path/models/Qwen3-8B
+  enable_thinking: false
+
+# --- Length budget (must match the training config) -------------------------
+lengths:
+  max_prompt_length: 2048
+  max_response_length: 8192
+
+# --- External evaluation sets ----------------------------------------------
+eval:
+  sources_json: configs/eval_sources.example.json
+  out_dir: /abs/path/data/math_eval
+  benchmarks: aime24,aime25,amc23,amc24,math500
+  strict: false

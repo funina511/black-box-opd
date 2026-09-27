@@ -1,0 +1,15 @@
+# Runtime dependencies of the sampling / data-preparation package.
+#
+# This package is deliberately independent from CARD and from the three GAD
+# training backends: it never imports CARD, never imports `verl`, and does not
+# require the CARD directory on PYTHONPATH. Install into the same interpreter
+# that will run the sampling job (teacher serving may use a different one).
+pyarrow>=15.0
+datasets>=2.19
+huggingface_hub>=0.23
+transformers>=4.51
+openai>=1.40
+# `vllm` is only needed for the in-process backend (--backend vllm-offline); it is
+# deliberately NOT listed here so the CPU-only data-contract tests stay light. Use the
+# same vLLM version as the training environment.
+PyYAML>=6.0

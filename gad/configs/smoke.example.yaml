@@ -1,0 +1,66 @@
+# =============================================================================
+# GPU smoke-test configuration (example)
+# =============================================================================
+# Purpose: prove the plumbing on real GPUs *before* a long run:
+#   * SeqKD/Warmup cross the original actor-update gate (critic_warmup = 10),
+#   * the Warmup discriminator really updates,
+#   * the Warmup -> GAD handoff and the S -> S+K step continuation work,
+#   * GAD performs real GRPO updates with finite loss/gradients,
+#   * a real long-sequence batch is exercised (not just a 512-token toy).
+#
+# Use the synthetic dataset for the plumbing check
+#   python LMOps/sample/make_smoke_data.py --prompt-parquet <train.parquet> \
+#       --dev-parquet <dev.parquet> --out-dir /abs/path/smoke_data --prompts 64
+# or a small real subset (preferred before a paper run).
+#
+# Budgets: warmup_steps must be > optim.critic_warmup (10) so the actor update
+# path is actually exercised; 14 gives four post-gate steps.
+# =============================================================================
+
+run:
+  output_root: /abs/path/runs/smoke
+  run_id: auto
+  python_bin: /abs/path/envs/gad/bin/python
+  log_backend: console
+  eval_after_train: false
+
+models:
+  student: /abs/path/models/Qwen3-0.6B        # small model for a fast smoke test
+  discriminator_init: /abs/path/models/Qwen3-0.6B
+
+data:
+  train_file: /abs/path/smoke_data/train.parquet
+  val_file: /abs/path/smoke_data/dev.parquet
+  prompt_key: content
+  teacher_index: /abs/path/smoke_data/teacher_index.jsonl
+  manifest: /abs/path/smoke_data/manifest.json
+  # Real math lengths start at prompt 2048 / response 8192; for the first smoke
+  # pass use a smaller response cap to fit memory, then repeat with the real cap.
+  max_prompt_length: 1024
+  max_response_length: 1024
+  train_batch_size: 8
+  val_batch_size: 8
+
+rollout:
+  n: 4                                  # n=8 in a real run
+  temperature: 0.8
+  tensor_model_parallel_size: 1
+  gpu_memory_utilization: 0.5
+  enable_thinking: false
+
+budget:
+  seqkd_steps: 12                       # cross the critic_warmup=10 gate
+  warmup_steps: 14                      # 10 gated steps + 4 actor updates
+  gad_steps: 4                          # S=14 -> stop at 18
+
+optim:
+  critic_warmup: 10
+
+resources:
+  n_gpus_per_node: 1
+  nnodes: 1
+  save_freq: 4
+  test_freq: 4
+
+eval:
+  enabled: false

@@ -1,0 +1,117 @@
+# Independent 0.6B / 5k exploration config. The 1.7B run is untouched.
+# Train subset: 5,000 UIDs sampled without replacement from gad_train.parquet, seed 42.
+# Shared held-out dev, quick_dev and teacher index come from the 17k preparation.
+# batch=64 gives 78 steps/epoch (8 rows dropped each epoch).
+# SeqKD: 156 steps; Warmup: 78; GAD: global step 78 -> 156 (78 updates).
+# GAD stage_epochs=2 is an absolute global target, not two additional GAD epochs.
+# Run only after the current 1.7B job frees GPUs 1,2,3,4.
+
+run:
+  output_root: ../../runs/gad_qwen3_0.6b_5k
+  run_id: qwen3-0.6b-5k-seed42-n2
+  python_bin: /mnt/jinbo/miniconda3/envs/gad/bin/python
+  log_backend: console
+  eval_after_train: false
+  skip_completed_stages: true
+  val_before_train: false
+  resume_worker_state: false
+  pytorch_cuda_alloc_conf: ''
+backends:
+  source_repo: ../../gad/verl
+  root: ../../gad/.backends
+models:
+  student: /mnt/jinbo/RLRM/model/Qwen/Qwen3-0.6B
+  discriminator_init: /mnt/jinbo/RLRM/model/Qwen/Qwen3-0.6B
+  trust_remote_code: true
+  use_remove_padding: true
+  enable_gradient_checkpointing: true
+  param_offload: true
+  optimizer_offload: true
+  ref_param_offload: true
+data:
+  train_file: ../../data/dapo_math_5k_gad/gad_train.parquet
+  val_file: ../../data/dapo_math_17k_gad/gad_dev.parquet
+  prompt_key: content
+  teacher_index: ../../data/dapo_math_17k_gad/teacher_index.jsonl
+  manifest: ../../data/dapo_math_5k_gad/manifest.json
+  expected_fingerprint_digest: 40d9199b0a66f34f8fb180725ef1b5e7f1c305f4f4fde628da3be55dd3ae2035
+  max_prompt_length: 2048
+  max_response_length: 8192
+  truncation: right
+  train_batch_size: 64
+  val_batch_size: 64
+rollout:
+  name: vllm
+  n: 2
+  n_seqkd: 1
+  n_warmup: 1
+  temperature: 0.8
+  top_p: 1.0
+  tensor_model_parallel_size: 1
+  gpu_memory_utilization: 0.55
+  max_model_len: null
+  max_num_batched_tokens: null
+  max_num_seqs: 128
+  enforce_eager: true
+  free_cache_engine: false
+  val_n: 1
+  val_do_sample: false
+  val_temperature: 0.0
+  enable_thinking: false
+  thinking_control: true
+budget:
+  stage_epochs:
+    seqkd: 2
+    warmup: 1
+    gad: 2
+  seqkd_steps: 200
+  warmup_steps: 800
+  gad_steps: 200
+  epochs_override: null
+  handoff_step: null
+optim:
+  seqkd_actor_lr: 5.0e-06
+  warmup_actor_lr: 1.0e-06
+  warmup_critic_lr: 1.0e-06
+  gad_actor_lr: 1.0e-06
+  gad_critic_lr: 1.0e-06
+  grad_clip: 0.2
+  kl_loss_coef: 0.001
+  kl_loss_type: low_var_kl
+  entropy_coeff: 0.0
+  critic_warmup: 10
+  critic_dynamic_bsz: false
+  critic_micro_batch_size_per_gpu: 1
+  actor_ppo_max_token_len_per_gpu: 10240
+  critic_ppo_max_token_len_per_gpu: 12288
+resources:
+  n_gpus_per_node: 4
+  nnodes: 1
+  gpus: 1,2,3,4
+  save_freq: 50
+  test_freq: 200
+  max_actor_ckpt_to_keep: null
+  max_critic_ckpt_to_keep: null
+eval:
+  enabled: false
+  parquet: ../../assets/datasets/math_eval/test.parquet
+  benchmarks: aime24,aime25,amc23,amc24,math500
+  n: 8
+  math500_n: 2
+  temperature: 1.0
+  top_p: 0.95
+  max_tokens: 16384
+  max_model_len: 20480
+  tensor_parallel_size: 1
+  gpu_memory_utilization: 0.85
+  backend: vllm
+  dev_n: 1
+  dev_do_sample: false
+validation:
+  scorer_path: ''
+  require_math_metrics: true
+  quick_size: 128
+  quick_seed: 42
+  final_full: true
+  quick_enabled: true
+  quick_file: ../../data/dapo_math_17k_gad/quick_dev.parquet

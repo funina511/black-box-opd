@@ -1,0 +1,11 @@
+# Offline data production package: caches and local outputs only.
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local data artifacts (configs point at explicit absolute paths, so nothing
+# produced by a real run should ever land inside the repository).
+data/
+*.parquet
+*.jsonl
+!configs/*.json

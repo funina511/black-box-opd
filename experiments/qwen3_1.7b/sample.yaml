@@ -1,0 +1,77 @@
+# =============================================================================
+# sample config -- Qwen3-30B-A3B-Instruct-2507 teacher, Qwen3-1.7B student
+# Target box: 8x RTX 3090 24GB (this run uses 4 cards, ids 1,2,3,4)
+#
+# Teacher IN-PROCESS (engine: vllm_offline): one command, one process, no
+# server, no port, no sudo, and the log goes to a file so a closed terminal
+# can never block the run. Detach it with:
+#   setsid nohup bash /mnt/jinbo/RLRM/LMOps/scripts/sample.sh \
+#     --stage sample \
+#     > /dev/null 2>&1 < /dev/null &
+#   tail -f /mnt/jinbo/RLRM/LMOps/data/dapo_math_17k_gad/logs/sample.log
+#
+# Stages: prompts -> sample -> convert(=convert_train+convert_dev) -> validate [-> eval]
+# =============================================================================
+prompts:
+  input_parquet: ../../assets/datasets/dapo_math_17k/data/dapo-math-17k.parquet
+  repo_id: BytedTsinghua-SIA/DAPO-Math-17k
+  filename: data/dapo-math-17k.parquet
+  revision: 65877096c24ffa7abc4e4fa5edb95cf3413a5674
+  expected_unique: 17917
+  on_conflict: error
+  seed: 42
+  dev_size: 512
+  out_dir: ../../data/dapo_math_17k_gad
+  card_full_train: false
+  dev_file: ''
+teacher:
+  base_url: http://127.0.0.1:18080/v1
+  api_key_env: GAD_TEACHER_API_KEY
+  model: Qwen3-30B-A3B-Instruct-2507
+  m: 1
+  temperature: 0.7
+  top_p: 0.95
+  max_tokens: 8192
+  concurrency: 12
+  timeout: 600
+  retries: 3
+  enable_thinking: false
+  index_out: ../../data/dapo_math_17k_gad/teacher_index.jsonl
+  engine: vllm_offline
+  model_path: ../../assets/models/teacher
+  tensor_parallel_size: 4
+  max_model_len: 12288
+  gpu_memory_utilization: 0.9
+  dtype: bfloat16
+  batch_size: 128
+  gpus: 1,2,3,4
+  enforce_eager: false
+  log_file: ../../data/dapo_math_17k_gad/logs/sample.log
+  log_every: 100
+gad_data:
+  # 教师池口径（原版 scripts/train/_dapo_common.sh 的 TEACHER_SELECTION）：
+  #   all                  = 保留所有有教师回答的 prompt（原版 selection=all，消融口径，默认）
+  #   nontruncated         = all 里再去掉采样器标记为截断的回答
+  #   correct              = 只保留教师答对的 prompt
+  #   correct-nontruncated = 答对且未截断（**就是原版 selection=correct-nontruncated 本身**）
+  # 本索引实测（17,405 条训练 prompt）：
+  #   all 17405 / nontruncated 14913（丢 2492 截断）/ correct 10995（丢 6410 答错）
+  #   / correct-nontruncated 10987（丢 6410 答错 + 8 条答对但截断）
+  # 换 select 只需重跑 convert（CPU，约 1 分钟；索引与指纹不变）。
+  select: all
+  # dev/监控集口径单独控制：原版的验证集是不筛的，所以默认 all。
+  select_val: all
+  out_train: ../../data/dapo_math_17k_gad/gad_train.parquet
+  out_val: ../../data/dapo_math_17k_gad/gad_dev.parquet
+student:
+  model_path: ../../assets/models/student
+  tokenizer_path: ../../assets/models/student
+  enable_thinking: false
+lengths:
+  max_prompt_length: 2048
+  max_response_length: 8192
+eval:
+  sources_json: ../../sample/configs/eval_sources.example.json
+  out_dir: ''
+  benchmarks: aime24,aime25,amc23,amc24,math500
+  strict: false

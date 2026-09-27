@@ -1,0 +1,13 @@
+# Only performance overrides. All other settings come from ../train.yaml.
+baseline: {}
+kv50:
+  rollout.gpu_memory_utilization: 0.50
+micro2:
+  optim.critic_dynamic_bsz: false
+  optim.critic_micro_batch_size_per_gpu: 2
+kv50_micro2:
+  rollout.gpu_memory_utilization: 0.50
+  optim.critic_dynamic_bsz: false
+  optim.critic_micro_batch_size_per_gpu: 2
+kv55:
+  rollout.gpu_memory_utilization: 0.55

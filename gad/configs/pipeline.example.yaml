@@ -1,0 +1,129 @@
+# =============================================================================
+# GAD three-stage pipeline configuration (example)
+# =============================================================================
+# Copy this file outside the repo, fill in the absolute paths and run:
+#
+#   bash LMOps/gad/scripts/pipeline/run_all.sh --config /abs/path/run.yaml --dry-run
+#   bash LMOps/gad/scripts/pipeline/run_all.sh --config /abs/path/run.yaml
+#
+# Required keys (everything else has a default and is documented below):
+#   run.output_root, models.student, data.train_file, data.val_file,
+#   data.train_batch_size
+#
+# Budgets are expressed in *additional* optimizer steps per stage. SeqKD never
+# feeds Warmup; Warmup starts from the initial student; GAD continues from the
+# Warmup actor/critic and resumes the Warmup global step S, so `gad_steps = K`
+# means the run stops at S+K.
+# =============================================================================
+
+run:
+  output_root: /abs/path/runs            # each run gets its own <output_root>/<run_id>
+  run_id: auto                           # "auto" -> gad-YYYYmmdd-HHMMSS
+  python_bin: /abs/path/envs/gad/bin/python   # interpreter with torch/ray/vllm/verl deps
+  log_backend: console                   # console | console,wandb
+  wandb_project: ""                      # only used when wandb is in log_backend; credentials come from the env
+  eval_after_train: false                # run tools/evaluate_math.py on the final actor when the pipeline ends
+  skip_completed_stages: true            # skip a stage only when config + input signatures still match
+  val_before_train: true
+  resume_worker_state: false             # true => GAD restores optimizer/scheduler/RNG (requires the resume patch)
+
+backends:
+  source_repo: /abs/path/LMOps/gad/verl  # the pinned verl clone (source of the worktrees)
+  root: /abs/path/LMOps/gad/.backends    # where the per-stage detached worktrees are created
+  pins: {}                               # optional: {seqkd: {branch: ..., commit: ...}}
+  recreate: false                        # true => rebuild a worktree that is at the wrong commit
+
+models:
+  student: /abs/path/models/Qwen3-8B     # initial student (SeqKD + Warmup actor init)
+  discriminator_init: /abs/path/models/Qwen3-8B   # Warmup critic init; defaults to models.student
+  trust_remote_code: true
+  use_remove_padding: true
+  enable_gradient_checkpointing: true
+  param_offload: false                   # set true to fit actor+critic+ref+vLLM on smaller GPUs
+  optimizer_offload: false
+
+data:
+  train_file: /abs/path/data/dapo_all_v1/gad_train.parquet
+  val_file: /abs/path/data/dapo_all_v1/gad_dev.parquet
+  prompt_key: content                    # the GAD parquet contract uses `content`
+  teacher_index: /abs/path/data/dapo_all_v1/teacher_index.jsonl
+  # optional: the sampling manifest produced by LMOps/sample (recorded in run_summary.json)
+  manifest: /abs/path/data/dapo_all_v1/manifest.json
+  expected_fingerprint_digest: ""        # optional: pin the sampling fingerprint recorded in the index header
+  max_prompt_length: 2048                # CARD-aligned starting point for math
+  max_response_length: 8192              # student/rollout/discriminator must fit >= 10240 total context
+  truncation: right
+  train_batch_size: 32                   # must divide evenly across GPUs for GRPO grouping
+  val_batch_size: null                   # null => the whole dev set in one validation batch
+
+rollout:
+  name: vllm
+  n: 8                                   # original GAD setting
+  temperature: 0.8                       # original GAD setting
+  top_p: 1.0
+  tensor_model_parallel_size: 2
+  gpu_memory_utilization: 0.7
+  enforce_eager: false
+  free_cache_engine: false
+  val_n: 1                               # deterministic dev monitor
+  val_do_sample: false
+  val_temperature: 0.0
+  enable_thinking: false                 # CARD-aligned thinking switch
+  thinking_control: true                 # false => do not forward the switch at all (documented divergence)
+
+budget:
+  seqkd_steps: 200                       # additional steps for the independent SeqKD baseline
+  warmup_steps: 800                      # README default: 1 epoch over the LMSYS-scale set; set to match your data
+  gad_steps: 200                         # additional steps on top of the Warmup step S
+  epochs_override: null                  # optional: {seqkd: 4, warmup: 2, gad: 4} to force the original epoch counts
+  handoff_step: null                     # optional: force a specific Warmup step instead of the last complete one
+
+optim:
+  seqkd_actor_lr: 5.0e-6                 # original SeqKD script
+  warmup_actor_lr: 1.0e-6                # original Warmup script
+  warmup_critic_lr: 1.0e-6
+  gad_actor_lr: 1.0e-6                   # original GAD script
+  gad_critic_lr: 1.0e-6
+  grad_clip: 0.2
+  kl_loss_coef: 0.001                    # Warmup/GAD actor KL; SeqKD forces 0
+  kl_loss_type: low_var_kl
+  entropy_coeff: 0.0
+  critic_warmup: 10                      # original gate: SeqKD/Warmup 10, GAD 0
+  actor_ppo_max_token_len_per_gpu: 12288
+  critic_ppo_max_token_len_per_gpu: 12288
+
+resources:
+  n_gpus_per_node: 8
+  nnodes: 1                              # multi-node is a separate verification item, not assumed to work
+  gpus: ""                               # optional CUDA_VISIBLE_DEVICES, e.g. "0,1,2,3"
+  save_freq: 50
+  test_freq: 50
+  max_actor_ckpt_to_keep: null           # null keeps every checkpoint (needed for a clean handoff)
+  max_critic_ckpt_to_keep: null
+
+eval:
+  enabled: false
+  parquet: /abs/path/data/math_eval/test.parquet
+  benchmarks: aime24,aime25,amc23,amc24,math500
+  n: 16                                  # paper protocol; per-question success rate -> mean = pass@1
+  math500_n: 2
+  temperature: 1.0
+  top_p: 0.95
+  max_tokens: 32768
+  max_model_len: 40960                   # must exceed prompt + response
+  tensor_parallel_size: 2
+  gpu_memory_utilization: 0.85
+  backend: vllm
+  dev_n: 1
+  dev_do_sample: false
+  # run.eval_after_train=true evaluates the merged GAD final actor
+  # (<gad_out>/global_step_{S+K}/actor/huggingface), never the Warmup handoff
+  # checkpoint that GAD started from.
+
+validation:
+  # CARD-aligned math scorer used *inside* training validation by the
+  # gad-math-validation backend patch (exported to the stage as GAD_MATH_SCORER).
+  # Defaults to LMOps/sample/math_scorer.py. A stage that does not produce
+  # <stage_out>/validation_math_metrics.jsonl is not marked complete.
+  scorer_path: ""                        # "" -> LMOps/sample/math_scorer.py
+  require_math_metrics: true             # false only if you deliberately want ROUGE-L only

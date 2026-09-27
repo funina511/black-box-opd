@@ -1,0 +1,31 @@
+# External math evaluation configuration (example).
+#
+# Two protocols are supported by tools/evaluate_math.py:
+#   * dev monitor: --n 1 --temperature 0 on the held-out dev parquet
+#   * paper protocol: temperature 1.0, top_p 0.95, 16 samples (2 for MATH-500)
+#
+# The evaluator never needs teacher answers: external benchmarks only need the
+# problem statement and the ground-truth answer.
+
+model: /abs/path/models/Qwen3-8B           # or a merged stage product
+parquet: /abs/path/data/math_eval/test.parquet
+out_dir: /abs/path/eval/initial-student
+label: initial-student
+benchmarks: aime24,aime25,amc23,amc24,math500
+
+# --- paper protocol ---------------------------------------------------------
+n: 16
+math500_n: 2
+temperature: 1.0
+top_p: 0.95
+max_tokens: 32768
+max_model_len: 40960
+
+# --- resources --------------------------------------------------------------
+tensor_parallel_size: 2
+gpu_memory_utilization: 0.85
+backend: vllm                              # vllm | hf
+
+# --- prompt template --------------------------------------------------------
+enable_thinking: false                     # must match the training configuration
+seed: 0
