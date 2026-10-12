@@ -1,7 +1,9 @@
 # GAD 在线 Rubric 辅助训练与历史 Replay 修改计划
 
 日期：2026-10-12  
-状态：实现交接文档；本次只新增计划，不修改训练代码、配置、数据或运行状态。
+状态：实现交接文档，2026-10-12 修订；本次只修改计划，不修改训练代码、配置、数据或运行状态。
+
+**最新统一口径：启用 rubric 的主方案从 Warmup 第一轮 critic 更新就开始加入 rubric 辅助监督，并在 GAD 中继续。Warmup 的 critic 同时适应当前 teacher/student 分布与固定 rubric 评分标准；仅 GAD 开启属于阶段消融，不是主方案。**
 
 本计划依据用户最新决定，取代上一版“暂缓正式 GAD 接入”的范围约定。[离线第一版计划](Rubric辅助Critic第一版修改计划.md)保留为历史设计与已实现模块的参考，不再要求其全部研究门槛通过后才能开展在线实验。
 
@@ -11,13 +13,13 @@
 
 按以下顺序交付，每一阶段都必须可单独验证：
 
-1. **首先实现在线 rubric 辅助 critic 训练。** 从同一个已有 Warmup checkpoint 开始 GAD，对当前生成的 teacher/student 配对数据进行标注，保留原判别损失，增加辅助损失，critic 和 actor 均继续训练。
+1. **首先实现从 Warmup 开始的在线 rubric 辅助 critic 训练。** 各主实验组从相同初始学生模型及判别器初始化条件开始，Warmup 保留原 teacher SFT 和原成对判别损失，同时用独立 verifier 提供的固定 rubric 标签训练 critic；GAD 接续本组 Warmup 的 actor 和全部 critic 评分头，继续联合更新。
 2. **其次实现独立可选的历史轨迹 replay buffer。** 池子在正式训练中逐步建立，保存完整、题目匹配的 teacher/student 历史比较，供后续 critic 更新；不是预先构建后长期不变的离线标注集。
 3. 提供两个相互独立、默认关闭的功能开关，形成原版、rubric-only、replay-only、rubric+replay 四种组合。
-4. 先验证 rubric-only 的短程 actor 训练，不以完成 replay 或获得离线显著增益为前提。
+4. 先验证 rubric-only 的 Warmup→GAD 闭环和短程 actor 对照，不以完成 replay 或获得离线显著增益为前提；Warmup 的联合训练与完整交接是首版必做项。
 5. 原版开关全关时保持原行为；所有算法扩展走显式分支并记入配置与代码指纹。
 
-**首轮研究假设：固定 rubric 辅助监督通过共享 critic 骨干改善原判别通道，进而改善 actor 学习。** 本版不将辅助评分直接混入 actor reward，不更换原判别标签，不同时引入 evo-rubric。若辅助头学好而 actor 不提升，应如实报告该假设未获支持。
+**首轮研究假设：Warmup 中让 critic 同时学习 teacher/student 分布判别和 rubric 质量评价，使进入 GAD 的 critic 具备两类能力，再通过持续联合训练改善原判别奖励，进而改善 actor 学习。** 本版不将辅助评分直接混入 actor reward，不更换原判别标签，不同时引入 evo-rubric。若辅助头学好而 actor 不提升，应如实报告该假设未获支持。
 
 ## 1. 已确认的需求与非目标
 
@@ -25,7 +27,7 @@
 
 - 保留原版 teacher > student 的成对判别损失。
 - actor 的 Warmup SFT 与 GAD GRPO/PPO 更新公式不变。
-- 正式训练支持在线标注；judge 评价当前回答，不按题目 ID 套用离线旧回答标签。
+- Warmup 和 GAD 都支持在线标注；独立 verifier（代码中的 judge）评价当前回答，不按题目 ID 套用离线旧回答标签。它是冻结的监督标注器；critic 是持续学习的判别与质量评分模型，两者不是两套并列的 actor 奖励。
 - critic 继续更新，不因 rubric 引入而永久冻结。
 - replay 仅改变 critic 更新用的数据，不把历史轨迹带入 actor 的 policy loss。
 - actor 最终数学评测是主结果；critic 标签预测/排序只是辅助诊断。
@@ -34,9 +36,22 @@
 
 ### 1.2 第一轮范围
 
-第一轮只在 **GAD 阶段** 开启 rubric，从同一个原 Warmup checkpoint 初始化各组。这样避免把 Warmup 差异混入 GAD 效果。
+主方案的 `rubric.stages` 为 `[warmup, gad]`，总开关仍默认关闭。用户显式开启 rubric 后，必须从 Warmup 的第一轮 critic 更新加入辅助损失，再将训练好的全部评分头交接到 GAD。
 
-Warmup 接入设计预留在第 13 节，待 GAD 功能通过后再做；不作为第一轮验收前提。SeqKD 永远不启用这两项 critic 功能。
+- Warmup actor 从初始学生模型开始，按原版 teacher SFT 更新；SeqKD 仍是独立基线，不用其结果初始化 Warmup。
+- Warmup critic 同时优化原成对判别损失和 rubric 辅助损失；没有独立的“先做完原 Warmup，再追加 rubric 预热”阶段。
+- 原 `critic_warmup` 若暂时跳过 actor 更新，critic 仍执行原判别＋辅助更新，不等待 actor 解冻后才开始 rubric 训练。
+- GAD 使用本实验自己的 Warmup actor 与四通道 critic；辅助头不得重置。
+- `[gad]` 作为阶段消融，允许从共同的原版 Warmup checkpoint 开始，仅在 GAD 起点扩头。
+- replay 首版仍只作用于 GAD；SeqKD 不启用任何 rubric/replay critic 功能。
+
+### 1.2.1 固定 rubric、独立 verifier、可学习 critic 的职责
+
+固定 rubric 是共享评分标准，不在本版由模型生成。独立 verifier（judge）按该标准提供过程评分标签，答案正确性由现有规则评分器提供；critic 学习这些评分，同时保持原判别任务。实际 actor reward 仍取 critic 的 adv 通道。
+
+独立 verifier 可以由可调用的 teacher 模型承担，也可使用单独的已校准模型；“角色独立”不要求模型型号不同。首版仍按独立服务部署，以隔离生成式标注与 FSDP 训练。
+
+critic 未来生成、演化 rubric 及直接使用 rubric reward 的研究不在本版；当前辅助头训练不会自动产生 rubric 文本生成能力。
 
 ### 1.3 暂不实现
 
@@ -52,10 +67,12 @@ Warmup 接入设计预留在第 13 节，待 GAD 功能通过后再做；不作�
 | 当前位置 | 事实 | 实现要求 |
 | --- | --- | --- |
 | `gad/tools/pipeline.py::build_overrides` | 映射全局 YAML 到各阶段 Hydra 参数；指定 GRPO | 扩展参数必须真正传入后端并能在 resolved 配置中核实 |
-| `gad/tools/prepare_backends.py` | SeqKD/Warmup/GAD 来自不同固定 worktree | 不只修改 `gad/verl` 而忽略实际 `.backends/gad` |
+| `gad/tools/prepare_backends.py` | SeqKD/Warmup/GAD 来自不同固定 worktree | 算法扩展必须同时覆盖实际 warmup 与 gad worktree，不修改 SeqKD 算法 |
 | `gad/tools/backend_patches.py` | 当前工程补丁约定不改算法 | 新建显式算法扩展补丁组，不偷偷塞进原工程补丁 |
 | `.backends/gad/verl/trainer/ppo/ray_trainer.py::fit` | 新采样→原 critic 评分→优势→critic 更新→actor 更新 | 保持该顺序，新辅助梯度对下一批奖励起作用 |
 | 同上 | `uid` 是运行时 UUID，按 n 重复 | 区分 GRPO 组 ID 与持久化题目/回答 ID |
+| `.backends/warmup/verl/workers/actor/dp_actor.py` | teacher response 上的 SFT loss；不是 rubric policy reward 更新 | rubric 只修改 critic 联合目标，不把 GAD 的 actor 损失复制进 Warmup |
+| Warmup `ray_trainer.py` | 先更新 critic，再按 `critic_warmup` 门槛决定是否更新 actor | critic 辅助任务从阶段首步生效，原 actor 门槛保持不变 |
 | `.backends/gad/verl/workers/critic/dp_critic.py` | `_forward_micro_batch` 最终只保留末有效 response token 分数 | 多头必须在保留该语义的基础上扩展 |
 | 同上 | `update_critic` 使用固定字段白名单 | 新 label/mask/weight 字段必须显式通过 select 与微批切分 |
 | `fsdp_workers.py` | num_labels 固定 1，mini batch 乘 n 后按 DP 大小归一化 | 多头加载及分布式归一化必须一起改 |
@@ -70,9 +87,11 @@ Warmup 接入设计预留在第 13 节，待 GAD 功能通过后再做；不作�
 
 24 题实验已完成工程闭环但每组只更新一步；512 题实验尚无训练结果。512 题中 762/1536 回答截断，两个过程标签有效率不足一半；judge JSON 最终有效率约 92.1%，人工审阅为零。
 
-这些事实提示需要改进格式约束与监督覆盖诊断，但**不要求继续完成大规模离线训练才允许进入正式 GAD 小步测试**。首轮仅做必要的在线 judge 校准和工程冒烟。
+这些事实提示需要改进格式约束与监督覆盖诊断，但**不要求继续完成大规模离线训练才允许进入 Warmup→GAD 小步测试**。先用初始学生的当前轨迹做必要的 judge 校准；Warmup 末及 GAD 初复查覆盖率，不能只依据旧 Warmup 模型上的标签质量。
 
 ## 3. 功能矩阵与关闭语义
+
+下表描述 GAD 阶段；主方案的 Warmup 使用相同 rubric 开关和联合损失，但 replay 不启用，actor 仍以 teacher response 做 SFT。
 
 | rubric.enabled | replay.enabled | 模型/监督 | actor 数据 |
 | --- | --- | --- | --- |
@@ -98,7 +117,7 @@ Warmup 接入设计预留在第 13 节，待 GAD 功能通过后再做；不作�
 ```yaml
 rubric:
   enabled: false
-  stages: [gad]
+  stages: [warmup, gad]               # 主方案；[gad] 仅作阶段消融
   mode: joint                         # joint / correctness_only
   loss_coef: 0.1
   spec: rubric/specs/math_v1.yaml
@@ -162,11 +181,21 @@ resources:
 - stage 不在列表中时 runtime enabled=false；保留声明配置及“本阶段未启用”的记录。
 - preflight 比较 driver 与 worker 的 layout/hash/coef，避免两端配置失配。
 
-### 4.3 新实验与原 Warmup 交接
+### 4.3 主方案的新实验与预算
 
-复用旧 Warmup 必须新建 run，不能对已完成 run 使用 `--set` 强行改变算法再 resume。
+主方案使用新 run，执行 `--stages warmup,gad`，从同一初始学生模型和同一判别器初始化条件开始。若执行完整 `seqkd,warmup,gad`，SeqKD 保持独立，不作为 Warmup 的初始化模型。
 
-建议新增两个明确参数：
+不能复用已经完成、未接受 rubric 监督的旧 Warmup，并把它称为“从 Warmup 开始启用”的主方案。旧结果可保留为参考或供仅 GAD 开启的阶段消融使用；主方案要重新运行相应 Warmup。
+
+建议提供 `--gad-new-steps <K>`：当 Warmup 完成于绝对步 S，GAD 终点为 S+K。若 S 在启动时还未确定，计划先记录符号终点，在 Warmup 完整保存后解析，并更新 GAD 阶段配置快照。不要在训练启动前猜测不存在的 handoff checkpoint。
+
+主实验各组固定相同 Warmup epoch/样本预算及 GAD 新步数。该参数必须处理 `stage_epochs` 对 steps 的优先级，dry-run 展示 Warmup 预算、预计/最终 S、额外 K 和绝对终点；例如 S=271、K=80 时，GAD 终点为351。
+
+工程冒烟可显式将 Warmup 限制为少量步、随后交接少量 GAD 步；必须使用独立 smoke run，并标明提前结束，不能覆盖完整 Warmup 的完成记录。效果实验使用预先固定的正式 Warmup 预算。
+
+### 4.4 仅 GAD 开启的消融入口
+
+建议保留以下待实现接口，仅供消融或显式复用已完成的兼容 Warmup：
 
 ```text
 --init-from-warmup-run <run path or alias>
@@ -174,13 +203,31 @@ resources:
 --gad-new-steps <K>
 ```
 
-这些是待实现接口。语义：读取源 run 配置/模型/tokenizer 和完整 Warmup checkpoint，生成新目标 run 的派生 handoff，保留原 actor/critic/reference 初始化约定；不复制为同阶段完整恢复。原 Warmup 文件只读。
+`rubric.stages=[gad]` 的消融读取指定原 Warmup actor/critic，在新 run 中派生四头 critic，并只运行 GAD。输入若是已完成 rubric Warmup 的四头模型，则不得再次扩头，需严格验证 layout/hash。
 
-如果源 Warmup 步数 S=271，`--gad-new-steps 80` 的 GAD 绝对终点为 351。该参数必须处理 `stage_epochs` 对 steps 的优先级，dry-run 展示 S、额外 K、绝对终点及循环上限；禁止设置 `gad_steps=80` 后实际仍跑完原 epoch。
-
-若沿用已有等价机制，也必须实现上述明确语义，并在最终 README 给出确切可运行命令。不能让用户自行猜测配置组合。
+两种情况都不覆盖源 run，也不冒称同阶段完整恢复。`--resume` 只允许相同阶段及相同算法配置的完整状态恢复；不能用它把关闭 rubric 的历史 run 改成开启状态。
 
 ## 5. 正式训练数据流与更新顺序
+
+### 5.1 Warmup 数据流
+
+```text
+当前学生生成 student 回答，与离线 teacher 回答配对
+    ↓
+固定 rubric → 独立 verifier / 规则评分器 → 两侧辅助标签
+    ↓
+critic：原 teacher > student 损失 + rubric 辅助损失
+    ↓
+按原 critic_warmup 门槛决定是否执行 actor 的 teacher SFT 更新
+    ↓
+继续下一步；阶段末保存 actor 与完整四通道 critic
+```
+
+保留 Warmup 后端原有计算/更新顺序，即使其框架中仍计算 values/advantages，也不删除这些路径或让 rubric 分数成为 SFT 权重。Warmup actor 的训练目标、选取 teacher 数据的规则与优化器保持原样。
+
+标签来自该步实际送入 critic 的 teacher/student 回答；不固定使用旧 Warmup 结束后的学生轨迹。teacher 可按精确回答缓存，student 逐步按新回答匹配标签。Warmup 默认 n=1，不能套用 GAD n=2 的重复数或 batch 分母。
+
+### 5.2 GAD 数据流
 
 以进入本步时的 critic 为 D_t，actor 为 π_t：
 
@@ -208,7 +255,7 @@ resources:
 
 第一版采用同步标注屏障，方便检查每步监督与版本。可以把请求与无依赖计算重叠作为后续性能优化；不能跨步使用不对应当前回答的标签。
 
-本地代码是“评分→更新 critic→更新 actor”；参考论文采用其他次序的部分不照搬。rubric-only 第一步 actor 使用的分数与 baseline 应相同或在迁移数值误差内，差异从后续 critic 更新后逐步体现。
+本地代码是“评分→更新 critic→更新 actor”；参考论文采用其他次序的部分不照搬。仅 GAD 开启且共用原 Warmup 起点的消融，第一步 actor 分数应与对应 baseline 相同或在迁移数值误差内。主方案使用各自已完成联合训练的 Warmup critic，GAD 第一步奖励就可能不同，这是预期效果，不能套用前述同分断言。
 
 ## 6. 真实轨迹、ID 与 DataProto 契约
 
@@ -304,15 +351,19 @@ global 辅助维度计数、有效 pair 数和 logical optimizer minibatch 标�
 
 复用 `rubric/model.py` 的扩头语义：共享骨干，输出顺序 `[adv, correctness, reasoning, conditions]`。只支持已核实的 Qwen2/Qwen3 TokenClassification 分支；其他架构先拒绝。
 
-优先在新 run 的 handoff/export 阶段生成四通道 HF 初始化产物：
+主方案在 **Warmup 启动前** 确定四通道结构，并生成/记录可复现的初始化产物；不等到 GAD 交接时才第一次扩头。
 
-1. 严格加载源单头 critic，验证其 score.weight 与可选 bias。
+必须区分初始模型类型：若从原学生 CausalLM 初始化 critic，原评分头本来需要按原版规则随机初始化，允许这一明确的头初始化过程；若从已训练的 critic checkpoint 加载，则 score.weight/bias 必须严格存在，不能把缺失评分头误当正常初始化。原骨干权重加载缺失仍然是错误。
+
+1. 按原版初始化规则建立/严格加载单头 critic，记录模型来源、score 初始化 seed 和形状。基线与 rubric 组的初始骨干及 adv 行必须一致；不能让新增随机数消耗改变 actor 初始化或 rollout RNG。
 2. 扩头时第0行精确复制，其他行固定 seed 初始化，隔离 RNG 以免改变 actor 抽样。
-3. 保存新配置/权重及迁移 manifest，源 checkpoint 不变。
+3. 保存新配置/权重及初始化/迁移 manifest，源模型与 checkpoint 不变；同一原版初始化条件可用确定性 fixture 核对，不要求从已有 Warmup 取 adv 行。
 4. FSDP worker 根据 num_labels/layout 严格加载四通道，移除无条件强制1的逻辑。
 5. 在 FSDP/optimizer 建立前完成结构确定。meta tensor/rank0 广播路径必须通过真实多卡测试，不能只单卡检查。
 
 也可实现 worker 内扩头，但必须证明每rank一致且未对 meta tensor 做无效复制；两种方法择一，禁止重复扩头。
+
+Warmup→GAD 是四头到四头：严格加载已训练的完整评分头，不调用单头扩头函数、不重置辅助行。仅 GAD 消融才在原单头 Warmup 后首次扩头。
 
 ### 8.2 forward 和 reward 接口
 
@@ -423,7 +474,7 @@ critic_batch重新计算 `global_token_num`，不能沿用actor_batch的token元
 ### 10.1 完整扩展 checkpoint
 
 ```text
-runs/<run>/gad/global_step_<S>/
+runs/<run>/<warmup|gad>/global_step_<S>/
   actor/...
   critic/...
   data.pt
@@ -440,7 +491,9 @@ runs/<run>/gad/global_step_<S>/
 - 先保存各rank模型/optimizer/scheduler和dataloader，再保存扩展状态，校验完成后原子发布complete标志与latest tracker。
 - 同步修改恢复查找、checkpoint完整性检查与清理工具；不能只写一个标志而原`find_latest_ckpt_path`仍挑中未完成目录。
 - 两开关关闭时兼容历史无extension checkpoint；开启时从同阶段恢复缺失扩展状态必须失败。
-- 派生Warmup初始化是新阶段：允许单头迁移、fresh optimizer和空buffer，并明确记录，不能当成“缺扩展状态的resume”。
+- 新建 Warmup：按原模型初始化并扩头，建立新 optimizer；rubric 扩展状态从首步开始存在。
+- 主方案 Warmup→GAD：加载全部四头模型，按原跨阶段约定建立 GAD optimizer/scheduler并继承正确的step/dataloader语义；不强行带入Warmup optimizer状态。replay池在GAD为空，标签缓存仅在完整指纹一致时复用。
+- 仅 GAD 消融从原单头 Warmup 初始化时允许一次扩头；必须记录消融模式，不能当成“缺扩展状态的同阶段resume”。
 - label cache若外置，checkpoint必须固定依赖条目的内容hash/快照；不能只存易被覆盖的SQLite路径。resume后不要求对所有缓存逐一重hash，但被引用条目须可验证。
 - 缓存可保留超前完成的judge结果，因为纯标签缓存不等于已提交训练步；buffer和训练进度只恢复到最后完整checkpoint。
 - 步中途失败不允许仅从失败位置继续：内存可能已更新critic但未更新actor，应丢弃未提交进度，从最后完整checkpoint恢复。
@@ -448,7 +501,7 @@ runs/<run>/gad/global_step_<S>/
 ### 10.2 模型与优化器约束
 
 - 原单头→四头是新run初始化，不恢复旧一行head的optimizer状态到四行参数。
-- 同阶段四头resume严格恢复四头权重、optimizer、scheduler与RNG；不得每次重新随机初始化辅助头。
+- Warmup 或 GAD 的同阶段四头resume均严格恢复四头权重、optimizer、scheduler、dataloader与RNG；不得每次重新随机初始化辅助头。跨阶段交接与同阶段resume分开实现。
 - replay-only仍是单头。
 - 导出工具区分1/4输出，并保存id2label/layout/hash；禁止强制num_labels=1。
 - 关闭rubric后直接resume四头run应报错；需要显式派生只保留adv的模型，不在首版自动做。
@@ -463,7 +516,7 @@ runs/<run>/gad/global_step_<S>/
 - 为实验建立独立 backend root，例如 `gad/.backends_gad_extensions_v1`，避免热修改现有任务使用的worktree。
 - `prepare_backends.py` 接受明确的profile；默认 profile仍是原版。
 - 扩展profile预装关闭时无副作用的rubric/replay分支；配置决定运行是否启用。
-- preflight确认目标GAD worktree存在所需patch marker和具体版本；未完成replay实现时拒绝开启。
+- preflight分别确认目标Warmup和GAD worktree的patch marker与版本，并用两阶段真实worker验证；只支持GAD不能标记主方案完成。未完成replay实现时拒绝开启。
 
 算法模块建议部署在目标backend的 `verl/experimental/gad_extensions/`，源码由本仓库可追踪模块生成/复制，并校验hash；不能只改生成副本。
 
@@ -479,7 +532,7 @@ runs/<run>/gad/global_step_<S>/
 | --- | --- |
 | `LMOps/train.yaml` | 两开关默认false、配置注释；不改原训练默认值 |
 | `gad/tools/config.py` | defaults、路径解析、阶段支持、数值范围、judge必填项与失配检查 |
-| `gad/tools/pipeline.py` | Hydra映射、新run Warmup初始化、额外步数语义、run签名与dry-run |
+| `gad/tools/pipeline.py` | 两阶段Hydra映射、初始模型→rubric Warmup→四头GAD交接、消融初始化入口、额外步数与签名 |
 | `gad/tools/preflight.py` | 服务能力/模型指纹、GPU不重叠、head维度、backend功能支持、完整恢复检查 |
 | `gad/tools/prepare_backends.py` | 独立算法profile、生成目标root、记录manifest |
 | `gad/tools/algorithm_patches.py` | driver/critic/model/checkpoint/配置的显式扩展patch |
@@ -490,12 +543,12 @@ runs/<run>/gad/global_step_<S>/
 | `gad/extensions/critic_batch.py` | actor/critic批隔离、历史重建、跨rank去重权重、逻辑批计数 |
 | `gad/extensions/checkpoint_state.py` | 扩展状态写入/读取、原子完整性、兼容检查 |
 | `rubric/core/`及现有rubric文件 | 复用schema/loss/head迁移；保留原离线CLI可用 |
-| backend `ray_trainer.py` | 保持原顺序，构建critic专用批、标注屏障、pool提交、扩展checkpoint |
+| Warmup/GAD backend `ray_trainer.py` | 分别保持原顺序，两阶段critic标注屏障与扩展checkpoint；GAD额外支持pool提交 |
 | backend `dp_critic.py` | 多通道forward、第0通道reward、联合loss、新字段保留和正确缩放 |
 | backend `fsdp_workers.py` | 根据schema加载1/4头、传入rubric配置、scheduler更新次数保持原样 |
 | backend `ppo_trainer.yaml` | 显式扩展字段及默认关闭值，不滥用任意`+`绕过配置验证 |
 | backend dataset/rollout | 保留稳定prompt ID和准确的teacher/student截断/结束元数据 |
-| `gad/tools/prepare_gad_checkpoint.py` | 1/4通道兼容或派生rubric初始化专用出口 |
+| `gad/tools/prepare_gad_checkpoint.py` | 主方案四头Warmup→四头GAD严格交接；单头消融允许一次扩头；保留原版1头路径 |
 | `gad/tools/merge_model2hf.py` / `export_model.py` | 检查多头config/权重一致，不能导出丢辅助头的模型 |
 | `gad/tools/prune_checkpoints.py` / 原完整性判断 | extension完整性、缓存引用和受保护checkpoint |
 | `scripts/rubric_judge.sh` | 独立服务启动/检查/停止，不杀其他用户/实验进程 |
@@ -505,58 +558,80 @@ runs/<run>/gad/global_step_<S>/
 
 文档和日志统一术语：固定离线数据集用于已完成预实验；历史replay池用于正式训练过去步骤的轨迹；标签缓存只是避免重复标注的存储，不等于replay策略。
 
-## 13. Warmup 支持策略
+## 13. Warmup 联合训练与 GAD 交接（首版必做）
 
-### 13.1 首轮不改 Warmup
+### 13.1 Warmup 的两个 critic 学习目标
 
-A/B/C组共用同一个现有Warmup actor/critic初始化，在GAD起点扩头。这样结果可以归因于GAD阶段辅助训练。
+1. **分布判别适应**：原成对损失使 critic 学习当前 teacher/student 回答的相对分数。
+2. **Rubric 评分适应**：辅助损失使共享骨干和三个辅助通道学习固定质量标准，涵盖答案正确性、推导有效性和条件完整性。
 
-单独开启GAD rubric无需重跑SeqKD和Warmup。judge也不应在SeqKD阶段占GPU。
+二者从第一轮 critic 更新同时发生，默认固定相同 lambda 贯穿 Warmup/GAD，不新增单独 rubric 预热阶段。后续如需分阶段 lambda，作为明确消融，不在首版悄悄调权重。
 
-### 13.2 后续可选支持
+Warmup actor 仍按原 teacher SFT 更新；rubric 不改变其 loss、样本权重或teacher选择。训练循环原有 `critic_warmup` 门槛也保留：actor被跳过的步，critic的两项损失仍正常更新。不要把“actor跳过”误判成整步失败。
 
-GAD功能通过后，再允许 `rubric.stages: [warmup, gad]`：
+### 13.2 主方案交接契约
 
-- Warmup actor仍按原teacher SFT更新，原critic_warmup门槛不变。
-- Warmup critic使用同样原判别+辅助损失，非冻结。
-- 四头Warmup向四头GAD交接保留全部头；不得重新初始化辅助头。
-- GAD开关为false但输入四头Warmup时，要求显式选择兼容导出，不能悄悄删头。
-- replay默认只作用GAD；Warmup replay另行验证，不能因为配置列表可写就宣称支持。
+阶段末必须保存并转移：
 
-先实现GAD时如收到warmup stage配置应在preflight直接说明未支持。不要先引入不工作的参数占位。
+- 本实验 Warmup 的 actor 权重；
+- critic 骨干、adv 行和三个训练后的辅助行；
+- layout、rubric/spec/judge/scorer指纹、源初始化信息；
+- 原框架要求的step/dataloader等跨阶段交接信息。
+
+GAD延续本组Warmup的模型状态；按原跨阶段规则建立optimizer/scheduler与reference，记录实际reference来源，不为rubric另改KL参考模型选择。不能混用A组actor和C组critic再称为主实验。
+
+交接验收使用固定输入，比较Warmup导出前、HF中间产物与GAD加载后的四个通道，允许明确的dtype误差，不能只检查文件存在或adv一行。再验证GAD真实反向后辅助参数继续变化。
+
+label cache可以在rubric/judge/GT/实际可见输入全部一致时复用；Warmup学生旧标签绝不按题目ID套用到GAD新回答。replay默认只在GAD建立空池，不自动带入Warmup历史。
+
+### 13.3 阶段消融与不支持组合
+
+- 主方案：`rubric.enabled=true`、`stages=[warmup,gad]`。
+- 全关基线：`rubric.enabled=false`，两阶段走原逻辑。
+- 仅GAD消融：`stages=[gad]`，可复用原Warmup；在GAD初始化时扩头。
+- 仅Warmup开启、GAD关闭暂不作为首版必做项；输入四头而GAD按单头运行时必须明确报错，不能自动丢头。如后续实现，需独立定义adv导出及辅助冻结语义。
+- SeqKD、Warmup replay首版不支持；阶段校验须按开关及实际执行阶段给出明确错误。
+
+主方案以“Warmup联合训练→完整四头交接→GAD联合训练”整体通过作为功能完成条件，不能把Warmup支持推迟到replay之后。
 
 ## 14. 以 Actor 为中心的实验设计
 
-### 14.1 第一轮只做 rubric
+### 14.1 第一轮主实验：两阶段启用 rubric
 
-| 组 | 设置 | 要回答的问题 |
-| --- | --- | --- |
-| A | 两开关关闭，原GAD | 正常基线 |
-| B | rubric开启、correctness_only、replay关闭 | 仅答案监督的作用 |
-| C | rubric开启、joint、replay关闭 | 过程rubric是否有额外actor收益 |
+| 组 | Warmup critic | GAD critic | 要回答的问题 |
+| --- | --- | --- | --- |
+| A | 原判别损失 | 原判别损失 | 两阶段原版基线 |
+| B | 原判别＋正确性辅助 | 原判别＋正确性辅助 | 仅答案监督能否改善actor |
+| C | 原判别＋完整rubric辅助 | 原判别＋完整rubric辅助 | 过程rubric是否有额外actor收益 |
 
-A/B/C均从同一个原Warmup S开始；B/C使用相同扩头初始化seed。A走原单头路径。开发时额外做扩头lambda0的数值/调用检查，但不把这个额外组变成大规模研究前置条件。
+A/B/C均从相同初始学生模型、原判别头初始化条件及训练数据开始，各自执行完整Warmup，再进入本组GAD。B/C的辅助行初始化seed一致；A保持原单头路径。SeqKD仍独立，不作为Warmup起点。
 
-共同固定：actor/critic/reference初始权重、题目顺序seed、n、长度、温度、KL、优化器、actor/critic更新次数、训练题数和评测设置。
+固定两阶段的训练题数/epoch、样本顺序、rollout n、长度、温度、优化器、actor更新门槛与GAD新步数；reference遵循原框架相同构建规则。新增judge/head/cache使用独立RNG，尽量不扰动原actor随机数。
 
-策略更新后输出自然会分化，不能强求各组后续trajectory完全相同；可固定初始seed和调度口径，不宣称整个RL运行严格逐样本配对。
+Warmup actor目标未改变，理论上不直接受critic奖励影响；数值执行和随机性可能导致差异，不声称各组actor必然逐位相同。必须在Warmup末分别评价actor并报告起点差异，同时记录critic原判别与rubric指标。
 
-### 14.2 分三级预算
+最终主比较是相同Warmup+GAD训练预算后的actor能力，代表整个方法的效果，不能全部归因于GAD阶段。另报告各组从自身Warmup末到GAD末的变化，但不能仅凭相对增量忽略不同起点。
 
-1. **工程冒烟：2–5个GAD新步。** 验证真实在线标签、FSDP反向、actor更新、完整保存和新进程恢复，不看效果结论。
-2. **短程试验：建议80个新步作为起点。** 起点和终点统一评测，中途仅少量固定检查点诊断；实际预算依测得耗时确定。20步只够调试，不作为无效结论。
-3. **效果确认：若有信号或仍有合理疑问，固定训练预算、至少3个seed并扩展评测。** 短程无显著差异不自动判方法无效。
+### 14.2 阶段消融与分级预算
 
-不要求先把离线指标调到显著改善。judge格式/监督覆盖工程检查要通过，但不能用大规模离线优化替代在线主实验。
+在主方案工程闭环通过后，可追加C-GAD：Warmup关闭rubric，只有GAD开启joint。与A共用原版Warmup来源以隔离GAD效应；C与C-GAD比较用于评估从Warmup开始适应rubric的价值。该消融不替代主方案、不作为主方案实施前置要求。
+
+三级预算：
+
+1. **工程冒烟**：独立smoke run中运行2–5个Warmup步，验证actor门槛前critic确实联合更新；另外覆盖门槛后的至少一次teacher SFT更新，再完成Warmup→GAD交接并运行2–5个GAD步。可用fixture验证门槛逻辑，但真实GPU闭环需确实观察两种actor更新。若原门槛为10，仅跑5步不能声称Warmup actor更新已验证。
+2. **短程效果试验**：A/B/C使用相同正式Warmup预算，再各运行建议80个GAD新步。具体预算据实测耗时固定；不能将很短的smoke Warmup当成正式预热。额外报告共同初始模型、各组Warmup末和GAD末三个评价点。
+3. **效果确认**：固定两阶段预算，至少3个seed并扩展评测。短程无显著差异不自动判方法无效；解释监督覆盖、reward通道变化和计算成本。
+
+开发时可用扩头lambda0 fixture做数值回归，不必额外跑一套完整训练。无需先把离线指标调到显著改善；必要的judge格式/覆盖检查通过后，尽快运行两阶段actor对照。
 
 ### 14.3 主指标与统计
 
 主指标：actor在独立数学题上的固定解码准确率，比较相同新增训练步后的结果及相对共同起点的变化。
 
-- 训练中quick-dev仅用于进度和预先声明的模型选择；最终保留独立完整dev/外部数学测试评价。
+- Warmup与GAD中quick-dev仅用于进度和预先声明的模型选择；记录共同初始、各组Warmup末、GAD末三个评价点，最终保留独立完整dev/外部数学测试评价。
 - 固定greedy或相同采样协议，不能将rubric组更大评测n带来的收益算作训练收益。
 - 同时报告输出长度、截断率、有效最终答案率、KL/熵、训练耗时、judge GPU-hours/请求token和总GPU-hours。
-- 至少报告“相同actor更新步数”的结果；当judge开销明显时，再补充“相同总计算/时间预算”的效率比较。
+- 至少报告“相同Warmup预算＋相同GAD新增actor更新步数”的结果；judge成本包含两个阶段，不能漏算Warmup标注。额外补充相同总计算/时间预算的效率比较。
 - 配对题目bootstrap与跨seed波动分开报告；不对多seed和多回答当作独立题目膨胀显著性。
 - 明确主benchmark和训练预算，不在test上反复选择lambda或挑有利checkpoint。
 
@@ -566,7 +641,7 @@ A/B/C均从同一个原Warmup S开始；B/C使用相同扩头初始化seed。A�
 
 ### 14.4 之后再加入 replay
 
-replay实现完成后追加：D=replay-only、E=rubric+replay，并与相同步数的A/C对比。首轮不要同时改变rubric与replay，避免无法归因。
+replay实现完成后追加：D在A的原版Warmup来源上只于GAD启用replay；E在C的rubric Warmup来源上于GAD启用rubric+replay。分别与同来源、同步数的A/C比较，避免用不同Warmup critic造成混淆。首轮不同时改变rubric与replay。
 
 buffer改善critic稳定性不等于actor最终必然提升；同样以actor评价作为主结论。
 
@@ -606,10 +681,10 @@ diagnostic值必须有分母和解释。actor reward日志只记录adv；rubric 
 - teacher去重、同题不同回答不共享错误缓存、hash/version变化失效。
 - 网络乱序返回与batch行正确匹配；JSON错误/超时/上下文不足不变成零分。
 - 实际token与judge文本一致，超过上限/原题被截断有明确状态。
-- 原head迁移前后值一致；多头reload不重置；score通道只有adv进入actor。
+- 原初始化→Warmup扩头时adv值一致；Warmup→GAD四个通道都一致；多头reload不重置；GAD奖励只有adv通道，Warmup actor仍执行teacher SFT。
 - joint/correctness_only的mask与loss正确；全缺失或某rank缺失无NaN。
 - DDP/FSDP多rank+microbatch1/2梯度对齐全局整批参考，含重复teacher跨rank的情况。
-- 实际更新调用顺序测试：compute_values→advantages→critic→actor，失败标注在两次update之前退出。
+- 实际更新调用顺序测试覆盖Warmup与GAD：保留原compute_values/advantages→critic→按原门槛actor的顺序，失败标注在两次update之前退出。门槛前actor正常跳过不算失败，critic辅助损失仍生效。
 - raw padding与remove-padding多头路径测试；最长响应真实反向。
 
 ### 16.3 Replay
@@ -631,70 +706,88 @@ diagnostic值必须有分母和解释。actor reward日志只记录adv；rubric 
 
 ### 16.5 真实GPU验收
 
-- 单卡或小模型fixture不能替代正式4卡FSDP验证。
-- 运行2–5步含长样本、在线服务和恢复；确认actor与critic参数都有实际更新。
-- 首步后续步的adv/aux变化符合时序，judge进程只存在一份且GPU分配不冲突。
+- 单卡或小模型fixture不能替代正式4卡FSDP验证；Warmup和GAD各自后端都要覆盖。
+- 按14.2完成Warmup门槛前/后、完整四头交接及2–5步GAD，含长样本、在线服务和两阶段新进程恢复；确认Warmup actor执行SFT、GAD actor执行原策略更新、critic两阶段都有辅助梯度。
+- 两阶段adv/aux变化符合时序；主方案GAD首步允许因Warmup critic不同而奖励不同；judge服务按阶段复用且GPU分配不冲突。
 - 不跑全量训练直到工程冒烟和资源预算清楚；一旦通过就进入短程actor对照，避免持续堆砌离线检查。
 
 ## 17. 实施里程碑与交接要求
 
-### M1：Rubric 配置、数据、服务与模型
+### M1：两阶段 Rubric 配置、数据、服务与模型
 
-交付独立backend profile、双开关配置（replay明确未支持）、可用judge client/cache、真实token适配、单头→四头初始化、默认关闭回归。
+交付同时支持Warmup/GAD的独立backend profile、双开关配置（replay明确未支持）、可用judge client/cache、真实token适配、Warmup启动前单头→四头初始化及默认关闭回归。仅GAD扩头是消融路径。
 
-### M2：Rubric 在线联合更新与恢复
+### M2：Warmup 联合训练、交接与 GAD 延续
 
-交付正式GAD数据流、FSDP正确归一化、adv-only reward接口、多头保存导出、同阶段完整恢复；运行2–5步工程冒烟。
+交付Warmup首步辅助更新、原SFT和actor门槛保留、多卡归一化、Warmup同阶段恢复、完整四头交接、GAD持续联合更新与恢复。按照14.2完成真实GPU闭环，不只跑GAD的2–5步。
 
-**M2完成即可进行A/B/C短程actor实验，不等待replay。**
+**M2完成即可进行A/B/C两阶段actor实验，不等待replay。Warmup支持是M2的必做内容。**
 
-### M3：Actor 短程对照
+### M3：Actor 主实验与阶段消融
 
-交付起点/终点评测、准确率/长度/截断/成本比较和局限性。若只有辅助头改善，则明确指出尚未改善actor；若未知/错误标签太多，则定位监督问题，不直接否定rubric方法。
+交付初始/Warmup末/GAD末三点评测、准确率/长度/截断/成本比较和限制。按需要增加仅GAD开启的阶段消融。若只有辅助头改善而actor不改善，应明确报告；不把监督不足等同于整个rubric方向无效。
 
 ### M4：Replay 独立功能
 
-交付bounded历史比较池、固定大小critic batch、状态恢复和replay-only测试。此时才能正式标记四种开关组合均可用。
+交付GAD专用bounded历史比较池、固定大小critic batch、状态恢复和replay-only测试。此时才能正式标记四种开关组合均可用；Warmup replay不在本版范围。
 
-### M5：组合实验与可选Warmup支持
+### M5：组合实验
 
-进行D/E对照；按需要实现Warmup范围扩展，单独报告初始化差异。evo-rubric及判别器替换不在本计划内。
+进行D/E对照，匹配各自Warmup来源。Warmup rubric已在M2实现，不再作为此阶段可选项；evo-rubric及判别器替换不在本计划内。
 
 每个里程碑实现者必须提供：
 
-- 修改文件、实际支持的开关组合、未支持且会报错的模式；
-- 精确启动、dry-run、resume和评测命令；
-- 代码/配置/模型/数据/judge指纹；
-- CPU测试与GPU冒烟证据，不能把计划中的测试当成已通过；
-- 指标分母、训练新步数、完整结果目录及已知限制。
+- 修改文件、实际支持的阶段/开关组合、未支持且会报错的模式；
+- 精确启动、dry-run、两阶段resume、交接和评测命令；
+- 代码/配置/模型/数据/judge指纹及初始adv头一致性证据；
+- CPU测试、Warmup→GAD多卡GPU冒烟证据，不能把计划中的测试当成已通过；
+- 指标分母、Warmup与GAD各自预算、完整结果目录及已知限制。
 
 ## 18. 拟定启动示例（实现完成后替换为实测命令）
 
-以下是接口约定，不是当前已经可运行的命令：
+以下是接口约定，不是当前已经可运行的命令。各主实验使用同一初始模型/数据/初始化seed，执行各自Warmup；示例跳过独立SeqKD基线，不从SeqKD加载权重。
 
 ```bash
 cd /mnt/jinbo/RLRM/LMOps
 
-# 启动前按实际空闲资源填写judge配置；服务单独启动并检查模型指纹。
+# 开启rubric前，按实际资源配置独立verifier并检查模型指纹。
 bash scripts/rubric_judge.sh --config train.yaml --action health
 
-# 原版对照：同一个Warmup来源，新run，不改原run。
-bash scripts/train.sh --stages gad --name gad_baseline \
-  --init-from-warmup-run qwen3_0.6b_17k --init-step 271 --gad-new-steps 80 \
+# A：两阶段原版基线。
+bash scripts/train.sh --stages warmup,gad --name gad_baseline \
+  --gad-new-steps 80 \
   --set rubric.enabled=false --set replay.enabled=false --dry-run
 
-# Rubric主实验：先dry-run确认judge地址、资源、head和终点。
-bash scripts/train.sh --stages gad --name gad_rubric \
-  --init-from-warmup-run qwen3_0.6b_17k --init-step 271 --gad-new-steps 80 \
-  --set rubric.enabled=true --set rubric.mode=joint \
-  --set replay.enabled=false --dry-run
+# B：从Warmup开始，仅正确性辅助；无需过程judge请求。
+bash scripts/train.sh --stages warmup,gad --name gad_correctness \
+  --gad-new-steps 80 \
+  --set rubric.enabled=true --set 'rubric.stages=[warmup,gad]' \
+  --set rubric.mode=correctness_only --set replay.enabled=false --dry-run
 
-# Replay完成后才支持：
-bash scripts/train.sh --stages gad --name gad_rubric_replay \
+# C：主方案，Warmup与GAD持续进行完整rubric辅助训练。
+bash scripts/train.sh --stages warmup,gad --name gad_rubric \
+  --gad-new-steps 80 \
+  --set rubric.enabled=true --set 'rubric.stages=[warmup,gad]' \
+  --set rubric.mode=joint --set replay.enabled=false --dry-run
+
+# C-GAD：阶段消融，复用原版Warmup，仅在GAD起点扩头。
+bash scripts/train.sh --stages gad --name gad_rubric_gad_only \
   --init-from-warmup-run qwen3_0.6b_17k --init-step 271 --gad-new-steps 80 \
-  --set rubric.enabled=true --set replay.enabled=true --dry-run
+  --set rubric.enabled=true --set 'rubric.stages=[gad]' \
+  --set rubric.mode=joint --set replay.enabled=false --dry-run
+
+# E：Replay实现后，rubric覆盖两阶段，replay只覆盖GAD。
+bash scripts/train.sh --stages warmup,gad --name gad_rubric_replay \
+  --gad-new-steps 80 \
+  --set rubric.enabled=true --set 'rubric.stages=[warmup,gad]' \
+  --set rubric.mode=joint --set replay.enabled=true \
+  --set 'replay.stages=[gad]' --dry-run
 ```
 
-judge配置缺失应在dry-run中列出缺项，不自动选择模型/端点。baseline若不需要judge，应允许独立启动而不检查judge配置。
+主实验A/B/C由配置中相同Warmup预算控制，dry-run应明确列出Warmup会重新训练、初始模型来源、critic初始化、Warmup结束后GAD终点的解析方式。不要把以上命令自动转成复用旧Warmup。
 
-最终研究结论围绕actor：**相同训练设置下，rubric辅助训练是否带来可重复的数学准确率改善，以及改善需要多少额外成本。** 离线代码继续用于标签与实现诊断，不再作为上线实验前必须拿到显著增益的关卡。
+消融示例中的旧run只有在初始模型、数据、Warmup预算等与A可比时才能用于正式比较，否则只用于工程检查。D/E应按14.4匹配来源，必要时复用对应已完成Warmup，禁止混淆实验组。
+
+judge配置缺失在dry-run列出，不自动选择模型/端点；baseline和correctness_only无需过程judge。所有命令在真正实现后补充实测日志与结果目录。
+
+最终研究结论围绕actor：**在相同Warmup和GAD预算下，从Warmup起让critic同时适应teacher/student分布与rubric评分，是否带来可重复的数学准确率改善，以及需要多少额外成本。** 离线代码继续用于标签与实现诊断，不再作为上线实验前必须拿到显著增益的关卡。
