@@ -50,7 +50,7 @@ from common import (  # noqa: E402
     vllm_kv_budget,
     write_json,
 )
-from config import Config, load_config, validate_config, validate_paths  # noqa: E402
+from config import Config, load_config, validate_config, validate_paths, add_config_arguments, select_config  # noqa: E402
 from pipeline import validation_metrics_expected  # noqa: E402
 
 REQUIRED_PACKAGES = {
@@ -606,7 +606,7 @@ def check_output(cfg: Config, report: Report) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--config", required=True)
+    add_config_arguments(parser)
     parser.add_argument("--report", default=None, help="Where to write preflight_report.json.")
     parser.add_argument("--stages", default=None, help="Backends to check (default: all three).")
     parser.add_argument("--stage", default=None, help="Also require the inputs for this stage to be ready.")
@@ -615,7 +615,7 @@ def main() -> int:
     parser.add_argument("--sample-rows", type=int, default=2000)
     args = parser.parse_args()
 
-    cfg = load_config(args.config)
+    cfg = select_config(args)
     stages = [s.strip() for s in (args.stages.split(",") if args.stages else TRAIN_STAGES) if s.strip()]
     for stage in stages:
         if stage not in TRAIN_STAGES:
@@ -641,7 +641,7 @@ def main() -> int:
         check_interpreter(cfg, report, allow_no_gpu=args.allow_no_gpu)
 
     if args.stage == "gad":
-        warmup_dir = Path(cfg.require("run.output_root")) / "<run-id>" / "warmup"
+        warmup_dir = Path(cfg.require("run.output_root")) / str(cfg.get("run.run_id")) / "warmup"
         report.sections["gad_inputs"] = {
             "note": "the GAD stage additionally requires a completed Warmup checkpoint; "
                     "tools/prepare_gad_checkpoint.py --check-only verifies it at run time",
@@ -649,7 +649,13 @@ def main() -> int:
         }
 
     payload = report.to_dict()
-    report_path = Path(args.report).expanduser() if args.report else cfg.path.parent / "preflight_report.json"
+    if args.report:
+        report_path = Path(args.report).expanduser()
+    elif cfg.existing_run:
+        run_dir = Path(cfg.require("run.output_root")) / str(cfg.require("run.run_id"))
+        report_path = run_dir / "reports" / f"preflight_{utc_timestamp().replace(':', '').replace('-', '')}.json"
+    else:
+        report_path = Path(cfg.require("run.output_root")) / "_preflight" / f"preflight_{utc_timestamp().replace(':', '').replace('-', '')}.json"
     write_json(report_path, payload)
     log(f"report -> {report_path}")
 

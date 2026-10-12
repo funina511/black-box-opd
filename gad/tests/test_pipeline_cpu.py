@@ -348,7 +348,7 @@ class ConfigTests(unittest.TestCase):
                                    "resources.test_freq=0", "data.train_file=007.parquet"])
         self.assertIs(parsed["run.val_before_train"], False)
         self.assertIs(parsed["models.param_offload"], True)
-        self.assertEqual(parsed["resources.test_freq"], "0")
+        self.assertEqual(parsed["resources.test_freq"], 0)
         self.assertEqual(parsed["data.train_file"], "007.parquet")
 
     def test_reference_model_is_offloaded_by_default(self) -> None:
@@ -1565,7 +1565,7 @@ class VllmKvBudgetTests(unittest.TestCase):
 
     def test_shipped_config_passes_its_own_gate(self) -> None:
         """The committed run config must survive the gate on a 24GB card."""
-        config_path = GAD_DIR.parents[1] / "runs" / "configs" / "run_qwen3_1.7b.yaml"
+        config_path = GAD_DIR.parent / "train.yaml"
         if not config_path.exists():
             self.skipTest("shipped run config not found")
         cfg = gad_config.load_config(config_path)

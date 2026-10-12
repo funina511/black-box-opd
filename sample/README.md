@@ -1,5 +1,5 @@
 > Qwen3-1.7B 当前实验请从 `LMOps/scripts/sample.sh` 和
-> `LMOps/experiments/qwen3_1.7b/sample.yaml` 进入；专用数据在
+> `LMOps/sample/configs/sample.yaml` 进入；专用数据在
 > `LMOps/data/dapo_math_17k_gad/`。下文的脚本说明适用于通用采样实现。
 
 # `LMOps/sample` — offline data production for GAD

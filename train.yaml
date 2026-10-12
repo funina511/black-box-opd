@@ -1,14 +1,44 @@
-# Independent 0.6B / 5k exploration config. The 1.7B run is untouched.
-# Train subset: 5,000 UIDs sampled without replacement from gad_train.parquet, seed 42.
-# Shared held-out dev, quick_dev and teacher index come from the 17k preparation.
-# batch=64 gives 78 steps/epoch (8 rows dropped each epoch).
-# SeqKD: 156 steps; Warmup: 78; GAD: global step 78 -> 156 (78 updates).
-# GAD stage_epochs=2 is an absolute global target, not two additional GAD epochs.
-# Run only after the current 1.7B job frees GPUs 1,2,3,4.
-
+# Global defaults for NEW experiments. Each launch saves its resolved train.yaml in runs/.
+# Select model/dataset below, in scripts/train.sh, or with --model / --dataset.
+# GAD stage_epochs=2 is an ABSOLUTE target including Warmup; use 3 for 2 additional epochs.
+# Resume/export/evaluate an existing experiment with --run; its saved config is authoritative.
+selection:
+  model: qwen3_0.6b
+  dataset: dapo_math_17k
+catalog:
+  models:
+    qwen3_0.6b:
+      models:
+        student: ../model/Qwen/Qwen3-0.6B
+    qwen3_1.7b:
+      models:
+        student: ../model/Qwen/Qwen3-1.7B
+  datasets:
+    dapo_math_5k:
+      data:
+        train_file: data/dapo_math_5k_gad/gad_train.parquet
+        val_file: data/dapo_math_17k_gad/gad_dev.parquet
+        teacher_index: data/dapo_math_17k_gad/teacher_index.jsonl
+        manifest: data/dapo_math_5k_gad/manifest.json
+        expected_fingerprint_digest: 40d9199b0a66f34f8fb180725ef1b5e7f1c305f4f4fde628da3be55dd3ae2035
+      validation:
+        quick_file: data/dapo_math_17k_gad/quick_dev.parquet
+    dapo_math_17k:
+      data:
+        train_file: data/dapo_math_17k_gad/gad_train.parquet
+        val_file: data/dapo_math_17k_gad/gad_dev.parquet
+        teacher_index: data/dapo_math_17k_gad/teacher_index.jsonl
+        manifest: data/dapo_math_17k_gad/manifest.json
+        expected_fingerprint_digest: 40d9199b0a66f34f8fb180725ef1b5e7f1c305f4f4fde628da3be55dd3ae2035
+      validation:
+        quick_file: data/dapo_math_17k_gad/quick_dev.parquet
+legacy_runs:
+  qwen3_0.6b_5k: runs/gad_qwen3_0.6b_5k/qwen3-0.6b-5k-seed42-n2
+  qwen3_0.6b_17k: runs/gad_qwen3_0.6b_17k/qwen3-0.6b-17k-n2
+  qwen3_1.7b: runs/gad_qwen3_1.7b/qwen3-1.7b-4x3090
 run:
-  output_root: ../../runs/gad_qwen3_0.6b_5k
-  run_id: qwen3-0.6b-5k-seed42-n2
+  output_root: runs
+  run_id: auto
   python_bin: /mnt/jinbo/miniconda3/envs/gad/bin/python
   log_backend: console
   eval_after_train: false
@@ -17,11 +47,9 @@ run:
   resume_worker_state: false
   pytorch_cuda_alloc_conf: ''
 backends:
-  source_repo: ../../gad/verl
-  root: ../../gad/.backends
+  source_repo: gad/verl
+  root: gad/.backends
 models:
-  student: /mnt/jinbo/RLRM/model/Qwen/Qwen3-0.6B
-  discriminator_init: /mnt/jinbo/RLRM/model/Qwen/Qwen3-0.6B
   trust_remote_code: true
   use_remove_padding: true
   enable_gradient_checkpointing: true
@@ -29,12 +57,7 @@ models:
   optimizer_offload: true
   ref_param_offload: true
 data:
-  train_file: ../../data/dapo_math_5k_gad/gad_train.parquet
-  val_file: ../../data/dapo_math_17k_gad/gad_dev.parquet
   prompt_key: content
-  teacher_index: ../../data/dapo_math_17k_gad/teacher_index.jsonl
-  manifest: ../../data/dapo_math_5k_gad/manifest.json
-  expected_fingerprint_digest: 40d9199b0a66f34f8fb180725ef1b5e7f1c305f4f4fde628da3be55dd3ae2035
   max_prompt_length: 2048
   max_response_length: 8192
   truncation: right
@@ -89,12 +112,13 @@ resources:
   nnodes: 1
   gpus: 1,2,3,4
   save_freq: 50
+  keep_last_checkpoints: 5
   test_freq: 200
   max_actor_ckpt_to_keep: null
   max_critic_ckpt_to_keep: null
 eval:
   enabled: false
-  parquet: ../../assets/datasets/math_eval/test.parquet
+  parquet: assets/datasets/math_eval/test.parquet
   benchmarks: aime24,aime25,amc23,amc24,math500
   n: 8
   math500_n: 2
@@ -114,4 +138,3 @@ validation:
   quick_seed: 42
   final_full: true
   quick_enabled: true
-  quick_file: ../../data/dapo_math_17k_gad/quick_dev.parquet

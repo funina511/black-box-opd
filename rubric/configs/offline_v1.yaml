@@ -1,0 +1,76 @@
+schema_version: rubric.offline.v1
+run:
+  name: auto
+  seed: 42
+  output_root: ../../runs/rubric
+data:
+  output_root: ../../data/rubric_math_v1
+source:
+  run_config: ../../runs/gad_qwen3_0.6b_17k/qwen3-0.6b-17k-n2/train.yaml
+  actor_checkpoint: ../../runs/gad_qwen3_0.6b_17k/qwen3-0.6b-17k-n2/warmup/global_step_271/actor
+  critic_checkpoint: ../../runs/gad_qwen3_0.6b_17k/qwen3-0.6b-17k-n2/warmup/global_step_271/critic
+  dataset_manifest: ../../data/dapo_math_17k_gad/manifest.json
+rubric:
+  spec: ../specs/math_v1.yaml
+  dimensions: [answer_correctness, reasoning_validity, condition_coverage]
+  input_mode: implicit_fixed
+  unknown_policy: mask
+sampling:
+  prompt_count: 24
+  teacher_n: 1
+  student_n: 2
+  inherit_source_generation_settings: true
+  batch_size: 8
+  tensor_parallel_size: 1
+  gpu_memory_utilization: 0.55
+split:
+  unit: prompt
+  train: 16
+  dev: 4
+  test: 4
+judge:
+  backend: vllm
+  annotations_path: null
+  model: ../../../model/Qwen/Qwen3-30B-A3B-Instruct-2507
+  prompt: ../prompts/judge_math_v1.txt
+  temperature: 0
+  seed: 42
+  max_retries: 2
+  max_tokens: 768
+  max_model_len: 16384
+  tensor_parallel_size: 4
+  gpu_memory_utilization: 0.85
+  batch_size: 8
+  repeat_fraction: 0.1
+  api_base_url: null
+  api_model: null
+  api_key_env: RUBRIC_JUDGE_API_KEY
+  api_version: null
+audit:
+  reviews_path: null
+  min_reviews: 100
+  min_json_valid_rate: 0.98
+  min_human_acceptance: 0.85
+  max_severe_reverse_rate: 0.05
+model:
+  layout: [adv, answer_correctness, reasoning_validity, condition_coverage]
+  init: preserve_adv_expand_head
+training:
+  mode: joint
+  rubric_lambda: 0.1
+  logical_batch_prompts: 16
+  micro_batch_responses: 1
+  lr: 1.0e-6
+  betas: [0.9, 0.999]
+  weight_decay: 0.01
+  grad_clip: 0.2
+  max_epochs: 1
+  save_every_steps: 5
+  gradient_checkpointing: true
+  dtype: bfloat16
+  update_actor: false
+  reward_mode: original_adv
+  bootstrap_samples: 1000
+resources:
+  gpus: "1,2,3,4"
+  strategy: single_gpu

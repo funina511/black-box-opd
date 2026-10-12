@@ -1,4 +1,4 @@
-# Only performance overrides. All other settings come from ../train.yaml.
+# Only performance overrides. All other settings come from the selected source run config.
 baseline: {}
 kv50:
   rollout.gpu_memory_utilization: 0.50

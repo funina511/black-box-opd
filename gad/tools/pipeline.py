@@ -26,6 +26,7 @@ Examples::
 from __future__ import annotations
 
 import argparse
+from contextlib import nullcontext
 import json
 import math
 import os
@@ -58,10 +59,12 @@ from config import (  # noqa: E402
     load_config,
     validate_config,
     validate_paths,
+    add_config_arguments, select_config, new_run_id, save_run_config,
 )
+from prune_checkpoints import RetentionMonitor  # noqa: E402
 
 PROJECT_DIR = Path(__file__).resolve().parents[1]
-GUARD_DIR_NAME = "_guard"
+GUARD_DIR_NAME = "runtime/_guard"
 
 
 # --------------------------------------------------------------------------- #
@@ -170,8 +173,10 @@ if _EXPECTED:
     return guard_dir
 
 
-def stage_env(cfg: Config, run_dir: Path, stage: str, backend: Path, *, log_backend: str) -> dict:
-    guard_dir = write_guard(cfg, run_dir, stage, backend)
+def stage_env(cfg: Config, run_dir: Path, stage: str, backend: Path, *, log_backend: str,
+              install_guard: bool = True) -> dict:
+    guard_dir = (write_guard(cfg, run_dir, stage, backend) if install_guard
+                 else run_dir / GUARD_DIR_NAME / stage)
     pythonpath = os.pathsep.join([str(guard_dir), str(backend)])
     env = {
         "PYTHONPATH": pythonpath,
@@ -257,6 +262,8 @@ def build_overrides(cfg: Config, stage: str, *, model_path: str, critic_path: st
     # prompt+response respectively), so both are always passed explicitly.
     max_model_len = int(cfg.get("rollout.max_model_len") or length_budget)
     max_num_batched_tokens = int(cfg.get("rollout.max_num_batched_tokens") or length_budget)
+    keep_checkpoints = cfg.get("resources.keep_last_checkpoints")
+    save_freq = int(cfg.get("resources.save_freq"))
     overrides = [
         "algorithm.adv_estimator=grpo",
         f"data.prompt_key={cfg.get('data.prompt_key')}",
@@ -301,7 +308,7 @@ def build_overrides(cfg: Config, stage: str, *, model_path: str, critic_path: st
         "trainer.default_hdfs_dir=null",
         f"trainer.n_gpus_per_node={int(cfg.get('resources.n_gpus_per_node'))}",
         f"trainer.nnodes={int(cfg.get('resources.nnodes'))}",
-        f"trainer.save_freq={int(cfg.get('resources.save_freq'))}",
+        f"trainer.save_freq={save_freq}",
         f"trainer.test_freq={int(cfg.get('resources.test_freq'))}",
         f"trainer.total_epochs={epochs}",
         f"trainer.total_training_steps={total_steps}",
@@ -310,10 +317,13 @@ def build_overrides(cfg: Config, stage: str, *, model_path: str, critic_path: st
         f"trainer.experiment_name={stage}",
         f"hydra.run.dir={out_dir.parent / 'runtime' / 'hydra' / stage}",
     ]
-    if cfg.get("resources.max_actor_ckpt_to_keep"):
-        overrides.append(f"trainer.max_actor_ckpt_to_keep={int(cfg.get('resources.max_actor_ckpt_to_keep'))}")
-    if cfg.get("resources.max_critic_ckpt_to_keep"):
-        overrides.append(f"trainer.max_critic_ckpt_to_keep={int(cfg.get('resources.max_critic_ckpt_to_keep'))}")
+    # RetentionMonitor rotates whole checkpoints and can preserve exported models.
+    # Trainer rotation removes only actor/critic subdirectories and ignores pins.
+    if keep_checkpoints is None:
+        if cfg.get("resources.max_actor_ckpt_to_keep"):
+            overrides.append(f"trainer.max_actor_ckpt_to_keep={int(cfg.get('resources.max_actor_ckpt_to_keep'))}")
+        if cfg.get("resources.max_critic_ckpt_to_keep"):
+            overrides.append(f"trainer.max_critic_ckpt_to_keep={int(cfg.get('resources.max_critic_ckpt_to_keep'))}")
     if val_batch:
         overrides.append(f"data.val_batch_size={int(val_batch)}")
 
@@ -371,7 +381,7 @@ def build_overrides(cfg: Config, stage: str, *, model_path: str, critic_path: st
 
 
 def plan_stage(cfg: Config, run_dir: Path, stage: str, *, steps_per_epoch_value: int,
-               handoff: dict | None = None, resume: dict | None = None) -> dict:
+               handoff: dict | None = None, resume: dict | None = None, install_guard: bool = True) -> dict:
     backend = backend_path(cfg, stage)
     out_dir = stage_out_dir(cfg, run_dir, stage)
     python_bin = cfg.require("run.python_bin")
@@ -416,7 +426,8 @@ def plan_stage(cfg: Config, run_dir: Path, stage: str, *, steps_per_epoch_value:
         # Same-stage full-state resume (requires the gad-resume-worker-state patch).
         overrides.append("trainer.resume_load_worker_state=True")
     argv = [str(python_bin), "-m", "verl.trainer.main_ppo", *overrides]
-    env = stage_env(cfg, run_dir, stage, backend, log_backend=str(cfg.get("run.log_backend")))
+    env = stage_env(cfg, run_dir, stage, backend, log_backend=str(cfg.get("run.log_backend")),
+                    install_guard=install_guard)
     return {
         "stage": stage,
         "backend": str(backend),
@@ -661,9 +672,11 @@ def _stage_signature(cfg: Config, stage: str, *, legacy: bool) -> dict:
     """Build a stage training identity; legacy reproduces pre-performance markers."""
     # Completion identity tracks training inputs. Validation cadence and relocatable
     # paths are recorded elsewhere, so they cannot trigger a second training run.
+    cfg = cfg.for_stage(stage)
     excluded = {"run.output_root", "run.python_bin", "run.run_id", "run.val_before_train",
                 "run.log_backend", "run.eval_after_train", "run.skip_completed_stages",
-                "resources.test_freq", "resources.save_freq", "data.val_file",
+                "resources.test_freq", "resources.save_freq", "resources.keep_last_checkpoints",
+                "resources.keep_last_epochs", "data.val_file",
                 "rollout.val_n", "rollout.val_do_sample", "rollout.val_temperature",
                 "run.resume_worker_state",
                 "data.val_batch_size", "data.teacher_index", "data.manifest",
@@ -673,7 +686,7 @@ def _stage_signature(cfg: Config, stage: str, *, legacy: bool) -> dict:
         # rollouts or train a critic. These knobs only affect Warmup/GAD training.
         excluded.update({"rollout.gpu_memory_utilization", "optim.critic_dynamic_bsz",
                          "optim.critic_micro_batch_size_per_gpu"})
-    training = {k: v for k, v in cfg.to_dict().items()
+    training = {k: v for k, v in (cfg.identity_data or cfg.to_dict()).items()
                 if k not in excluded and not k.startswith("validation.") and not k.startswith("eval.")}
     for key in ("data.train_file", "models.student", "models.discriminator_init"):
         if key in training and training[key]:
@@ -752,6 +765,7 @@ def data_provenance(cfg: Config) -> dict:
 
 
 def stage_inputs_digest(cfg: Config, stage: str) -> dict:
+    cfg = cfg.for_stage(stage)
     digest = {
         "train_file_sha256": sha256_file(Path(str(cfg.require("data.train_file")))),
         "val_file_sha256": sha256_file(Path(str(cfg.require("data.val_file")))),
@@ -785,6 +799,7 @@ def _legacy_seqkd_marker_matches(cfg: Config, run_dir: Path, recorded_signature:
 
 
 def check_skip(cfg: Config, run_dir: Path, stage: str) -> tuple[bool, str]:
+    cfg = cfg.for_stage(stage)
     marker = completion_marker(run_dir, stage)
     if not marker.exists():
         return False, "no completion marker"
@@ -879,6 +894,7 @@ def export_warmup_handoff(cfg: Config, run_dir: Path, *, dry_run: bool) -> dict:
 
 def run_stage(cfg: Config, run_dir: Path, stage: str, *, dry_run: bool,
               resume_requested: bool = False) -> dict:
+    cfg = cfg.for_stage(stage)
     steps_per_epoch_value = steps_per_epoch(cfg)
     handoff = None
     resume: dict | None = None
@@ -917,7 +933,7 @@ def run_stage(cfg: Config, run_dir: Path, stage: str, *, dry_run: bool,
                 f"model={handoff['actor_hf']}")
 
     plan = plan_stage(cfg, run_dir, stage, steps_per_epoch_value=steps_per_epoch_value,
-                      handoff=handoff, resume=resume)
+                      handoff=handoff, resume=resume, install_guard=not dry_run)
 
     if dry_run:
         return plan
@@ -950,10 +966,16 @@ def run_stage(cfg: Config, run_dir: Path, stage: str, *, dry_run: bool,
     log(f"model   : {plan['model_path']}")
     log(f"discrim : {plan['critic_path']}")
 
-    process = run_command(
-        plan["argv"], env=plan["env"], cwd=str(PROJECT_DIR), log_path=plan["log"],
-        check=False, component=stage,
+    keep_checkpoints = cfg.get("resources.keep_last_checkpoints")
+    retention = (
+        RetentionMonitor(Path(plan["out_dir"]), keep_checkpoints=int(keep_checkpoints))
+        if keep_checkpoints is not None else nullcontext()
     )
+    with retention:
+        process = run_command(
+            plan["argv"], env=plan["env"], cwd=str(PROJECT_DIR), log_path=plan["log"],
+            check=False, component=stage,
+        )
     return finish_stage(
         cfg, run_dir, stage, plan, process=process, started=started,
         math_expected=math_expected, math_reason=math_reason, trainer_skipped=False,
@@ -1068,6 +1090,11 @@ def print_plan(cfg: Config, run_dir: Path, plans: list[dict], *, steps_per_epoch
           f"tp={cfg.get('rollout.tensor_model_parallel_size')} thinking={cfg.get('rollout.enable_thinking')} "
           f"(control={'on' if cfg.get('rollout.thinking_control') else 'off'})")
     print(f"gpus          : {cfg.get('resources.n_gpus_per_node')} x {cfg.get('resources.nnodes')} node(s)")
+    keep_checkpoints = cfg.get("resources.keep_last_checkpoints")
+    if keep_checkpoints is not None:
+        print(f"checkpoints   : save every {cfg.get('resources.save_freq')} steps; "
+              f"keep last {keep_checkpoints} saves per stage "
+              "(plus handoff and exported models)")
     print()
     for plan in plans:
         print("-" * 78)
@@ -1158,7 +1185,9 @@ def export_final_actor(cfg: Config, run_dir: Path, *, dry_run: bool) -> str:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--config", required=True)
+    add_config_arguments(parser)
+    parser.add_argument("--name", default="", help="Optional label for a new run")
+    parser.add_argument("--resume", action="store_true", help="Resume the saved config selected by --run")
     parser.add_argument("--stages", default=None, help="Comma-separated subset (default: seqkd,warmup,gad).")
     parser.add_argument("--from-stage", default=None, choices=TRAIN_STAGES)
     parser.add_argument("--to-stage", default=None, choices=TRAIN_STAGES)
@@ -1167,16 +1196,19 @@ def main() -> int:
     parser.add_argument("--force", action="store_true", help="Re-run stages even when a valid marker exists.")
     parser.add_argument("--resume-gad", action="store_true",
                         help="Enable full-state resume for the GAD stage (optimizer/scheduler/RNG).")
-    parser.add_argument("--set", action="append", default=None, metavar="KEY=VALUE",
-                        help="Override a config key (repeatable).")
     parser.add_argument("--skip-data-check", action="store_true")
     args = parser.parse_args()
 
-    cfg = load_config(args.config)
+    cfg = select_config(args)
+    source_config = str(cfg.path)
+    if args.resume and not cfg.existing_run:
+        raise PipelineError("--resume requires --run (or a saved run train.yaml)")
+    if cfg.existing_run and not (args.resume or args.resume_gad or cfg.legacy_selection):
+        raise PipelineError("an existing run was selected; pass --resume to continue its saved config")
+    if cfg.existing_run:
+        args.resume_gad = True
     if args.set:
-        overrides = parse_key_values(args.set)
-        cfg.data.update(overrides)
-        log(f"config overrides: {overrides}")
+        log(f"config overrides: {parse_key_values(args.set)}")
 
     problems = validate_config(cfg)
     if not args.skip_data_check:
@@ -1193,6 +1225,8 @@ def main() -> int:
     stages = list(TRAIN_STAGES)
     if args.stages:
         stages = [s.strip() for s in args.stages.split(",") if s.strip()]
+        if stages == ["all"]:
+            stages = list(TRAIN_STAGES)
         unknown = [s for s in stages if s not in TRAIN_STAGES]
         if unknown:
             raise PipelineError(f"unknown stage(s): {unknown}; known: {TRAIN_STAGES}")
@@ -1204,22 +1238,38 @@ def main() -> int:
         raise PipelineError("no stage selected")
 
     run_id = args.run_id or (None if cfg.get("run.run_id") == "auto" else str(cfg.get("run.run_id")))
-    run_dir = Path(cfg.require("run.output_root")) / (run_id or make_run_id("gad"))
+    if cfg.existing_run and args.run_id and args.run_id != str(cfg.get("run.run_id")):
+        raise PipelineError("--run-id cannot relocate an existing run; start a new experiment")
+    run_id = run_id or (new_run_id(cfg, args.name) if cfg.global_config else make_run_id("gad"))
+    import re
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", run_id):
+        raise PipelineError("invalid run ID")
+    cfg.data["run.run_id"] = run_id
+    run_dir = Path(cfg.require("run.output_root")) / run_id
+    if cfg.global_config and run_dir.exists():
+        raise PipelineError(f"new run directory already exists: {run_dir}; use --run ... --resume")
 
     if not args.dry_run:
-        ensure_dir(run_dir)
-        try:
-            import yaml as _yaml
-            from datetime import datetime, timezone
-            versions = ensure_dir(run_dir / "reports" / "resolved_configs")
-            stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
-            snapshot = versions / f"resolved_config_{stamp}.yaml"
-            snapshot.write_text(_yaml.safe_dump(cfg.to_dict(), sort_keys=True, allow_unicode=True), encoding="utf-8")
-            (run_dir / "current_resolved_config.txt").write_text(str(snapshot) + "\n", encoding="utf-8")
-            write_json(run_dir / "reports" / f"config_change_{stamp}.json", {
-                "source": str(cfg.path), "snapshot": str(snapshot), "previous": str(run_dir / "resolved_config.yaml")})
-        except Exception as exc:  # noqa: BLE001
-            log(f"WARNING: could not write resolved config snapshot: {exc}")
+        from datetime import datetime, timezone
+        if cfg.global_config:
+            save_run_config(cfg, run_dir)
+            (run_dir / "current_resolved_config.txt").write_text(str(cfg.path) + "\n", encoding="utf-8")
+        else:
+            ensure_dir(run_dir)
+            if not cfg.existing_run:
+                import yaml as _yaml
+                versions = ensure_dir(run_dir / "reports" / "resolved_configs")
+                stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+                snapshot = versions / f"resolved_config_{stamp}.yaml"
+                snapshot.write_text(_yaml.safe_dump(cfg.to_dict(), sort_keys=True, allow_unicode=True), encoding="utf-8")
+                (run_dir / "current_resolved_config.txt").write_text(str(snapshot) + "\n", encoding="utf-8")
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+        write_json(run_dir / "reports" / f"launch_{stamp}.json", {
+            "source_config": source_config, "config": str(cfg.path),
+            "config_sha256": sha256_file(cfg.path), "selection": cfg.selection,
+            "argv": sys.argv, "runtime_overrides": cfg.runtime_overrides,
+            "resume": cfg.existing_run, "stages": stages,
+        })
         if free_disk_gib(run_dir) < 5:
             log(f"WARNING: only {free_disk_gib(run_dir):.1f} GiB free under {run_dir}")
 
@@ -1235,6 +1285,19 @@ def main() -> int:
         prepare_argv.append("--recreate")
     if not args.dry_run:
         run_command(prepare_argv, component="backends")
+        if not args.skip_data_check:
+            preflight_argv = [
+                str(cfg.require("run.python_bin")), str(PROJECT_DIR / "tools" / "preflight.py"),
+                "--stages", ",".join(stages), "--skip-packages",
+                "--report", str(run_dir / "reports" / f"preflight_{stamp}.json"),
+            ]
+            if cfg.existing_run:
+                preflight_argv += ["--run", str(run_dir)]
+                for setting in args.set:
+                    preflight_argv += ["--set", setting]
+            else:
+                preflight_argv += ["--config", str(cfg.path)]
+            run_command(preflight_argv, component="preflight")
 
     # 2) plans
     steps_per_epoch_value = steps_per_epoch(cfg)
@@ -1242,7 +1305,7 @@ def main() -> int:
     for stage in stages:
         skip = False
         reason = ""
-        if not args.force and cfg.get("run.skip_completed_stages") and not args.dry_run:
+        if not args.force and cfg.get("run.skip_completed_stages") and (not args.dry_run or cfg.existing_run):
             skip, reason = check_skip(cfg, run_dir, stage)
         if skip:
             log(f"skipping stage {stage}: {reason}")

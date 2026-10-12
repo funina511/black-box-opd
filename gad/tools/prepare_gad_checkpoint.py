@@ -15,17 +15,18 @@ Two modes:
         python tools/merge_model2hf.py --local_dir .../global_step_${STEP}/critic
 
 ``--mode export-final``
-    Export the *trained* GAD actor (last complete ``global_step_*``) as an HF
+    Export the trained actor (latest complete checkpoint, or an explicitly
+    selected complete historical checkpoint) as an HF
     directory for evaluation. Evaluating the handoff actor instead would score
     the Warmup weights GAD started from, i.e. report "before GAD" numbers.
 
 In both modes:
 
-* the step is **discovered** (highest step whose checkpoint is complete), never
-  hard-coded and never guessed by lexicographic sort;
+* the default step is discovered from complete checkpoints; an explicit older
+  step is accepted only when that exact checkpoint is complete;
 * completeness is checked first: model shards, optimizer shards, ``config.json``,
   tokenizer files and ``data.pt`` must all be present;
-* the source directory is never modified;
+* source shard files are never modified; the HF export is written beside them;
 * every exported file is checksummed and recorded in the manifest, and the
   merged weights are compared key-by-key against their source shards.
 """
@@ -301,7 +302,12 @@ def export_final(args: argparse.Namespace) -> int:
     }
 
     step, source_ckpt, inspection = pick_last_complete(gad_dir, step=args.step, roles=("actor",))
-    log(f"last complete GAD checkpoint: global_step_{step} ({source_ckpt})")
+    if args.step is not None and step != args.step:
+        raise PipelineError(
+            f"requested global_step_{args.step} is incomplete; newest complete checkpoint "
+            f"at or below it is global_step_{step}"
+        )
+    log(f"selected complete actor checkpoint: global_step_{step} ({source_ckpt})")
     manifest["step"] = step
     manifest["source_checkpoint"] = str(source_ckpt)
     manifest["inspected_checkpoints"] = inspection
@@ -311,14 +317,18 @@ def export_final(args: argparse.Namespace) -> int:
         recorded = latest_file.read_text(encoding="utf-8").strip()
         manifest["gad_latest_marker"] = recorded
         if recorded != str(step):
-            marker_problem = (
-                f"{latest_file} says {recorded!r} but the newest complete checkpoint is {step}; "
-                "the GAD run may not have finished cleanly"
-            )
-            if args.allow_marker_mismatch:
-                problems.append(marker_problem)
+            if args.step is not None and int(recorded) > step:
+                log(f"explicit historical checkpoint global_step_{step}; latest marker is {recorded}")
             else:
-                raise PipelineError(f"{marker_problem}. Re-run GAD to completion, or pass --allow-marker-mismatch.")
+                marker_problem = (
+                    f"{latest_file} says {recorded!r} but the selected complete checkpoint is {step}; "
+                    "the run may not have finished cleanly"
+                )
+                if args.allow_marker_mismatch:
+                    problems.append(marker_problem)
+                else:
+                    raise PipelineError(f"{marker_problem}. Re-run training to completion, "
+                                        "or pass --allow-marker-mismatch.")
     else:
         problems.append(f"{latest_file} missing (cannot confirm which step GAD considered latest)")
 

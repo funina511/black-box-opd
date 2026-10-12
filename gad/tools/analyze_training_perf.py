@@ -10,6 +10,8 @@ from pathlib import Path
 import re
 import statistics
 
+from config import load_config, nested_config
+
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
 STEP = re.compile(r"(?:^|\s)step:(\d+)\s+-")
 FIELD = re.compile(r"([A-Za-z_][A-Za-z0-9_./-]*):(-?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)")
@@ -156,9 +158,10 @@ def main() -> None:
     if not records:
         parser.error(f"no completed training steps found in {log}")
     config_pointer = run_dir / "current_resolved_config.txt"
-    config_path = Path(config_pointer.read_text().strip()) if config_pointer.is_file() else run_dir / "resolved_config.yaml"
-    import yaml
-    config = yaml.safe_load(config_path.read_text(encoding="utf-8")) if config_path.is_file() else {}
+    config_path = run_dir / "train.yaml"
+    if not config_path.is_file():
+        config_path = Path(config_pointer.read_text().strip()) if config_pointer.is_file() else run_dir / "resolved_config.yaml"
+    config = nested_config(load_config(config_path).for_stage(args.stage).data) if config_path.is_file() else {}
     batch = (config.get("data") or {}).get("train_batch_size")
     rollout = config.get("rollout") or {}
     candidates = rollout.get("n") if args.stage == "gad" else rollout.get(f"n_{args.stage}")

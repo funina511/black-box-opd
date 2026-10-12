@@ -121,6 +121,7 @@ DEFAULTS: dict[str, Any] = {
     "resources.nnodes": 1,
     "resources.gpus": "",
     "resources.save_freq": 50,
+    "resources.keep_last_checkpoints": None,
     "resources.test_freq": 50,
     "resources.max_actor_ckpt_to_keep": None,
     "resources.max_critic_ckpt_to_keep": None,
@@ -187,6 +188,26 @@ class Config:
     def __init__(self, data: dict, *, path: Path):
         self.data = data
         self.path = path
+        self.identity_data = None
+        self.selection = {}
+        self.runtime_overrides = {}
+        self.global_config = False
+        self.existing_run = False
+        self.legacy_selection = False
+        self.stage_overrides = {}
+
+    def for_stage(self, stage: str) -> "Config":
+        overlay = self.stage_overrides.get(stage)
+        if not overlay:
+            return self
+        data = {**self.data, **overlay}
+        for key in self.runtime_overrides:
+            data[key] = self.data[key]
+        result = Config(data, path=self.path)
+        result.identity_data = {**(self.identity_data or self.data), **overlay}
+        result.runtime_overrides = dict(self.runtime_overrides)
+        result.existing_run = self.existing_run
+        return result
 
     def get(self, key: str, default: Any = None) -> Any:
         if key in self.data:
@@ -240,9 +261,7 @@ def resolve_paths(data: dict, base_dir: Path) -> dict:
             candidate = Path(value)
             if candidate.is_absolute():
                 return str(candidate)
-            # Only treat it as a path when it looks like one.
-            if "/" in value or value.endswith((".json", ".yaml", ".yml", ".parquet", ".jsonl", ".pt")):
-                return str((base_dir / candidate).resolve())
+            return str((base_dir / candidate).resolve())
         return value
 
     resolved = dict(data)
@@ -255,38 +274,250 @@ def resolve_paths(data: dict, base_dir: Path) -> dict:
     return resolved
 
 
-def load_config(path: str | Path) -> Config:
+LMOPS_DIR = GAD_DIR.parent
+GLOBAL_CONFIG = LMOPS_DIR / "train.yaml"
+CONFIG_METADATA = {"selection", "catalog", "legacy_runs", "_stage_overrides"}
+RUNTIME_KEYS = {
+    "resources.gpus", "run.python_bin", "run.log_backend", "run.val_before_train",
+    "resources.save_freq", "resources.test_freq", "resources.keep_last_checkpoints",
+}
+
+
+def read_yaml(path: Path) -> dict:
     import yaml
-
-    config_path = Path(path).expanduser().resolve()
-    if not config_path.exists():
-        raise PipelineError(f"pipeline config not found: {config_path}")
-    raw = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
     if not isinstance(raw, dict):
-        raise PipelineError(f"pipeline config must be a mapping: {config_path}")
+        raise PipelineError(f"config must be a YAML mapping: {path}")
+    return raw
 
-    data = dict(DEFAULTS)
-    for key, value in flatten_dict(raw).items():
-        data[key] = value
-    # Keep unknown keys so the manifest records exactly what the user wrote.
-    known = set(DEFAULTS)
-    for key, value in flatten_dict(raw).items():
-        if key not in known:
-            data.setdefault(key, value)
 
-    data = resolve_paths(data, config_path.parent)
-    if not data.get("run.python_bin"):
-        import sys
+def nested_config(data: dict) -> dict:
+    """Normalize old dotted-key snapshots and new nested configs."""
+    result: dict = {}
+    for key, value in sorted(flatten_dict(data).items(), key=lambda item: (item[0].count("."), item[0])):
+        parts = key.split(".")
+        node = result
+        for part in parts[:-1]:
+            if not isinstance(node.get(part), dict):
+                node[part] = {}
+            node = node[part]
+        node[parts[-1]] = value
+    return result
 
-        data["run.python_bin"] = sys.executable
-    if not data.get("models.discriminator_init"):
-        data["models.discriminator_init"] = data.get("models.student")
-    if not data.get("validation.scorer_path"):
-        # The vendored CARD-aligned scorer, so training validation and the
-        # offline evaluation use one implementation.
+
+def legacy_runs() -> dict[str, Path]:
+    if not GLOBAL_CONFIG.is_file():
+        return {}
+    return {name: (GLOBAL_CONFIG.parent / value).resolve()
+            for name, value in read_yaml(GLOBAL_CONFIG).get("legacy_runs", {}).items()}
+
+
+def resolve_run(value: str | Path) -> Path:
+    raw = Path(value).expanduser()
+    candidates = [raw, LMOPS_DIR / raw, LMOPS_DIR / "runs" / raw]
+    registered = legacy_runs().get(str(value))
+    if registered:
+        candidates.append(registered)
+    for candidate in candidates:
+        if candidate.is_dir():
+            return candidate.resolve()
+    matches = [path for path in (LMOPS_DIR / "runs").glob("*/*")
+               if path.is_dir() and path.name == str(value)]
+    if len(matches) == 1:
+        return matches[0].resolve()
+    if len(matches) > 1:
+        raise PipelineError(f"ambiguous run {value}; pass its full directory path")
+    raise PipelineError(f"run directory not found: {value}")
+
+
+def run_config_path(value: str | Path) -> Path:
+    run_dir = resolve_run(value)
+    primary = run_dir / "train.yaml"
+    if primary.is_file():
+        return primary
+    pointer = run_dir / "current_resolved_config.txt"
+    if pointer.is_file():
+        snapshot = Path(pointer.read_text(encoding="utf-8").strip())
+        if not snapshot.is_absolute():
+            snapshot = run_dir / snapshot
+        if snapshot.is_file():
+            return snapshot
+    old = run_dir / "resolved_config.yaml"
+    if old.is_file():
+        return old
+    raise PipelineError(f"no saved training config under {run_dir}")
+
+
+def config_file(path: str | Path) -> Path:
+    requested = Path(path).expanduser().resolve()
+    if requested.is_file():
+        return requested
+    # Preserve explicit old config paths after experiments/ has been archived.
+    if (requested.name == "train.yaml" and requested.parent.parent == LMOPS_DIR / "experiments"
+            and requested.parent.name in legacy_runs()):
+        return run_config_path(legacy_runs()[requested.parent.name])
+    raise PipelineError(f"pipeline config not found: {requested}")
+
+
+def _resolved_config(data: dict, path: Path) -> Config:
+    import sys
+    resolved = resolve_paths({**DEFAULTS, **flatten_dict(data)}, path.parent)
+    if not resolved.get("run.python_bin"):
+        resolved["run.python_bin"] = sys.executable
+    if not resolved.get("models.discriminator_init"):
+        resolved["models.discriminator_init"] = resolved.get("models.student")
+    if not resolved.get("validation.scorer_path"):
         candidate = GAD_DIR.parent / "sample" / "math_scorer.py"
-        data["validation.scorer_path"] = str(candidate) if candidate.is_file() else None
-    return Config(data, path=config_path)
+        resolved["validation.scorer_path"] = str(candidate) if candidate.is_file() else None
+    return Config(resolved, path=path)
+
+
+def validate_override_keys(data: dict) -> None:
+    known = set(DEFAULTS) | set(REQUIRED)
+    unknown = [key for key in data if key not in known
+               and not any(key == f"budget.{group}.{stage}" for group in ("stage_epochs", "epochs_override")
+                           for stage in TRAIN_STAGES)]
+    if unknown:
+        raise PipelineError(f"unknown training override(s): {unknown}")
+
+
+def compose_config(path: str | Path = GLOBAL_CONFIG, *, model: str | None = None,
+                   dataset: str | None = None, overrides: list[str] | None = None,
+                   settings: list[str] | None = None) -> Config:
+    from common import parse_key_values
+    path = config_file(path)
+    raw = read_yaml(path)
+    data = resolve_paths(flatten_dict({key: value for key, value in raw.items()
+                                      if key not in CONFIG_METADATA}), path.parent)
+    selection = raw.get("selection", {})
+    chosen = {"model": model or selection.get("model"), "dataset": dataset or selection.get("dataset")}
+    for kind, group in (("model", "models"), ("dataset", "datasets")):
+        name = chosen[kind]
+        if name:
+            choices = raw.get("catalog", {}).get(group, {})
+            if name not in choices:
+                raise PipelineError(f"unknown {kind} {name!r}; available: {', '.join(choices)}")
+            layer = resolve_paths(flatten_dict(choices[name]), path.parent)
+            if kind == "model" and "models.discriminator_init" not in layer:
+                layer["models.discriminator_init"] = layer.get("models.student")
+            data.update(layer)
+    for value in overrides or []:
+        overlay_path = Path(value).expanduser().resolve()
+        overlay = read_yaml(overlay_path)
+        if CONFIG_METADATA & overlay.keys():
+            raise PipelineError(f"override YAML must contain training settings only: {overlay_path}")
+        overlay_data = flatten_dict(overlay)
+        validate_override_keys(overlay_data)
+        data.update(resolve_paths(overlay_data, overlay_path.parent))
+    # CLI paths are relative to the invocation directory, never to runs/<id>/.
+    cli_settings = parse_key_values(settings or [])
+    validate_override_keys(cli_settings)
+    data.update(resolve_paths(cli_settings, Path.cwd()))
+    cfg = _resolved_config(data, path)
+    cfg.selection = {key: value for key, value in chosen.items() if value}
+    cfg.global_config = bool(raw.get("catalog"))
+    cfg.stage_overrides = {stage: resolve_paths(flatten_dict(value), path.parent)
+                           for stage, value in raw.get("_stage_overrides", {}).items()}
+    return cfg
+
+
+def load_config(path: str | Path) -> Config:
+    path = config_file(path)
+    raw = read_yaml(path)
+    if raw.get("catalog"):
+        return compose_config(path)
+    cfg = _resolved_config({key: value for key, value in raw.items() if key not in CONFIG_METADATA}, path)
+    cfg.stage_overrides = {stage: resolve_paths(flatten_dict(value), path.parent)
+                           for stage, value in raw.get("_stage_overrides", {}).items()}
+    return cfg
+
+
+def load_run_config(value: str | Path) -> Config:
+    run_dir = resolve_run(value)
+    cfg = load_config(run_config_path(run_dir))
+    recorded = Path(cfg.require("run.output_root")) / str(cfg.require("run.run_id"))
+    if recorded.resolve() != run_dir:
+        raise PipelineError(f"saved config points to {recorded}, not requested run {run_dir}")
+    cfg.identity_data = dict(cfg.data)
+    return cfg
+
+
+def add_config_arguments(parser, *, config_alias: str | None = None) -> None:
+    flags = ["--config"] + ([config_alias] if config_alias else [])
+    parser.add_argument(*flags, dest="config", help="Global template or saved training YAML")
+    parser.add_argument("--run", help="Existing run directory or registered historical name")
+    parser.add_argument("--model", help="Model name in the global catalog")
+    parser.add_argument("--dataset", help="Prepared dataset name in the global catalog")
+    parser.add_argument("--overrides", action="append", default=[], help="Small training override YAML")
+    parser.add_argument("--set", action="append", default=[], metavar="KEY=VALUE")
+    parser.add_argument("--model-name", help="Legacy experiment selector; prefer --model for new runs")
+    parser.add_argument("--experiment-name", help="Legacy experiment selector")
+    parser.add_argument("--experiment", help="Registered historical experiment name")
+
+
+def select_config(args, *, existing_only: bool = False) -> Config:
+    from common import parse_key_values
+    legacy = args.experiment
+    if args.model_name and not args.dataset:
+        legacy = legacy or (args.model_name + ("_" + args.experiment_name if args.experiment_name else ""))
+    elif args.experiment_name and not args.model_name:
+        raise PipelineError("--experiment-name requires --model-name; use --name for a new run label")
+    if args.run and legacy:
+        raise PipelineError("choose either --run or a legacy experiment selector")
+    run = args.run or legacy
+    if run:
+        if args.config or args.model or args.dataset or args.overrides:
+            raise PipelineError("--run selects a frozen config; do not combine it with model/data/template selection")
+        cfg = load_run_config(run)
+        updates = parse_key_values(args.set)
+        forbidden = set(updates) - RUNTIME_KEYS
+        if forbidden:
+            raise PipelineError(f"resume cannot change training settings {sorted(forbidden)}; start a new run")
+        cfg.data.update(resolve_paths(updates, Path.cwd()))
+        cfg.runtime_overrides = updates
+        cfg.existing_run = True
+        cfg.legacy_selection = bool(legacy)
+    else:
+        if existing_only and not args.config:
+            raise PipelineError("select an existing experiment with --run or --config")
+        cfg = compose_config(args.config or GLOBAL_CONFIG, model=args.model or args.model_name,
+                             dataset=args.dataset, overrides=args.overrides, settings=args.set)
+        if existing_only and cfg.global_config:
+            raise PipelineError("this operation needs an existing run; pass --run")
+        saved_dir = Path(cfg.require("run.output_root")) / str(cfg.get("run.run_id"))
+        if cfg.path == saved_dir / "train.yaml":
+            cfg.identity_data = dict(cfg.data)
+            if args.set or args.overrides:
+                raise PipelineError("use --run for recorded runtime overrides on a saved config")
+            cfg.existing_run = True
+    return cfg
+
+
+def new_run_id(cfg: Config, name: str = "") -> str:
+    from datetime import datetime, timezone, timedelta
+    import re
+    parts = [cfg.selection.get("model", "model"), cfg.selection.get("dataset", "data")]
+    if name:
+        parts.append(name)
+    if not all(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", part) for part in parts):
+        raise PipelineError("model, dataset and run label must use letters, digits, _, - or .")
+    stamp = datetime.now(timezone(timedelta(hours=8))).strftime("%Y%m%d-%H%M%S-%f")
+    return "_".join([*parts, stamp])
+
+
+def save_run_config(cfg: Config, run_dir: Path) -> None:
+    """Claim a new run directory; never overwrite an existing experiment."""
+    import os
+    import yaml
+    try:
+        run_dir.mkdir(parents=True, exist_ok=False)
+    except FileExistsError as exc:
+        raise PipelineError(f"run already exists: {run_dir}; choose a new name or --run ... --resume") from exc
+    target = run_dir / "train.yaml"
+    temporary = target.with_suffix(".yaml.tmp")
+    temporary.write_text(yaml.safe_dump(nested_config(cfg.data), sort_keys=False, allow_unicode=True), encoding="utf-8")
+    os.replace(temporary, target)
+    cfg.path = target
 
 
 def validate_paths(config: Config, *, check_exists: bool) -> list[str]:
@@ -315,8 +546,10 @@ def validate_config(config: Config) -> list[str]:
             problems.append(f"missing required key: {key}")
 
     for stage in TRAIN_STAGES:
-        if config.get(f"budget.stage_epochs.{stage}") is not None:
-            # The epoch budget replaces the step budget for this stage.
+        value = config.get(f"budget.stage_epochs.{stage}")
+        if value is not None:
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                problems.append(f"budget.stage_epochs.{stage} must be a positive integer")
             continue
         key = STAGE_STEPS_KEY[stage]
         try:
@@ -326,6 +559,12 @@ def validate_config(config: Config) -> list[str]:
             continue
         if steps <= 0:
             problems.append(f"{key} must be > 0 (got {config.get(key)!r})")
+
+    warmup_epochs = config.get("budget.stage_epochs.warmup")
+    gad_epochs = config.get("budget.stage_epochs.gad")
+    if (isinstance(warmup_epochs, int) and isinstance(gad_epochs, int)
+            and gad_epochs <= warmup_epochs):
+        problems.append("GAD absolute epoch target must exceed the Warmup epoch budget")
 
     batch = config.get("data.train_batch_size")
     if batch is not None:
@@ -356,6 +595,15 @@ def validate_config(config: Config) -> list[str]:
                 )
         except (TypeError, ValueError):
             pass
+
+    keep_checkpoints = config.get("resources.keep_last_checkpoints")
+    if keep_checkpoints is not None:
+        if isinstance(keep_checkpoints, bool) or not isinstance(keep_checkpoints, int):
+            problems.append("resources.keep_last_checkpoints must be an integer")
+        elif keep_checkpoints < 1:
+            problems.append("resources.keep_last_checkpoints must be >= 1")
+    if config.get("resources.keep_last_epochs") is not None:
+        problems.append("resources.keep_last_epochs was replaced by resources.keep_last_checkpoints")
 
     if config.get("validation.quick_enabled"):
         quick = config.get("validation.quick_file")

@@ -1,31 +1,39 @@
 # LMOps
 
-Qwen3-1.7B 的 SeqKD → Warmup → GAD 实验入口。训练实现位于 `gad/`，数据生产实现位于 `sample/`；实验的唯一可编辑配置在 `experiments/qwen3_1.7b/`。
-
-| 位置 | 内容 |
-| --- | --- |
-| `experiments/qwen3_1.7b/train.yaml` | 训练、验证与恢复配置 |
-| `experiments/qwen3_1.7b/sample.yaml` | 采样与数据转换配置 |
-| `data/dapo_math_17k_gad/` | 专用数据、教师索引、固定 quick dev 与采样日志 |
-| `assets/models/`, `assets/datasets/` | 指向共享模型及原始数据的本机链接 |
-| `runs/gad_qwen3_1.7b/qwen3-1.7b-4x3090/` | checkpoint、日志、Hydra 输出、报告与评测 |
-| `docs/` | [训练验证提速与目录整理计划](docs/训练验证提速与目录整理计划.md)和[原 GAD 计划](docs/GAD修改计划.md) |
-
-本机首次使用时运行 `bash scripts/link_assets.sh` 创建共享资源链接；可用 `GAD_STUDENT_MODEL`、`GAD_TEACHER_MODEL`、`GAD_DAPO_DATASET`、`GAD_MATH_EVAL_DATASET` 指定其他位置。独立数学评测集当前尚未准备。
-
-从任意目录调用：
+Qwen3 的 SeqKD → Warmup → GAD 通用实验入口。新实验通过一份 [train.yaml](train.yaml) 选择模型、准备好的数据集和训练参数；启动时自动将完整配置保存到 `runs/<运行名>/train.yaml`。
 
 ```bash
-bash /mnt/jinbo/RLRM/LMOps/scripts/sample.sh --dry-run --stage validate
-bash /mnt/jinbo/RLRM/LMOps/scripts/preflight.sh --stages seqkd --skip-packages
-bash /mnt/jinbo/RLRM/LMOps/scripts/train.sh --stages seqkd --dry-run
-bash /mnt/jinbo/RLRM/LMOps/scripts/train.sh --stages seqkd
-bash /mnt/jinbo/RLRM/LMOps/scripts/benchmark_train.sh --candidate baseline  # dry-run
+cd /mnt/jinbo/RLRM/LMOps
+# 先检查计划，再启动；两条命令使用同样的参数
+bash scripts/train.sh --model qwen3_0.6b --dataset dapo_math_17k --name n2 --dry-run
+bash scripts/train.sh --model qwen3_0.6b --dataset dapo_math_17k --name n2
+# 切换数据和模型，无需复制完整 YAML
+bash scripts/train.sh --model qwen3_1.7b --dataset dapo_math_5k --name trial --dry-run
+# 已有实验：按其保存配置恢复、评测、导出
+bash scripts/train.sh --run qwen3_0.6b_17k --resume --dry-run
+bash evaluate/run_eval.sh --run qwen3_0.6b_17k --dry-run
+bash scripts/export_model.sh --run qwen3_0.6b_17k --stage gad --dry-run
 ```
 
-`train.sh` 原样转发 `--stages`、`--from-stage`、`--to-stage`、`--set`、`--resume-gad` 等参数。`eval.sh` 转发评测脚本参数，需要指定 `--model` 和 `--parquet`。完整恢复说明见[实验 README](experiments/qwen3_1.7b/README.md)。
+| 位置 | 用途 |
+| --- | --- |
+| `train.yaml` | 全局训练默认值、模型/数据映射及历史 run 别名 |
+| `scripts/train.sh` | 通用启动入口；顶部可设置模型、数据和覆盖参数 |
+| `runs/<运行名>/train.yaml` | 自动保存的本次完整配置，恢复/评测/导出的依据 |
+| `evaluate/run_eval.sh` | 设置目标 run、评测模型、数据集和采样参数 |
+| `sample/configs/sample.yaml` | 共享教师数据的生产配置，入口为 `scripts/sample.sh` |
+| `gad/configs/benchmark_candidates.yaml` | 性能候选设置，入口为 `scripts/benchmark_train.sh` |
+| `data/`、`assets/` | 共享准备好数据、模型和原始数据链接 |
+| `docs/` | [实验运行指南](docs/实验运行指南.md)及[本次改造计划](docs/全局训练配置与实验目录精简计划.md) |
+
+初始全局默认采用 0.6B 探索设置：non-thinking、GAD n=2、batch=64、SeqKD/Warmup/GAD 为 2/1/2 epoch，GAD 的 epoch 是包含 Warmup 的绝对目标。每 50 step 及阶段末保存一次，每阶段轮换最近 5 次完整保存；交接、完成结果和已导出模型额外保留。
+
+原 `experiments/` 已归档到各 run 的 `reports/legacy_experiment/`，旧 checkpoint 路径保留。`qwen3_0.6b_5k`、`qwen3_0.6b_17k`、`qwen3_1.7b` 是历史 run 别名；新实验使用自动生成的唯一目录名。全局配置进入 Git，运行配置随 `runs/` 一起备份。
 
 ## 原仓库说明
+
+独立离线 rubric 实验入口：[rubric/README.md](rubric/README.md)；
+运行 bash scripts/rubric.sh --stage all --dry-run 查看固定轨迹、judge 与资源计划。
 
 <!--# LMOps: Enabling AI w/ LLMs-->
 

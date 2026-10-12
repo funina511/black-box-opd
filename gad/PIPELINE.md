@@ -1,5 +1,5 @@
 > Qwen3-1.7B 当前实验请从 `LMOps/scripts/train.sh`、`LMOps/scripts/preflight.sh` 和
-> `LMOps/experiments/qwen3_1.7b/train.yaml` 进入；运行产物在 `LMOps/runs/`。
+> `LMOps/train.yaml` 进入；运行产物在 `LMOps/runs/`。
 > 下面的 `gad/` 命令仍是通用实现说明。
 
 # GAD 三阶段流水线（SeqKD → Warmup → GAD）实施说明
@@ -371,7 +371,7 @@ KV 池在每次 actor 更新前就被丢弃，所以给它留大一点是"显存
 反传正好落在第 11 步，峰值是 Adam 状态回迁 + 12288-token 的 LM head logits。
 **SeqKD 跑到第 10 步不代表任何阶段的分批或显存是安全的。**
 
-阶梯（`LMOps/experiments/qwen3_1.7b/train.yaml` 里有同一份注释，依次试，别一次全加）：
+阶梯（全局 `LMOps/train.yaml` 可设置这些字段，依次试，别一次全加）：
 
 1. `rollout.enforce_eager: true`（已默认）—— 去掉常驻训练期的 CUDA graph pool；
    后端/原版 harness 的默认本来就是 `ENFORCE_EAGER:=True`。

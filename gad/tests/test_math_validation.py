@@ -35,6 +35,7 @@ import re
 import sys
 import tempfile
 import textwrap
+import time
 import unittest
 from pathlib import Path
 
@@ -220,6 +221,10 @@ class MathValidationTests(unittest.TestCase):
             "reward_extra_infos_dict": collections.defaultdict(list, {"reward": [0.5, 0.5]}),
             "os": os,
             "json": json,
+            "time": time,
+            "scope": "full",
+            "_gad_started": time.perf_counter(),
+            "_gad_timing": {"generation": 0.0, "decode": 0.0, "rouge_l": 0.0, "math_scoring": 0.0},
         }
         namespace.update(
             {name: getattr(self.ray_trainer, name) for name in dir(self.ray_trainer) if name.startswith("_gad_")}
@@ -285,44 +290,31 @@ class MathValidationTests(unittest.TestCase):
             self.assertFalse((tmp_path / "validation_math_metrics.jsonl").exists())
 
     # -------------------------------------------------------------- frozen
-    def test_only_marked_insertions_were_added_to_ray_trainer(self) -> None:
-        """Byte-level proof that the patch inserts and never rewrites logic.
+    def test_only_known_patches_were_added_to_ray_trainer(self) -> None:
+        """The backend must match the pinned source plus the known patches.
 
-        ``ray_trainer.py`` carries the reward/advantage computation, so the
-        diff against the pinned checkout must consist purely of marked
-        insertions: no deleted line, and every added line inside a
-        ``PATCH(gad:...)`` block.
+        Validation scope includes timing imports and two replaced statements,
+        so a purely insertion-based assertion no longer describes that patch.
+        Reward/advantage byte equality is checked separately below.
         """
-        import difflib
+        import shutil
+        import backend_patches
 
-        pristine_path = GAD_DIR / "verl" / "verl" / "trainer" / "ppo" / "ray_trainer.py"
-        if not pristine_path.exists():
-            self.skipTest(f"pinned checkout missing: {pristine_path}")
-        pristine = pristine_path.read_text(encoding="utf-8").splitlines()
-        patched = self.source.splitlines()
-
-        diff = list(difflib.unified_diff(pristine, patched, lineterm="", n=0))
-        removed = [line for line in diff if line.startswith("-") and not line.startswith("---")]
-        self.assertEqual(removed, [], f"the patch deleted lines: {removed[:5]}")
-
-        hunks: list[list[str]] = []
-        current: list[str] = []
-        for line in diff:
-            if line.startswith("+") and not line.startswith("+++"):
-                current.append(line[1:])
-            else:
-                if current:
-                    hunks.append(current)
-                current = []
-        if current:
-            hunks.append(current)
-
-        self.assertTrue(hunks, "expected the math patch to add lines")
-        for hunk in hunks:
-            self.assertTrue(
-                any("PATCH(gad:" in line for line in hunk),
-                f"an added block is not part of a marked patch: {hunk[:3]}",
-            )
+        pristine = GAD_DIR / "verl"
+        trainer = Path("verl/trainer/ppo/ray_trainer.py")
+        config = Path("verl/trainer/config/ppo_trainer.yaml")
+        if not (pristine / trainer).exists():
+            self.skipTest(f"pinned checkout missing: {pristine / trainer}")
+        with tempfile.TemporaryDirectory() as temporary:
+            expected = Path(temporary)
+            for relative in (trainer, config):
+                (expected / relative).parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(pristine / relative, expected / relative)
+            for patch in (backend_patches.ResumeWorkerStatePatch(),
+                          backend_patches.MathValidationPatch(),
+                          backend_patches.ValidationScopePatch()):
+                patch.apply(expected)
+            self.assertEqual((expected / trainer).read_text(encoding="utf-8"), self.source)
 
     def test_reward_and_advantage_code_is_byte_identical(self) -> None:
         pristine_path = GAD_DIR / "verl" / "verl" / "trainer" / "ppo" / "ray_trainer.py"

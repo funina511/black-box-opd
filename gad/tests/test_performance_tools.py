@@ -10,7 +10,7 @@ sys.path.insert(0, str(TOOLS))
 import analyze_training_perf as perf  # noqa: E402
 import benchmark_train as bench  # noqa: E402
 import compare_training_perf as compare_perf  # noqa: E402
-from config import load_config, validate_config  # noqa: E402
+from config import load_config, load_run_config, validate_config  # noqa: E402
 
 
 class PerformanceToolsTests(unittest.TestCase):
@@ -83,7 +83,7 @@ class PerformanceToolsTests(unittest.TestCase):
                 compare_perf.compare(results)
 
     def test_critic_micro_must_divide_normalized_minibatch(self):
-        cfg = load_config(Path(__file__).resolve().parents[2] / "experiments/qwen3_1.7b/train.yaml")
+        cfg = load_run_config("qwen3_1.7b").for_stage("warmup")
         cfg.data["optim.critic_micro_batch_size_per_gpu"] = 3
         problems = validate_config(cfg)
         self.assertTrue(any("normalized critic minibatch" in item for item in problems), problems)

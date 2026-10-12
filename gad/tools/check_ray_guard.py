@@ -140,8 +140,8 @@ def main() -> int:
     # Reuse the exact guard the pipeline installs, so this checks the real thing.
     from pipeline import write_guard
 
-    write_guard(None, temp_root / "run", "guard-check", backend)
-    shutil.copy2(temp_root / "run" / "_guard" / "guard-check" / "sitecustomize.py", guard_dir / "sitecustomize.py")
+    installed_guard = write_guard(None, temp_root / "run", "guard-check", backend)
+    shutil.copy2(installed_guard / "sitecustomize.py", guard_dir / "sitecustomize.py")
 
     log(f"backend : {backend} @ {commit[:10]}")
     log(f"guard   : {guard_dir}")

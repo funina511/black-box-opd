@@ -17,14 +17,14 @@ import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from common import PipelineError, ensure_dir, sha256_file, write_json  # noqa: E402
-from config import load_config, validate_config, validate_paths  # noqa: E402
+from config import load_config, load_run_config, resolve_run, validate_config, validate_paths  # noqa: E402
 from pipeline import (plan_stage, steps_per_epoch, verify_checkpoint_dir,  # noqa: E402
                       dataset_rows)
 from analyze_training_perf import parse_steps, summarize_steps  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_CONFIG = ROOT / "experiments/qwen3_1.7b/train.yaml"
-DEFAULT_CANDIDATES = ROOT / "experiments/qwen3_1.7b/perf/candidates.yaml"
+DEFAULT_CONFIG = None
+DEFAULT_CANDIDATES = ROOT / "gad/configs/benchmark_candidates.yaml"
 DEFAULT_SOURCE = ROOT / "runs/gad_qwen3_1.7b/qwen3-1.7b-4x3090"
 SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 
@@ -153,7 +153,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     parser.add_argument("--candidates", type=Path, default=DEFAULT_CANDIDATES)
-    parser.add_argument("--source-run", type=Path, default=DEFAULT_SOURCE)
+    parser.add_argument("--source-run", "--run", type=Path, default=DEFAULT_SOURCE)
     parser.add_argument("--source-step", type=int)
     parser.add_argument("--candidate", required=True)
     parser.add_argument("--steps", type=int, default=7)
@@ -167,7 +167,7 @@ def main() -> int:
     candidates = yaml.safe_load(args.candidates.read_text()) or {}
     if args.candidate not in candidates:
         parser.error(f"unknown candidate {args.candidate}; choose from {', '.join(candidates)}")
-    source_run = args.source_run.resolve()
+    source_run = resolve_run(args.source_run)
     marker = source_run / "warmup/latest_checkpointed_iteration.txt"
     if not marker.is_file():
         parser.error(f"source marker missing: {marker}")
@@ -178,7 +178,8 @@ def main() -> int:
         parser.error("run-id must contain only letters, numbers, dot, underscore or dash")
     if args.execute:
         assert_no_training()
-    cfg = load_config(args.config)
+    cfg = load_config(args.config) if args.config else load_run_config(source_run).for_stage("warmup")
+    cfg.identity_data = None
     cfg.data.update(candidates[args.candidate] or {})
     cfg.data.update({"run.output_root": str(ROOT / "runs/performance_benchmarks"),
                      "run.run_id": run_id,
@@ -195,20 +196,24 @@ def main() -> int:
     run_dir = Path(cfg.require("run.output_root")) / run_id
     if run_dir.exists():
         raise PipelineError(f"benchmark run_id already exists: {run_dir}")
-    plan = plan_stage(cfg, run_dir, "warmup", steps_per_epoch_value=steps_per_epoch(cfg))
+    plan = plan_stage(cfg, run_dir, "warmup", steps_per_epoch_value=steps_per_epoch(cfg),
+                      install_guard=args.execute)
     plan["argv"].append("trainer.resume_mode=auto")
-    reports = ensure_dir(run_dir / "reports")
-    config_path = reports / "resolved_benchmark_config.yaml"
-    config_path.write_text(yaml.safe_dump(cfg.to_dict(), sort_keys=True, allow_unicode=True))
-    (run_dir / "current_resolved_config.txt").write_text(str(config_path) + "\n")
-    compose_hydra(plan, run_dir)
     print(f"candidate={args.candidate} source=warmup/global_step_{source_step} target={source_step + args.steps}")
     print(f"run_dir={run_dir}")
     print(f"gpu_memory_utilization={cfg.get('rollout.gpu_memory_utilization')} "
           f"critic_micro={cfg.get('optim.critic_micro_batch_size_per_gpu')}")
     if not args.execute:
-        print("dry-run: Hydra composed; no checkpoint copy or GPU training")
+        from tempfile import TemporaryDirectory
+        with TemporaryDirectory(prefix="lmops-hydra-") as temporary:
+            compose_hydra(plan, Path(temporary))
+        print("dry-run: Hydra composed; no run directory, checkpoint copy or GPU training")
         return 0
+    reports = ensure_dir(run_dir / "reports")
+    config_path = reports / "resolved_benchmark_config.yaml"
+    config_path.write_text(yaml.safe_dump(cfg.to_dict(), sort_keys=True, allow_unicode=True))
+    (run_dir / "current_resolved_config.txt").write_text(str(config_path) + "\n")
+    compose_hydra(plan, run_dir)
     copy_checkpoint(source_checkpoint, run_dir / "warmup" / source_checkpoint.name)
     (run_dir / "warmup/latest_checkpointed_iteration.txt").write_text(str(source_step))
     started = datetime.now(timezone.utc).isoformat()

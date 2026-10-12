@@ -197,25 +197,31 @@ def slugify(text: str) -> str:
 
 
 def parse_key_values(pairs: Sequence[str] | None) -> dict:
-    """Parse repeated ``key=value`` CLI arguments.
+    """Parse repeated ``key=value`` arguments into scalar config values.
 
-    ``true``/``false`` (any case) become Python booleans: the config consumers use
-    ``bool(cfg.get(key))``, and the *string* ``"false"`` is truthy, so
-    ``--set run.val_before_train=false`` used to mean ``True``. Numbers stay strings -
-    every consumer already calls ``int()``/``float()`` and string typing keeps paths such
-    as ``--set data.train_file=007.parquet`` intact.
+    Decimal numbers, booleans and null use their native types. Other values
+    remain strings, including GPU lists and paths such as ``007.parquet``.
     """
     result: dict = {}
     for pair in pairs or []:
         if "=" not in pair:
             raise PipelineError(f"expected key=value, got {pair!r}")
         key, value = pair.split("=", 1)
-        value = value.strip()
+        key, value = key.strip(), value.strip()
+        if not key:
+            raise PipelineError(f"expected a nonempty key, got {pair!r}")
         lowered = value.lower()
         if lowered in ("true", "false"):
-            result[key.strip()] = lowered == "true"
+            parsed = lowered == "true"
+        elif lowered in ("null", "none"):
+            parsed = None
+        elif re.fullmatch(r"[+-]?(?:0|[1-9][0-9]*)", value):
+            parsed = int(value)
+        elif re.fullmatch(r"[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?", value) and any(c in value for c in ".eE"):
+            parsed = float(value)
         else:
-            result[key.strip()] = value
+            parsed = value
+        result[key] = parsed
     return result
 
 
