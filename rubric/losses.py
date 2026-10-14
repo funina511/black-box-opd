@@ -4,17 +4,7 @@ from torch.nn import functional as F
 from rubric.common import DIMENSIONS
 
 
-def pair_loss(teacher, student):
-    return -F.logsigmoid(teacher - student)
-
-
-def auxiliary_loss(logits, targets, masks):
-    counts = masks.sum(0)
-    active = counts > 0
-    if not active.any():
-        return logits.sum() * 0
-    sums = (F.binary_cross_entropy_with_logits(logits, targets, reduction="none") * masks).sum(0)
-    return (sums[active] / counts[active]).mean()
+from rubric.core.losses import pair_loss, auxiliary_loss
 
 
 def auxiliary_contribution(logits, targets, masks, counts):

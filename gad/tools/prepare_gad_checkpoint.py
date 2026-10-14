@@ -123,6 +123,9 @@ def check_checkpoint(path: Path, roles: tuple[str, ...] = ("actor", "critic")) -
             problems.append(f"{path.name}/{role}: no tokenizer files")
     if not (path / "data.pt").exists():
         problems.append(f"{path.name}: data.pt missing (dataloader state)")
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    from gad.extensions.checkpoint_state import checkpoint_problems
+    problems.extend(checkpoint_problems(path))
     return problems
 
 
@@ -242,11 +245,21 @@ def fix_critic_config(critic_hf: Path, *, hidden_size: int | None) -> dict:
     if not architectures:
         architectures = ["ForTokenClassification"]
     config["architectures"] = architectures
-    config["num_labels"] = 1
+    shape = inspect_safetensors(critic_hf).get("shapes", {}).get("score.weight")
+    labels = shape[0] if shape else 4 if config.get("rubric_head_layout") else 1
+    if labels not in (1, 4):
+        raise PipelineError(f"unsupported critic score shape: {shape}")
+    if labels == 4:
+        from extension_config import LAYOUT
+        if config.get("rubric_head_layout") != list(LAYOUT) or not config.get("rubric_hash"):
+            raise PipelineError("four-channel critic is missing its layout/rubric hash")
+        config["id2label"] = dict(enumerate(LAYOUT))
+        config["label2id"] = {name: i for i, name in enumerate(LAYOUT)}
+    config["num_labels"] = labels
     if hidden_size:
         config.setdefault("hidden_size", hidden_size)
     config_path.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
-    return {"architectures_before": before, "architectures_after": architectures, "num_labels": 1}
+    return {"architectures_before": before, "architectures_after": architectures, "num_labels": labels}
 
 
 def parse_args() -> argparse.Namespace:
@@ -419,6 +432,8 @@ def run_handoff(args: argparse.Namespace) -> int:
         raise PipelineError(f"merge tool not found: {merge_tool}")
 
     step, source_ckpt, inspection = pick_last_complete(warmup_dir, step=args.step)
+    if args.step is not None and step != args.step:
+        raise PipelineError(f"explicit Warmup step {args.step} is incomplete; refusing fallback to {step}")
     log(f"last complete Warmup checkpoint: global_step_{step} ({source_ckpt})")
     manifest["step"] = step
     manifest["source_checkpoint"] = str(source_ckpt)
@@ -431,7 +446,7 @@ def run_handoff(args: argparse.Namespace) -> int:
     if latest_file.exists():
         recorded = latest_file.read_text(encoding="utf-8").strip()
         manifest["warmup_latest_marker"] = recorded
-        if recorded != str(step):
+        if recorded != str(step) and not (args.step is not None and recorded.isdigit() and int(recorded) > step):
             marker_problem = (
                 f"{latest_file} says {recorded!r} but the newest complete checkpoint is {step}; "
                 "the warmup run may not have finished cleanly"
@@ -511,8 +526,9 @@ def run_handoff(args: argparse.Namespace) -> int:
             )
         else:
             shape = critic_info["shapes"]["score.weight"]
-            if len(shape) != 2 or shape[0] != 1:
-                problems.append(f"score.weight has shape {shape}; expected a single scalar output [1, hidden]")
+            expected_labels = 4 if critic_config.get("rubric_head_layout") else 1
+            if len(shape) != 2 or shape[0] != expected_labels:
+                problems.append(f"score.weight has shape {shape}; expected [{expected_labels}, hidden]")
             if hidden_size and shape[1] != hidden_size:
                 problems.append(f"score.weight shape {shape} does not match hidden_size {hidden_size}")
     else:

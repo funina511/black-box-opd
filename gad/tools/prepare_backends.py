@@ -141,6 +141,7 @@ def main() -> int:
     parser.add_argument("--repo", default=None, help="Source verl checkout (the pinned clone).")
     parser.add_argument("--backend-root", default=None, help="Where the per-stage worktrees are created.")
     parser.add_argument("--stages", default="seqkd,warmup,gad")
+    parser.add_argument("--profile", choices=("original", "gad_extensions_v1"), default=None)
     parser.add_argument("--fetch", action="store_true", help="Fetch the branch when the pinned commit is missing.")
     parser.add_argument("--recreate", action="store_true", help="Rebuild an existing worktree at the wrong commit.")
     parser.add_argument("--no-patches", action="store_true", help="Only create worktrees, apply nothing.")
@@ -150,6 +151,7 @@ def main() -> int:
 
     config = load_config(args.config)
     backends_cfg = config.get("backends", {}) if isinstance(config, dict) else {}
+    profile = args.profile or backends_cfg.get("profile", "original")
     repo = Path(
         args.repo
         or backends_cfg.get("source_repo")
@@ -158,8 +160,10 @@ def main() -> int:
     backend_root = Path(
         args.backend_root
         or backends_cfg.get("root")
-        or (Path(__file__).resolve().parents[1] / ".backends")
+        or (Path(__file__).resolve().parents[1] / (".backends_gad_extensions_v1" if profile != "original" else ".backends"))
     ).expanduser().resolve()
+    if profile != "original" and backend_root == (Path(__file__).resolve().parents[1] / ".backends").resolve():
+        raise PipelineError("algorithm profile must use an independent backend root")
 
     pins = dict(PINNED_BACKENDS)
     for stage, override in (backends_cfg.get("pins") or {}).items():
@@ -192,6 +196,7 @@ def main() -> int:
         "source_repo_commit": repo_commit,
         "source_repo_dirty": repo_dirty,
         "backend_root": str(backend_root),
+        "profile": profile,
         "patches_available": [{"name": p.name, "description": p.description} for p in ALL_PATCHES],
         "backends": {},
     }
@@ -214,6 +219,12 @@ def main() -> int:
             ok, problems = verify_patches(path)
             if not ok:
                 failures.extend(f"{stage}: {problem}" for problem in problems)
+        algorithm = None
+        if profile == "gad_extensions_v1":
+            if args.no_patches:
+                raise PipelineError("algorithm profile requires the engineering patches")
+            from algorithm_patches import apply
+            algorithm = apply(path, stage)
 
         patch_file = backend_root / f"{stage}.patch"
         patch_sha, patch_lines = write_patch_file(path, patch_file)
@@ -228,6 +239,7 @@ def main() -> int:
             "patch_file": str(patch_file),
             "patch_sha256": patch_sha,
             "patch_lines": patch_lines,
+            "algorithm": algorithm,
             "pythonpath": str(path),
             "verified": not failures or not any(f.startswith(f"{stage}:") for f in failures),
         }

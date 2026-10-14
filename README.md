@@ -33,6 +33,7 @@ bash scripts/export_model.sh --run qwen3_0.6b_17k --stage gad --dry-run
 ## 原仓库说明
 
 独立离线 rubric 实验入口：[rubric/README.md](rubric/README.md)；
+在线 Warmup/GAD rubric 与历史 replay：[gad/ONLINE_RUBRIC.md](gad/ONLINE_RUBRIC.md)。
 运行 bash scripts/rubric.sh --stage all --dry-run 查看固定轨迹、judge 与资源计划。
 
 <!--# LMOps: Enabling AI w/ LLMs-->

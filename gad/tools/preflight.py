@@ -174,6 +174,15 @@ def check_backends(cfg: Config, report: Report, stages: list[str]) -> dict:
             entry["patches_ok"] = ok
             entry["patch_problems"] = patch_problems
             problems.extend(patch_problems)
+            if cfg.get("backends.profile") == "gad_extensions_v1" and stage in ("warmup", "gad"):
+                try:
+                    from algorithm_patches import verify, code_hash
+                    algorithm = verify(backend)
+                    if algorithm["extension_code_hash"] != code_hash():
+                        raise ValueError("backend extension source is stale")
+                    entry["algorithm"] = algorithm
+                except (ValueError, RuntimeError, OSError) as exc:
+                    problems.append(f"algorithm profile validation failed: {exc}")
         results[stage] = {**entry, "problems": problems}
         if problems:
             for problem in problems:
@@ -637,6 +646,24 @@ def main() -> int:
     check_validation_metrics(cfg, report)
     check_quick_dev(cfg, report)
     check_eval(cfg, report)
+    from extension_config import active, service_identity
+    if any(active(cfg, "rubric", stage) for stage in stages):
+        if cfg.get("rubric.mode") == "joint":
+            try:
+                from gad.extensions.judge_client import JudgeClient
+                from rubric.core.contracts import digest
+                options = {key[13:]: value for key, value in cfg.data.items() if key.startswith("rubric.judge.")}
+                health = JudgeClient(options, digest(service_identity(cfg)), tokenizer=object()).health()
+                if set(str(health.get("gpu_ids", "")).split(",")) & set(str(cfg.get("resources.gpus")).split(",")):
+                    raise ValueError("running judge uses training GPUs")
+                if set(str(health.get("gpu_ids", "")).split(",")) != set(str(cfg.get("resources.judge_gpus")).split(",")):
+                    raise ValueError("running judge GPU allocation differs from declared resources.judge_gpus")
+                report.sections["online_judge"] = health
+                report.ok("online judge model/revision/template/schema/precision verified")
+            except (ValueError, RuntimeError, OSError) as exc:
+                report.fail(f"online judge: {exc}")
+        else:
+            report.sections["online_judge"] = {"mode": "correctness_only", "service_required": False}
     if not args.skip_packages:
         check_interpreter(cfg, report, allow_no_gpu=args.allow_no_gpu)
 

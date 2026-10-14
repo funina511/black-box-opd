@@ -197,10 +197,11 @@ def slugify(text: str) -> str:
 
 
 def parse_key_values(pairs: Sequence[str] | None) -> dict:
-    """Parse repeated ``key=value`` arguments into scalar config values.
+    """Parse repeated ``key=value`` arguments into config values.
 
     Decimal numbers, booleans and null use their native types. Other values
     remain strings, including GPU lists and paths such as ``007.parquet``.
+    Bracketed YAML/JSON lists support stage selectors such as ``[warmup,gad]``.
     """
     result: dict = {}
     for pair in pairs or []:
@@ -219,6 +220,14 @@ def parse_key_values(pairs: Sequence[str] | None) -> dict:
             parsed = int(value)
         elif re.fullmatch(r"[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?", value) and any(c in value for c in ".eE"):
             parsed = float(value)
+        elif value.startswith('[') and value.endswith(']'):
+            import yaml
+            try:
+                parsed = yaml.safe_load(value)
+            except yaml.YAMLError as exc:
+                raise PipelineError(f'invalid list override {key}: {value!r}') from exc
+            if not isinstance(parsed, list):
+                raise PipelineError(f'expected a list override for {key}')
         else:
             parsed = value
         result[key] = parsed

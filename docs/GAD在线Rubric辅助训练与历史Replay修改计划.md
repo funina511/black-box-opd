@@ -1,7 +1,8 @@
 # GAD 在线 Rubric 辅助训练与历史 Replay 修改计划
 
 日期：2026-10-12  
-状态：实现交接文档，2026-10-12 修订；本次只修改计划，不修改训练代码、配置、数据或运行状态。
+状态：2026-10-12 已接入两阶段在线 Rubric 与 GAD Replay，并完成工程验证；完整 actor 效果实验由用户执行。
+实现与启动说明见 [ONLINE_RUBRIC.md](../gad/ONLINE_RUBRIC.md)，实际验收证据见 [ONLINE_RUBRIC_VERIFICATION.md](../gad/ONLINE_RUBRIC_VERIFICATION.md)。下文保留原设计与验收要求。
 
 **最新统一口径：启用 rubric 的主方案从 Warmup 第一轮 critic 更新就开始加入 rubric 辅助监督，并在 GAD 中继续。Warmup 的 critic 同时适应当前 teacher/student 分布与固定 rubric 评分标准；仅 GAD 开启属于阶段消融，不是主方案。**
 

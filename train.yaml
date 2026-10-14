@@ -47,6 +47,7 @@ run:
   resume_worker_state: false
   pytorch_cuda_alloc_conf: ''
 backends:
+  profile: original # Enabling rubric/replay selects an isolated extension backend.
   source_repo: gad/verl
   root: gad/.backends
 models:
@@ -111,6 +112,7 @@ resources:
   n_gpus_per_node: 4
   nnodes: 1
   gpus: 1,2,3,4
+  judge_gpus: 6,7 # Independent service; never included in Ray training resources.
   save_freq: 50
   keep_last_checkpoints: 5
   test_freq: 200
@@ -138,3 +140,54 @@ validation:
   quick_seed: 42
   final_full: true
   quick_enabled: true
+
+# Online supervision begins with the first Warmup critic update; actor reward stays adv.
+rubric:
+  enabled: false
+  stages: [warmup, gad]
+  mode: joint # correctness_only uses the rule scorer without a process judge.
+  loss_coef: 0.1
+  spec: rubric/specs/math_v1.yaml
+  prompt: rubric/prompts/judge_math_v1.txt
+  head_layout: [adv, answer_correctness, reasoning_validity, condition_coverage]
+  reward_source: adv_only
+  label_source: online
+  label_scope: selected_critic_batch
+  teacher_cache: true
+  student_cache: true
+  truncated_process_policy: mask
+  on_annotation_error: mask
+  on_service_unavailable: abort_step
+  seed: 42
+  judge:
+    backend: openai_compatible
+    base_url: http://127.0.0.1:8010/v1
+    model: Qwen3-8B
+    model_revision: local-sha256
+    tokenizer_path: ../model/Qwen/Qwen3-8B
+    api_key_env: null
+    temperature: 0
+    max_output_tokens: 768
+    max_context_tokens: 16384
+    structured_output: required
+    concurrency: 8
+    request_timeout_seconds: 120
+    step_timeout_seconds: 600
+    max_retries: 2
+    dtype: bfloat16
+    tensor_parallel_size: 2
+    gpu_memory_utilization: 0.85
+    cpu_offload_gb: 0
+
+replay:
+  enabled: false
+  stages: [gad]
+  mix_ratio: 0.25
+  max_age_steps: 8
+  capacity_pairs: 1024
+  max_bytes: 536870912
+  sampling: uniform_without_replacement
+  eviction: oldest_first
+  insert_after_step: true
+  store_labels: true
+  seed: 43

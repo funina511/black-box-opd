@@ -7,9 +7,12 @@
 本文件说明按 `LMOps/GAD修改计划.md` 对 `LMOps/gad` 所做的修改：新增了什么、怎么运行、
 已验证到什么程度、以及还需要在 GPU 机器上完成哪些验收。
 
-算法本身没有被改动：判别器结构、判别器损失、Warmup actor 的 SFT 更新、GAD 的 GRPO
+默认关闭扩展时，算法本身没有被改动：判别器结构、判别器损失、Warmup actor 的 SFT 更新、GAD 的 GRPO
 更新顺序与 KL 设置全部保持官方实现；新增的是**外围工程**（独立 backend、数据、模板兼容、
 checkpoint 交接、评测与编排）。
+
+显式启用在线 rubric/replay 的算法扩展使用独立后端，配置、启动、恢复及工程证据见
+[ONLINE_RUBRIC.md](ONLINE_RUBRIC.md)。原 actor 目标与 adv 奖励接口保留。
 
 ---
 

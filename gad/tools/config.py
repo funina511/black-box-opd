@@ -20,6 +20,8 @@ from common import PipelineError, TRAIN_STAGES, flatten_dict
 
 GAD_DIR = Path(__file__).resolve().parents[1]
 
+from extension_config import EXTENSION_DEFAULTS
+
 DEFAULTS: dict[str, Any] = {
     "run.python_bin": None,  # resolved later: current interpreter
     "run.run_id": "auto",
@@ -156,6 +158,8 @@ REQUIRED = (
     "data.train_batch_size",
 )
 
+DEFAULTS.update(EXTENSION_DEFAULTS)
+
 # Keys that name a filesystem path and must exist for a real (non-dry) run.
 PATH_KEYS = (
     "models.student",
@@ -167,6 +171,9 @@ PATH_KEYS = (
     "eval.parquet",
     "validation.scorer_path",
     "validation.quick_file",
+    "rubric.spec",
+    "rubric.prompt",
+    "rubric.judge.tokenizer_path",
 )
 
 STAGE_LR_KEY = {
@@ -280,6 +287,7 @@ CONFIG_METADATA = {"selection", "catalog", "legacy_runs", "_stage_overrides"}
 RUNTIME_KEYS = {
     "resources.gpus", "run.python_bin", "run.log_backend", "run.val_before_train",
     "resources.save_freq", "resources.test_freq", "resources.keep_last_checkpoints",
+    "run.max_stage_steps",
 }
 
 
@@ -369,7 +377,10 @@ def _resolved_config(data: dict, path: Path) -> Config:
     if not resolved.get("validation.scorer_path"):
         candidate = GAD_DIR.parent / "sample" / "math_scorer.py"
         resolved["validation.scorer_path"] = str(candidate) if candidate.is_file() else None
-    return Config(resolved, path=path)
+    cfg = Config(resolved, path=path)
+    from extension_config import configure_profile
+    configure_profile(cfg)
+    return cfg
 
 
 def validate_override_keys(data: dict) -> None:
@@ -539,7 +550,8 @@ def validate_paths(config: Config, *, check_exists: bool) -> list[str]:
 
 def validate_config(config: Config) -> list[str]:
     """Collect every configuration problem (missing keys and bad values)."""
-    problems: list[str] = []
+    from extension_config import validate as validate_extensions
+    problems: list[str] = validate_extensions(config)
     for key in REQUIRED:
         value = config.get(key)
         if value is None or (isinstance(value, str) and not value.strip()):
@@ -562,7 +574,7 @@ def validate_config(config: Config) -> list[str]:
 
     warmup_epochs = config.get("budget.stage_epochs.warmup")
     gad_epochs = config.get("budget.stage_epochs.gad")
-    if (isinstance(warmup_epochs, int) and isinstance(gad_epochs, int)
+    if (config.get("budget.gad_new_steps") is None and isinstance(warmup_epochs, int) and isinstance(gad_epochs, int)
             and gad_epochs <= warmup_epochs):
         problems.append("GAD absolute epoch target must exceed the Warmup epoch budget")
 

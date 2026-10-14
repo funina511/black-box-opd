@@ -133,4 +133,5 @@ dmypy.json
 /assets/
 /data/
 /gad/outputs/
+/gad/.backends_gad_extensions*/
 /GAD修改计划.md

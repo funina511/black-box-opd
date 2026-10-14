@@ -32,15 +32,7 @@ def label(value=None, valid=False, source="unknown"):
     return {"value": value, "valid": valid, "source": source}
 
 
-def validate_label(item, dimension):
-    value, valid = item.get("value"), item.get("valid")
-    if type(valid) is not bool:
-        raise ValueError("label valid must be boolean")
-    if not valid and value is not None:
-        raise ValueError("unknown label must be null")
-    allowed = (0, 1) if dimension == DIMENSIONS[0] else (0, 0.5, 1)
-    if valid and (isinstance(value, bool) or value not in allowed):
-        raise ValueError(f"invalid {dimension} label: {value}")
+from rubric.core.contracts import validate_label
 
 
 def annotation_key(row, rubric_hash, judge_fingerprint, prompt_hash):

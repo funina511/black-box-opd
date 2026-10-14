@@ -96,6 +96,8 @@ def stage_step_budget(cfg: Config, stage: str, steps_per_epoch_value: int,
     global step, so its epoch budget is an ABSOLUTE target (the original runs
     ``total_epochs=4`` on top of Warmup's checkpoint at step S).
     """
+    if stage == "gad" and cfg.get("budget.gad_new_steps") is not None:
+        return int(cfg.get("budget.gad_new_steps"))
     epoch_budget = cfg.stage_epochs(stage)
     if epoch_budget is None:
         return cfg.stage_steps(stage)
@@ -116,6 +118,13 @@ def stage_step_budget(cfg: Config, stage: str, steps_per_epoch_value: int,
 
 def backend_path(cfg: Config, stage: str) -> Path:
     return Path(cfg.require("backends.root")) / stage
+
+
+def planned_backend_commit(backend: Path, stage: str) -> str:
+    if backend.exists():
+        return git_rev_parse(backend, "HEAD")
+    from prepare_backends import PINNED_BACKENDS
+    return PINNED_BACKENDS[stage]["commit"]
 
 
 def stage_out_dir(cfg: Config, run_dir: Path, stage: str) -> Path:
@@ -181,7 +190,7 @@ def stage_env(cfg: Config, run_dir: Path, stage: str, backend: Path, *, log_back
     env = {
         "PYTHONPATH": pythonpath,
         "GAD_EXPECT_VERL_PATH": str(backend),
-        "GAD_EXPECT_VERL_COMMIT": git_rev_parse(backend, "HEAD"),
+        "GAD_EXPECT_VERL_COMMIT": planned_backend_commit(backend, stage),
         "GAD_BACKEND_STAGE": stage,
         "PYTHONUNBUFFERED": "1",
         "TOKENIZERS_PARALLELISM": "true",
@@ -377,6 +386,13 @@ def build_overrides(cfg: Config, stage: str, *, model_path: str, critic_path: st
             ]
         if stage == "gad":
             overrides.append("trainer.resume_mode=auto")
+    from extension_config import active
+    sampling_seed = cfg.get("rollout.seed")
+    if sampling_seed is None and (active(cfg, "rubric", stage) or active(cfg, "replay", stage)):
+        sampling_seed = cfg.get("rubric.seed")
+    if sampling_seed is not None:
+        prefix = "" if cfg.get("backends.profile") == "gad_extensions_v1" and stage != "seqkd" else "+"
+        overrides.append(f"{prefix}actor_rollout_ref.rollout.seed={int(sampling_seed)}")
     return overrides
 
 
@@ -422,7 +438,23 @@ def plan_stage(cfg: Config, run_dir: Path, stage: str, *, steps_per_epoch_value:
         cfg, stage, model_path=model_path, critic_path=critic_path,
         out_dir=out_dir, total_steps=total_steps, epochs=epochs,
     )
-    if stage == "gad" and cfg.get("run.resume_worker_state"):
+    from extension_config import active, hydra_overrides
+    if active(cfg, "rubric", stage):
+        config_path = Path(critic_path) / "config.json"
+        source_four = config_path.is_file() and json.loads(config_path.read_text()).get("rubric_head_layout")
+        assumed_four = stage == "gad" and active(cfg, "rubric", "warmup") and not cfg.get("budget.init_from_warmup_run")
+        if not source_four and not (not install_guard and assumed_four):
+            prepared = run_dir / "initialization" / f"critic_{stage}"
+            if install_guard:
+                prepare_argv = [str(python_bin), str(PROJECT_DIR / "tools/prepare_rubric_critic.py"),
+                                "--source", str(critic_path), "--target", str(prepared),
+                                "--spec", str(cfg.require("rubric.spec")), "--seed", str(cfg.get("rubric.seed"))]
+                run_command(prepare_argv, component="critic-initialization")
+            critic_path = str(prepared)
+            overrides = build_overrides(cfg, stage, model_path=model_path, critic_path=critic_path,
+                                        out_dir=out_dir, total_steps=total_steps, epochs=epochs)
+    overrides += hydra_overrides(cfg, stage, out_dir, start_step)
+    if stage in ("warmup", "gad") and cfg.get("run.resume_worker_state"):
         # Same-stage full-state resume (requires the gad-resume-worker-state patch).
         overrides.append("trainer.resume_load_worker_state=True")
     argv = [str(python_bin), "-m", "verl.trainer.main_ppo", *overrides]
@@ -431,7 +463,10 @@ def plan_stage(cfg: Config, run_dir: Path, stage: str, *, steps_per_epoch_value:
     return {
         "stage": stage,
         "backend": str(backend),
-        "backend_commit": git_rev_parse(backend, "HEAD"),
+        "backend_commit": planned_backend_commit(backend, stage),
+        "backend_profile": cfg.get("backends.profile"),
+        "rubric_enabled": active(cfg, "rubric", stage),
+        "replay_enabled": active(cfg, "replay", stage),
         "out_dir": str(out_dir),
         "model_path": str(model_path),
         "critic_path": str(critic_path) if critic_path else None,
@@ -479,6 +514,8 @@ def verify_checkpoint_dir(path: Path, *, roles: tuple[str, ...]) -> list[str]:
             problems.append(f"{role_dir}: no optimizer shards (full-state resume would be incomplete)")
     if not (path / "data.pt").exists():
         problems.append(f"{path}/data.pt missing (dataloader state; step resume would restart the epoch)")
+    from gad.extensions.checkpoint_state import checkpoint_problems
+    problems.extend(checkpoint_problems(path))
     return problems
 
 
@@ -681,6 +718,11 @@ def _stage_signature(cfg: Config, stage: str, *, legacy: bool) -> dict:
                 "run.resume_worker_state",
                 "data.val_batch_size", "data.teacher_index", "data.manifest",
                 "backends.source_repo", "backends.root", "validation.scorer_path"}
+    excluded.add("run.max_stage_steps")
+    from extension_config import EXTENSION_DEFAULTS, extension_enabled
+    if not extension_enabled(cfg):
+        excluded.update(key for key, default in EXTENSION_DEFAULTS.items() if cfg.get(key) == default)
+        excluded.update(key for key in cfg.data if key.startswith(("rubric.", "replay.", "resources.judge_")))
     if stage == "seqkd" and not legacy:
         # SeqKD updates the actor on teacher responses; it does not generate student
         # rollouts or train a critic. These knobs only affect Warmup/GAD training.
@@ -693,6 +735,17 @@ def _stage_signature(cfg: Config, stage: str, *, legacy: bool) -> dict:
             training[key] = str(Path(str(training[key])).resolve())
     payload = {"stage": stage, "training_config": training,
                "backend_commit": git_rev_parse(backend_path(cfg, stage), "HEAD") if backend_path(cfg, stage).exists() else None}
+    if cfg.get("backends.profile") == "gad_extensions_v1":
+        from algorithm_patches import code_hash
+        payload["algorithm"] = {"extension_code_hash": code_hash(),
+                                "patch_generator_hash": sha256_file(PROJECT_DIR / "tools/algorithm_patches.py")}
+        if cfg.get("rubric.enabled"):
+            payload["algorithm"]["spec_hash"] = sha256_file(Path(cfg.require("rubric.spec")))
+            payload["algorithm"]["prompt_hash"] = sha256_file(Path(cfg.require("rubric.prompt")))
+            if cfg.get("rubric.mode") == "joint":
+                from extension_config import service_identity
+                from rubric.core.contracts import digest
+                payload["algorithm"]["judge_fingerprint"] = digest(service_identity(cfg))
     if stage in ("warmup", "gad"):
         payload["discriminator_init"] = cfg.get("models.discriminator_init")
     if stage == "gad":
@@ -869,6 +922,14 @@ def verify_backend_import(cfg: Config, run_dir: Path, stage: str, plan: dict) ->
 
 def export_warmup_handoff(cfg: Config, run_dir: Path, *, dry_run: bool) -> dict:
     warmup_out = stage_out_dir(cfg, run_dir, "warmup")
+    if cfg.get("budget.init_from_warmup_run"):
+        from config import resolve_run, load_run_config
+        source_run = resolve_run(cfg.get("budget.init_from_warmup_run"))
+        source_cfg = load_run_config(source_run)
+        for key in ("models.student", "data.train_file"):
+            if Path(source_cfg.require(key)).resolve() != Path(cfg.require(key)).resolve():
+                raise PipelineError(f"explicit Warmup initialization requires matching {key}; source {source_run}")
+        warmup_out = source_run / "warmup"
     gad_dir = stage_out_dir(cfg, run_dir, "gad")
     argv = [
         str(cfg.require("run.python_bin")),
@@ -880,6 +941,8 @@ def export_warmup_handoff(cfg: Config, run_dir: Path, *, dry_run: bool) -> dict:
     ]
     if cfg.get("budget.handoff_step"):
         argv += ["--step", str(int(cfg.get("budget.handoff_step")))]
+    if cfg.get("budget.init_step"):
+        argv += ["--step", str(int(cfg.get("budget.init_step")))]
     run_command(argv, dry_run=dry_run, component="handoff")
     manifest_path = run_dir / "handoff_manifest.json"
     if dry_run:
@@ -889,6 +952,11 @@ def export_warmup_handoff(cfg: Config, run_dir: Path, *, dry_run: bool) -> dict:
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     if not manifest.get("ok"):
         raise PipelineError(f"handoff failed: {manifest.get('problems')}")
+    from extension_config import active
+    if active(cfg, "rubric", "gad") or active(cfg, "replay", "gad"):
+        initial = Path(manifest["gad_checkpoint"])
+        write_json(initial / "handoff_initialization.json", {"source": manifest["source_checkpoint"],
+                                                           "step": manifest["step"], "same_stage_resume": False})
     return manifest
 
 
@@ -900,7 +968,7 @@ def run_stage(cfg: Config, run_dir: Path, stage: str, *, dry_run: bool,
     resume: dict | None = None
     if stage == "gad":
         recorded = recorded_handoff(run_dir, cfg)
-        planned_warmup_step = stage_step_budget(cfg, "warmup", steps_per_epoch_value)
+        planned_warmup_step = int(cfg.get("budget.init_step") or stage_step_budget(cfg, "warmup", steps_per_epoch_value))
         gad_added_steps = stage_step_budget(
             cfg, "gad", steps_per_epoch_value,
             handoff_step=int(recorded["step"]) if recorded else planned_warmup_step,
@@ -919,7 +987,7 @@ def run_stage(cfg: Config, run_dir: Path, stage: str, *, dry_run: bool,
                 # Mirror what prepare_gad_checkpoint.py will produce, so the printed
                 # plan matches the real run instead of a placeholder. The last Warmup
                 # step is saved by the trainer even when it is not a save_freq multiple.
-                planned_step = int(cfg.get("budget.handoff_step") or planned_warmup_step)
+                planned_step = int(cfg.get("budget.init_step") or cfg.get("budget.handoff_step") or planned_warmup_step)
                 target = stage_out_dir(cfg, run_dir, "gad") / f"global_step_{planned_step}"
                 handoff = {
                     "actor_hf": str(target / "actor" / "huggingface"),
@@ -955,6 +1023,8 @@ def run_stage(cfg: Config, run_dir: Path, stage: str, *, dry_run: bool,
         )
 
     verify_backend_import(cfg, run_dir, stage, plan)
+    if cfg.get("backends.profile") == "gad_extensions_v1":
+        (Path(plan["backend"]) / ".gad_backend_used").touch()
 
     log(f"===== stage {stage} =====")
     log(f"backend : {plan['backend']} @ {plan['backend_commit'][:10]}")
@@ -1045,6 +1115,15 @@ def finish_stage(cfg: Config, run_dir: Path, stage: str, plan: dict, *, process,
         "trainer_skipped": trainer_skipped,
         "verification": verification,
     }
+    intentional_limit = bool(cfg.get("run.max_stage_steps") and returncode == 0
+                             and verification.get("problems")
+                             and all(problem.startswith("last checkpoint is global_step_") for problem in verification["problems"]))
+    if intentional_limit:
+        stage_manifest["invocation_limit_reached"] = True
+        plan["invocation_limit_reached"] = True
+        write_json(run_dir / f"stage_{stage}.json", stage_manifest)
+        log(f"[{stage}] engineering invocation limit reached; checkpoint saved, full stage remains incomplete")
+        return plan
     if not verification["ok"]:
         # Preserve the evidence before the next attempt truncates the live log.
         stage_manifest["failure_log"] = preserve_failed_stage_log(plan, finished=finished)
@@ -1099,6 +1178,7 @@ def print_plan(cfg: Config, run_dir: Path, plans: list[dict], *, steps_per_epoch
     for plan in plans:
         print("-" * 78)
         print(f"stage {plan['stage']}")
+        print(f"  extensions   : rubric={plan.get('rubric_enabled', False)} replay={plan.get('replay_enabled', False)}")
         print(f"  backend      : {plan['backend']} @ {plan['backend_commit'][:10]}")
         print(f"  output       : {plan['out_dir']}")
         print(f"  model path   : {plan['model_path']}")
@@ -1188,6 +1268,11 @@ def main() -> int:
     add_config_arguments(parser)
     parser.add_argument("--name", default="", help="Optional label for a new run")
     parser.add_argument("--resume", action="store_true", help="Resume the saved config selected by --run")
+    parser.add_argument("--gad-new-steps", type=int, help="Additional GAD steps K; overrides its absolute epoch budget")
+    parser.add_argument("--init-from-warmup-run", help="Explicit read-only Warmup source for a new GAD experiment")
+    parser.add_argument("--init-step", type=int, help="Exact complete Warmup initialization step")
+    parser.add_argument("--warmup-smoke-steps", type=int, help="New engineering run: explicitly shorten Warmup")
+    parser.add_argument("--max-stage-steps", type=int, help="Engineering-only invocation limit; does not change planned budgets")
     parser.add_argument("--stages", default=None, help="Comma-separated subset (default: seqkd,warmup,gad).")
     parser.add_argument("--from-stage", default=None, choices=TRAIN_STAGES)
     parser.add_argument("--to-stage", default=None, choices=TRAIN_STAGES)
@@ -1200,6 +1285,21 @@ def main() -> int:
     args = parser.parse_args()
 
     cfg = select_config(args)
+    updates = {"budget.gad_new_steps": args.gad_new_steps,
+               "budget.init_from_warmup_run": args.init_from_warmup_run, "budget.init_step": args.init_step}
+    if cfg.existing_run and any(value is not None for value in updates.values()):
+        raise PipelineError("resume uses the saved budget/source; these initialization options require a new run")
+    cfg.data.update({key: value for key, value in updates.items() if value is not None})
+    if args.warmup_smoke_steps is not None:
+        if cfg.existing_run or args.warmup_smoke_steps < 1:
+            raise PipelineError("--warmup-smoke-steps requires positive steps and a new run")
+        cfg.data.update({"budget.warmup_steps": args.warmup_smoke_steps,
+                         "budget.stage_epochs.warmup": None, "run.engineering_smoke": True})
+    if args.max_stage_steps is not None:
+        cfg.data["run.max_stage_steps"] = args.max_stage_steps
+        cfg.runtime_overrides["run.max_stage_steps"] = args.max_stage_steps
+    from extension_config import configure_profile
+    configure_profile(cfg)
     source_config = str(cfg.path)
     if args.resume and not cfg.existing_run:
         raise PipelineError("--resume requires --run (or a saved run train.yaml)")
@@ -1236,6 +1336,8 @@ def main() -> int:
         stages = [s for s in stages if TRAIN_STAGES.index(s) <= TRAIN_STAGES.index(args.to_stage)]
     if not stages:
         raise PipelineError("no stage selected")
+    if cfg.get("budget.init_from_warmup_run") and stages != ["gad"]:
+        raise PipelineError("explicit Warmup initialization is for --stages gad only")
 
     run_id = args.run_id or (None if cfg.get("run.run_id") == "auto" else str(cfg.get("run.run_id")))
     if cfg.existing_run and args.run_id and args.run_id != str(cfg.get("run.run_id")):
@@ -1280,6 +1382,7 @@ def main() -> int:
         "--repo", str(cfg.require("backends.source_repo")),
         "--backend-root", str(cfg.require("backends.root")),
         "--stages", ",".join(stages),
+        "--profile", str(cfg.get("backends.profile")),
     ]
     if cfg.get("backends.recreate"):
         prepare_argv.append("--recreate")
@@ -1311,6 +1414,8 @@ def main() -> int:
             log(f"skipping stage {stage}: {reason}")
             continue
         plans.append(run_stage(cfg, run_dir, stage, dry_run=args.dry_run, resume_requested=args.resume_gad))
+        if plans[-1].get("invocation_limit_reached"):
+            break
 
     if args.dry_run:
         print_plan(cfg, run_dir, plans, steps_per_epoch_value=steps_per_epoch_value)
