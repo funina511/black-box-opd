@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PYTHON="${GAD_PYTHON:-/mnt/jinbo/miniconda3/envs/gad/bin/python}"
 RUN="runs/gad_qwen3_0.6b_17k/qwen3-0.6b-17k-n2"
-PROFILE="oprd_dapo_nonthinking_n8_16k"
+PROFILE="math_unified_v1_n8_math500n2_8k"
 
 # Select stage models by name. "base" comes from train.yaml;
 # SeqKD/Warmup/GAD final checkpoints are located using the training run ID.

@@ -210,9 +210,13 @@ def stage_env(cfg: Config, run_dir: Path, stage: str, backend: Path, *, log_back
         # Consumed by the gad-math-validation backend patch: every branch then
         # reports dev-set math accuracy next to the original ROUGE-L metric.
         env["GAD_MATH_SCORER"] = str(scorer)
+        if cfg.get('scoring.math.version') == 'math_unified_v1':
+            external = os.environ.get('GAD_MATH_SCORER')
+            if external and Path(external).resolve() != Path(scorer).resolve():
+                raise PipelineError('GAD_MATH_SCORER conflicts with unified scoring.math')
+            env['GAD_SCORING_MATH_CONFIG'] = json.dumps({key[13:]: value for key, value in cfg.data.items() if key.startswith('scoring.math.')})
     if cfg.get("validation.quick_enabled"):
         from hashlib import sha256
-        from pathlib import Path
         quick = Path(str(cfg.require("validation.quick_file")))
         full = Path(str(cfg.require("data.val_file")))
         env["GAD_QUICK_DEV"] = str(quick)
@@ -230,6 +234,8 @@ def stage_env(cfg: Config, run_dir: Path, stage: str, backend: Path, *, log_back
 
 def validation_metrics_expected(cfg: Config) -> tuple[bool, str]:
     """Whether a stage must produce the dev-set math metric artifact."""
+    if cfg.get('run.disable_validation'):
+        return False, 'run.disable_validation is true'
     if not cfg.get("validation.require_math_metrics"):
         return False, "validation.require_math_metrics is false"
     if not cfg.get("validation.scorer_path"):
@@ -313,6 +319,7 @@ def build_overrides(cfg: Config, stage: str, *, model_path: str, critic_path: st
         f"actor_rollout_ref.rollout.val_kwargs.temperature={cfg.get('rollout.val_temperature')}",
         f"trainer.critic_warmup={int(cfg.get('optim.critic_warmup')) if stage != 'gad' else 0}",
         f"trainer.val_before_train={bool(cfg.get('run.val_before_train'))}",
+        f"trainer.validation_rouge_l_enabled={bool(cfg.get('validation.rouge_l_enabled'))}",
         f"trainer.logger=[{cfg.get('run.log_backend')}]",
         "trainer.default_hdfs_dir=null",
         f"trainer.n_gpus_per_node={int(cfg.get('resources.n_gpus_per_node'))}",
@@ -326,6 +333,10 @@ def build_overrides(cfg: Config, stage: str, *, model_path: str, critic_path: st
         f"trainer.experiment_name={stage}",
         f"hydra.run.dir={out_dir.parent / 'runtime' / 'hydra' / stage}",
     ]
+    backend = backend_path(cfg, stage)
+    backend_config = backend / "verl/trainer/config/ppo_trainer.yaml"
+    if (backend / ".gad_backend_used").exists() and "validation_rouge_l_enabled" not in backend_config.read_text():
+        overrides = [a for a in overrides if not a.startswith("trainer.validation_rouge_l_enabled=")]
     # RetentionMonitor rotates whole checkpoints and can preserve exported models.
     # Trainer rotation removes only actor/critic subdirectories and ignores pins.
     if keep_checkpoints is None:
@@ -388,11 +399,16 @@ def build_overrides(cfg: Config, stage: str, *, model_path: str, critic_path: st
             overrides.append("trainer.resume_mode=auto")
     from extension_config import active
     sampling_seed = cfg.get("rollout.seed")
-    if sampling_seed is None and (active(cfg, "rubric", stage) or active(cfg, "replay", stage)):
-        sampling_seed = cfg.get("rubric.seed")
     if sampling_seed is not None:
         prefix = "" if cfg.get("backends.profile") == "gad_extensions_v1" and stage != "seqkd" else "+"
         overrides.append(f"{prefix}actor_rollout_ref.rollout.seed={int(sampling_seed)}")
+    if cfg.get('run.disable_validation'):
+        overrides.append('trainer.val_before_train=False')
+        overrides.append('trainer.test_freq=0')
+    if cfg.get('scoring.math.version') == 'math_unified_v1' and stage in ('warmup', 'gad'):
+        overrides += [f'++data.seed={int(cfg.get("run.seed"))}',
+                      f'++trainer.seed={int(cfg.get("run.seed"))}',
+                      f'++trainer.disable_validation={str(cfg.get("run.disable_validation")).lower()}']
     return overrides
 
 
@@ -467,6 +483,12 @@ def plan_stage(cfg: Config, run_dir: Path, stage: str, *, steps_per_epoch_value:
         "backend_profile": cfg.get("backends.profile"),
         "rubric_enabled": active(cfg, "rubric", stage),
         "replay_enabled": active(cfg, "replay", stage),
+        "validation_diagnostics": {
+            "configured_rouge_l_enabled": bool(cfg.get("validation.rouge_l_enabled")),
+            "effective_rouge_l_enabled": (bool(cfg.get("validation.rouge_l_enabled"))
+                if any(a.startswith("trainer.validation_rouge_l_enabled=") for a in overrides) else True),
+            "block_training_on_incomplete": bool(cfg.get("validation.block_training_on_incomplete")),
+        },
         "out_dir": str(out_dir),
         "model_path": str(model_path),
         "critic_path": str(critic_path) if critic_path else None,
@@ -507,11 +529,17 @@ def verify_checkpoint_dir(path: Path, *, roles: tuple[str, ...]) -> list[str]:
         shards = sorted(role_dir.glob("model_world_size_*_rank_*.pt"))
         if not shards:
             problems.append(f"{role_dir}: no model shards (model_world_size_*_rank_*.pt)")
-        if not (role_dir / "config.json").exists():
-            problems.append(f"{role_dir}: config.json missing")
+        try:
+            metadata = json.loads((role_dir / "config.json").read_text())
+            if not isinstance(metadata, dict): raise ValueError("not a JSON object")
+        except (OSError, ValueError) as exc:
+            problems.append(f"{role_dir}: config.json missing/corrupt ({exc})")
         optimizers = sorted(role_dir.glob("optim_world_size_*_rank_*.pt"))
         if not optimizers:
             problems.append(f"{role_dir}: no optimizer shards (full-state resume would be incomplete)")
+        for shard in shards + optimizers:
+            if not shard.stat().st_size:
+                problems.append(f"{shard}: empty/corrupt shard")
     if not (path / "data.pt").exists():
         problems.append(f"{path}/data.pt missing (dataloader state; step resume would restart the epoch)")
     from gad.extensions.checkpoint_state import checkpoint_problems
@@ -522,77 +550,69 @@ def verify_checkpoint_dir(path: Path, *, roles: tuple[str, ...]) -> list[str]:
 def verify_stage_artifacts(stage: str, out_dir: Path, *, expected_step: int | None,
                            math_metrics_expected: bool = False,
                            math_metrics_reason: str = "",
-                           require_final_full: bool = False, full_count: int | None = None) -> dict:
+                           require_final_full: bool = False, full_count: int | None = None,
+                           strict_evaluation: bool = False) -> dict:
     roles = ("actor",) if stage == "seqkd" else ("actor", "critic")
-    problems: list[str] = []
     steps = checkpoint_dirs(out_dir)
-    if not steps:
-        problems.append(f"{out_dir}: no global_step_* checkpoint was written")
-        return {"ok": False, "problems": problems, "last_step": None, "checkpoints": []}
-
-    last_step, last_dir = steps[-1]
-    problems.extend(verify_checkpoint_dir(last_dir, roles=roles))
+    last_step, last_dir = steps[-1] if steps else (None, None)
+    checkpoint_problems = verify_checkpoint_dir(last_dir, roles=roles) if last_dir else [f"{out_dir}: no global_step_* checkpoint was written"]
+    training_problems = list(checkpoint_problems)
     if expected_step is not None and last_step != expected_step:
-        problems.append(
-            f"last checkpoint is global_step_{last_step} but the budget requires global_step_{expected_step}"
-        )
-
+        training_problems.append(f"last checkpoint is global_step_{last_step} but the budget requires global_step_{expected_step}")
     latest_file = out_dir / "latest_checkpointed_iteration.txt"
-    if not latest_file.exists():
-        problems.append(f"{latest_file}: missing (the next stage cannot find the last complete checkpoint)")
-    else:
+    try:
         recorded = latest_file.read_text(encoding="utf-8").strip()
         if recorded != str(last_step):
-            problems.append(f"{latest_file}: says {recorded!r} but the newest checkpoint is {last_step}")
-
-    # The math metric is the plan's primary validation number; a stage that only
-    # produced ROUGE-L must not be marked complete.
-    math: dict = {"expected": bool(math_metrics_expected), "reason": math_metrics_reason}
+            training_problems.append(f"{latest_file}: says {recorded!r} but the newest checkpoint is {last_step}")
+    except (OSError, UnicodeError) as exc:
+        training_problems.append(f"{latest_file}: missing/unreadable ({type(exc).__name__})")
+    evaluation_problems = []
+    evaluation_status = "not_requested"
+    math = {"expected": bool(math_metrics_expected), "reason": math_metrics_reason}
     if math_metrics_expected:
         artifact = out_dir / "validation_math_metrics.jsonl"
-        if not artifact.exists():
-            problems.append(
-                f"{artifact} missing: the stage did not report dev-set math accuracy "
-                f"({math_metrics_reason}). Check GAD_MATH_SCORER and the gad-math-validation backend patch."
-            )
-        else:
-            records = []
-            for line in artifact.read_text(encoding="utf-8").splitlines():
-                if line.strip():
-                    try:
-                        records.append(json.loads(line))
-                    except json.JSONDecodeError:
-                        problems.append(f"{artifact}: unparsable line: {line[:120]}")
-            if not records:
-                problems.append(f"{artifact} is empty")
-            else:
-                last = records[-1]
-                math["records"] = len(records)
-                math["steps"] = [record.get("global_step") for record in records]
-                math["last"] = {
-                    "global_step": last.get("global_step"),
-                    "acc": last.get("acc"),
-                    "score_mean": last.get("score_mean"),
-                    "answer_parse_failure_rate": last.get("answer_parse_failure_rate"),
-                    "truncated_rate": last.get("truncated_rate"),
-                    "count": last.get("count"),
-                    "scorer": last.get("scorer"),
-                }
-                if last.get("acc") is None or last.get("count") in (None, 0):
-                    problems.append(f"{artifact}: the last record has no usable accuracy: {last}")
-                if require_final_full and (last.get("validation_scope") != "full"
-                                           or last.get("global_step") != last_step
-                                           or last.get("count") != full_count):
-                    problems.append(
-                        f"{artifact}: final validation must be full at global_step_{last_step} "
-                        f"with {full_count} rows; got {last.get('validation_scope')}, "
-                        f"step {last.get('global_step')}, count {last.get('count')}"
-                    )
+        records = []
+        evaluation_status = "complete"
+        try:
+            for number, line in enumerate(artifact.read_text(encoding="utf-8").splitlines(), 1):
+                if not line.strip(): continue
+                row = json.loads(line)
+                if not isinstance(row, dict): raise ValueError(f"line {number} is not an object")
+                records.append(row)
+        except FileNotFoundError:
+            evaluation_status = "missing"
+            evaluation_problems.append(f"{artifact}: missing; validation was not reported")
+        except (OSError, UnicodeError, ValueError) as exc:
+            evaluation_status = "failed"
+            evaluation_problems.append(f"{artifact}: unparsable/unreadable ({exc})")
+        if not records and not evaluation_problems:
+            evaluation_status = "missing"
+            evaluation_problems.append(f"{artifact}: empty; validation was not reported")
+        if records:
+            last = records[-1]
+            math.update(records=len(records), steps=[r.get("global_step") for r in records], last=last)
+            if last.get("evaluation_complete", True) is not True:
+                evaluation_problems.append("last evaluation is incomplete (unscorable/missing answers)")
+            for key in ("grader_error_rate", "unscorable_rate"):
+                rate = last.get(key, 0)
+                if not isinstance(rate, (int, float)) or not 0 <= rate <= 1 or rate > 0:
+                    evaluation_problems.append(f"{key}={rate!r}; official accuracy is unavailable")
+                    if key == "grader_error_rate": evaluation_status = "failed"
+            acc = last.get("acc")
+            if not isinstance(acc, (int, float)) or not 0 <= acc <= 1 or not last.get("count"):
+                evaluation_problems.append("last record has no usable official accuracy (acc may be null)")
+            if require_final_full and (last.get("validation_scope") != "full" or last.get("global_step") != last_step or last.get("count") != full_count):
+                evaluation_problems.append(f"final validation must be full at global_step_{last_step} with {full_count} rows; got {last.get('validation_scope')}, step {last.get('global_step')}, count {last.get('count')}")
+            if evaluation_problems and evaluation_status == "complete": evaluation_status = "incomplete"
+    ready = not training_problems and (not strict_evaluation or not evaluation_problems)
     return {
-        "ok": not problems,
-        "problems": problems,
-        "last_step": last_step,
-        "math_metrics": math,
+        "schema_version": "gad.stage_verification.v2", "ok": ready, "handoff_ready": ready,
+        "training_status": "artifacts_ready" if not training_problems else "incomplete",
+        "checkpoint_status": "valid" if not checkpoint_problems else "invalid",
+        "training_problems": training_problems, "evaluation_status": evaluation_status,
+        "evaluation_problems": evaluation_problems, "strict_evaluation": strict_evaluation,
+        "problems": training_problems + (evaluation_problems if strict_evaluation else []),
+        "last_step": last_step, "math_metrics": math,
         "checkpoints": [{"step": step, "path": str(path)} for step, path in steps],
     }
 
@@ -735,10 +755,11 @@ def _stage_signature(cfg: Config, stage: str, *, legacy: bool) -> dict:
             training[key] = str(Path(str(training[key])).resolve())
     payload = {"stage": stage, "training_config": training,
                "backend_commit": git_rev_parse(backend_path(cfg, stage), "HEAD") if backend_path(cfg, stage).exists() else None}
-    if cfg.get("backends.profile") == "gad_extensions_v1":
-        from algorithm_patches import code_hash
-        payload["algorithm"] = {"extension_code_hash": code_hash(),
-                                "patch_generator_hash": sha256_file(PROJECT_DIR / "tools/algorithm_patches.py")}
+    if cfg.get("backends.profile") == "gad_extensions_v1" and stage != "seqkd":
+        from extension_config import deployed_code_identity
+        deployed = deployed_code_identity(cfg,stage)
+        payload["algorithm"] = {"extension_code_hash": deployed["extension_code_hash"],
+                                "patch_generator_hash": deployed["patch_generator_hash"]}
         if cfg.get("rubric.enabled"):
             payload["algorithm"]["spec_hash"] = sha256_file(Path(cfg.require("rubric.spec")))
             payload["algorithm"]["prompt_hash"] = sha256_file(Path(cfg.require("rubric.prompt")))
@@ -851,11 +872,57 @@ def _legacy_seqkd_marker_matches(cfg: Config, run_dir: Path, recorded_signature:
     return False
 
 
+def recover_completed_stage(cfg: Config, run_dir: Path, stage: str) -> tuple[bool, str]:
+    """Read-only recovery: never reinterpret checkpoint existence as exit=0."""
+    import copy
+    history = read_json(run_dir / f"stage_{stage}.json", default=None)
+    if not history or history.get("returncode") != 0 or history.get("trainer_skipped"):
+        return False, "no successful training exit record"
+    previous = history.get("plan") or {}
+    if not previous.get("argv"):
+        return False, "historical launch argv is missing"
+    frozen = copy.deepcopy(cfg)
+    backend = backend_path(cfg, stage)
+    if str(backend) != previous.get("backend"):
+        return False, "historical backend identity differs"
+    try:
+        if previous.get("backend_commit") != git_rev_parse(backend, "HEAD"):
+            return False, "historical backend commit differs"
+        if cfg.get("backends.profile") == "gad_extensions_v1" and stage != "seqkd":
+            from algorithm_patches import verify
+            manifest = verify(backend)
+            frozen._recovery_code_hash = manifest["extension_code_hash"]
+        current = plan_stage(frozen, run_dir, stage, steps_per_epoch_value=steps_per_epoch(cfg),
+            handoff=recorded_handoff(run_dir, cfg) if stage == "gad" else None, install_guard=False)
+    except (PipelineError, RuntimeError, OSError, ValueError, KeyError) as exc:
+        return False, f"historical backend/handoff cannot be verified: {exc}"
+    def training_args(argv):
+        diagnostic = ('trainer.resume_load_worker_state=', 'trainer.validation_rouge_l_enabled=',
+            'trainer.val_before_train=', 'trainer.test_freq=', 'data.val_files=', 'data.val_batch_size=')
+        return [a for a in argv if not a.startswith(diagnostic)]
+    if training_args(previous["argv"]) != training_args(current["argv"]):
+        return False, "historical launch training identity does not match current plan"
+    # If the original run recorded immutable input hashes, require them too.
+    historical_inputs = history.get("inputs")
+    if historical_inputs and any(historical_inputs.get(k) != stage_inputs_digest(cfg, stage).get(k)
+                                 for k in ("train_file_sha256", "train_rows")):
+        return False, "historical training data digest differs"
+    verification = verify_stage_artifacts(stage, stage_out_dir(cfg, run_dir, stage),
+        expected_step=current["total_steps"], math_metrics_expected=validation_metrics_expected(cfg)[0],
+        require_final_full=bool(cfg.get('validation.final_full')),
+        full_count=dataset_rows(cfg.require('data.val_file')) * int(cfg.get('rollout.val_n') or 1),
+        strict_evaluation=bool(cfg.get('validation.block_training_on_incomplete')))
+    if not verification["handoff_ready"]:
+        return False, "historical training/checkpoint is incomplete: " + str(verification["problems"])
+    return True, (f"historical exit=0 and checkpoint {verification['last_step']} reverified; "
+                  f"evaluation={verification['evaluation_status']}")
+
+
 def check_skip(cfg: Config, run_dir: Path, stage: str) -> tuple[bool, str]:
     cfg = cfg.for_stage(stage)
     marker = completion_marker(run_dir, stage)
     if not marker.exists():
-        return False, "no completion marker"
+        return recover_completed_stage(cfg,run_dir,stage)
     recorded = json.loads(marker.read_text(encoding="utf-8"))
     expected = stage_inputs_digest(cfg, stage)
     recorded_inputs = recorded.get("inputs")
@@ -868,9 +935,18 @@ def check_skip(cfg: Config, run_dir: Path, stage: str) -> tuple[bool, str]:
                 and _legacy_seqkd_marker_matches(
                     cfg, run_dir, recorded_inputs.get("config_signature", ""))):
             return False, "config or input signature changed since the stage completed"
+    if recorded.get("returncode", 0) != 0:
+        return False, "recorded training process did not exit successfully"
     if not recorded.get("verified", {}).get("ok"):
         return False, "the recorded completion was not verified"
-    return True, f"already completed at step {recorded.get('verified', {}).get('last_step')}"
+    verified=verify_stage_artifacts(stage,stage_out_dir(cfg,run_dir,stage),
+        expected_step=int(recorded.get('total_steps') or recorded.get('verified',{}).get('last_step') or stage_step_budget(cfg,stage,steps_per_epoch(cfg),handoff_step=recorded_handoff(run_dir,cfg)['step'] if stage=='gad' and recorded_handoff(run_dir,cfg) else 0)),
+        math_metrics_expected=validation_metrics_expected(cfg)[0],
+        require_final_full=bool(cfg.get('validation.final_full')),
+        full_count=dataset_rows(cfg.require('data.val_file')) * int(cfg.get('rollout.val_n') or 1),
+        strict_evaluation=bool(cfg.get('validation.block_training_on_incomplete')))
+    if not verified['handoff_ready']:return False,'current checkpoint/evaluation policy no longer permits handoff: '+str(verified['problems'])
+    return True, f"training already completed at step {verified['last_step']}; evaluation={verified['evaluation_status']}"
 
 
 def write_completion(cfg: Config, run_dir: Path, stage: str, plan: dict, verification: dict,
@@ -878,6 +954,9 @@ def write_completion(cfg: Config, run_dir: Path, stage: str, plan: dict, verific
     write_json(
         completion_marker(run_dir, stage),
         {
+            "schema_version": "gad.training_completion.v2",
+            "training_completed": True,
+            "evaluation_status": verification.get("evaluation_status", "unknown"),
             "stage": stage,
             "backend": plan["backend"],
             "backend_commit": plan["backend_commit"],
@@ -1017,6 +1096,9 @@ def run_stage(cfg: Config, run_dir: Path, stage: str, *, dry_run: bool,
         # final save but before the marker was written). Verify instead of
         # running one step past global_step_{S+K}.
         log(f"[gad] {plan['resume']['reason']}")
+        recovered, reason = recover_completed_stage(cfg, run_dir, stage)
+        if not recovered:
+            raise PipelineError("resume-complete requires successful historical training provenance: " + reason)
         return finish_stage(
             cfg, run_dir, stage, plan, process=None, started=started,
             math_expected=math_expected, math_reason=math_reason, trainer_skipped=True,
@@ -1089,22 +1171,40 @@ def finish_stage(cfg: Config, run_dir: Path, stage: str, plan: dict, *, process,
                  math_expected: bool, math_reason: str, trainer_skipped: bool) -> dict:
     """Verify a stage's artifacts and only then write its completion marker."""
     finished = utc_timestamp()
+    stage_record_path = run_dir / f"stage_{stage}.json"
+    if trainer_skipped:
+        from datetime import datetime, timezone
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+        stage_record_path = run_dir / "reports" / f"resume_complete_{stage}_{stamp}.json"
     verification = verify_stage_artifacts(
         stage, Path(plan["out_dir"]), expected_step=plan["total_steps"],
         math_metrics_expected=math_expected, math_metrics_reason=math_reason,
-        require_final_full=bool(cfg.get("validation.quick_enabled") and cfg.get("validation.final_full")),
-        full_count=dataset_rows(cfg.require("data.val_file")) if cfg.get("validation.quick_enabled") else None,
+        require_final_full=bool(cfg.get("validation.final_full")),
+        strict_evaluation=bool(cfg.get("validation.block_training_on_incomplete")),
+        full_count=dataset_rows(cfg.require("data.val_file")) * int(cfg.get('rollout.val_n') or 1) if cfg.get("validation.final_full") else None,
     )
     returncode = 0 if trainer_skipped else process.returncode
     if not trainer_skipped and process.returncode != 0:
-        verification["ok"] = False
-        verification["problems"].append(
-            f"stage process exited with code {process.returncode} (log: {plan['log']})"
-        )
+        verification["ok"] = verification["handoff_ready"] = False
+        verification["training_status"] = "failed"
+        failure = f"stage process exited with code {process.returncode} (log: {plan['log']})"
+        verification["problems"].append(failure)
+        verification["training_problems"].append(failure)
+    if returncode == 0 and not verification["training_problems"]:
+        verification["training_status"] = "completed"
     if trainer_skipped:
         verification["trainer_skipped"] = True
 
     stage_manifest = {
+        'scorer_identity': {key[13:]: value for key, value in cfg.data.items() if key.startswith('scoring.math.')},
+        'seeds': {'initial_critic': cfg.get('rubric.seed'), 'data_order': cfg.get('run.seed'),
+                  'driver_torch_numpy_python': cfg.get('run.seed'), 'rollout_engine': cfg.get('rollout.seed'),
+                  'sampling_params_request': cfg.get('rollout.seed'), 'request_seed_policy': 'same_explicit_seed_per_request',
+                  'judge': cfg.get('rubric.seed') if plan.get('rubric_enabled') else None,
+                  'judge_sampling_request': cfg.get('rubric.seed') if plan.get('rubric_enabled') else None,
+                  'judge_engine': None,
+                  'replay': cfg.get('replay.seed') if plan.get('replay_enabled') else None,
+                  'worker_rng_seed': None},
         "stage": stage,
         "plan": {k: v for k, v in plan.items() if k != "env"},
         "env": {k: v for k, v in plan["env"].items() if k != "PYTHONPATH"},
@@ -1121,13 +1221,13 @@ def finish_stage(cfg: Config, run_dir: Path, stage: str, plan: dict, *, process,
     if intentional_limit:
         stage_manifest["invocation_limit_reached"] = True
         plan["invocation_limit_reached"] = True
-        write_json(run_dir / f"stage_{stage}.json", stage_manifest)
+        write_json(stage_record_path, stage_manifest)
         log(f"[{stage}] engineering invocation limit reached; checkpoint saved, full stage remains incomplete")
         return plan
     if not verification["ok"]:
         # Preserve the evidence before the next attempt truncates the live log.
         stage_manifest["failure_log"] = preserve_failed_stage_log(plan, finished=finished)
-    write_json(run_dir / f"stage_{stage}.json", stage_manifest)
+    write_json(stage_record_path, stage_manifest)
 
     if not verification["ok"]:
         failure = stage_manifest.get("failure_log") or {}
@@ -1140,10 +1240,14 @@ def finish_stage(cfg: Config, run_dir: Path, stage: str, plan: dict, *, process,
                      returncode=returncode)
     log(f"[{stage}] verified: last checkpoint global_step_{verification['last_step']}")
     math = verification.get("math_metrics") or {}
-    if math.get("last"):
-        log(f"[{stage}] dev math accuracy: acc={math['last']['acc']:.4f} "
-            f"(n={math['last']['count']}, truncated={math['last']['truncated_rate']}, "
-            f"parse_fail={math['last']['answer_parse_failure_rate']}) over {math['records']} validation pass(es)")
+    if verification['evaluation_status'] != 'complete':
+        log(f"[{stage}] training completed; evaluation={verification['evaluation_status']}: "
+            f"{verification['evaluation_problems']}")
+    if math.get('last'):
+        last=math['last'];acc=last.get('acc')
+        log(f"[{stage}] dev math accuracy: acc={format(acc,'.4f') if acc is not None else 'null'} "
+            f"provisional_acc={last.get('provisional_acc')} status={verification['evaluation_status']} "
+            f"(n={last.get('count')}, truncated={last.get('truncated_rate')})")
     return plan
 
 
@@ -1168,6 +1272,8 @@ def print_plan(cfg: Config, run_dir: Path, plans: list[dict], *, steps_per_epoch
     print(f"rollout       : n={cfg.get('rollout.n')} temperature={cfg.get('rollout.temperature')} "
           f"tp={cfg.get('rollout.tensor_model_parallel_size')} thinking={cfg.get('rollout.enable_thinking')} "
           f"(control={'on' if cfg.get('rollout.thinking_control') else 'off'})")
+    print(f"ROUGE-L       : {cfg.get('validation.rouge_l_enabled')} (diagnostic)")
+    print(f"eval blocks handoff: {cfg.get('validation.block_training_on_incomplete')}")
     print(f"gpus          : {cfg.get('resources.n_gpus_per_node')} x {cfg.get('resources.nnodes')} node(s)")
     keep_checkpoints = cfg.get("resources.keep_last_checkpoints")
     if keep_checkpoints is not None:
@@ -1243,7 +1349,9 @@ def export_final_actor(cfg: Config, run_dir: Path, *, dry_run: bool) -> str:
     run_command(argv, dry_run=dry_run, component="export-final")
     if dry_run:
         handoff = recorded_handoff(run_dir, cfg) or {}
-        target = int(handoff.get("step") or cfg.get("budget.warmup_steps")) + cfg.stage_steps("gad")
+        per_epoch = steps_per_epoch(cfg)
+        start = int(handoff.get('step') or cfg.get('budget.init_step') or stage_step_budget(cfg,'warmup',per_epoch))
+        target = start + stage_step_budget(cfg,'gad',per_epoch,handoff_step=start)
         return f"<dry-run: {gad_out}/global_step_{target}/actor/huggingface>"
 
     manifest = read_json(manifest_path, default=None)
@@ -1258,8 +1366,10 @@ def export_final_actor(cfg: Config, run_dir: Path, *, dry_run: bool) -> str:
     # Guard against the original bug: the exported step must be the step the GAD
     # stage verified, not the Warmup init step.
     verify_final_model_step(run_dir, manifest)
+    handoff = recorded_handoff(run_dir,cfg) or {}
+    added = int(manifest['step']) - int(handoff['step']) if handoff.get('step') is not None else None
     log(f"final model: {actor_hf} (global_step_{manifest['step']}, "
-        f"trained for {cfg.stage_steps('gad')} steps on top of the Warmup handoff)")
+        f"added steps from recorded Warmup handoff: {added if added is not None else 'unavailable'})")
     return str(actor_hf)
 
 
@@ -1365,6 +1475,8 @@ def main() -> int:
                 snapshot = versions / f"resolved_config_{stamp}.yaml"
                 snapshot.write_text(_yaml.safe_dump(cfg.to_dict(), sort_keys=True, allow_unicode=True), encoding="utf-8")
                 (run_dir / "current_resolved_config.txt").write_text(str(snapshot) + "\n", encoding="utf-8")
+                # Preflight must read the resolved snapshot, including CLI overrides.
+                cfg.path = snapshot
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
         write_json(run_dir / "reports" / f"launch_{stamp}.json", {
             "source_config": source_config, "config": str(cfg.path),
@@ -1412,6 +1524,12 @@ def main() -> int:
             skip, reason = check_skip(cfg, run_dir, stage)
         if skip:
             log(f"skipping stage {stage}: {reason}")
+            if not args.dry_run and not completion_marker(run_dir,stage).exists() and not (run_dir/'reports'/f'training_recovery_{stage}.json').exists():
+                write_json(run_dir/'reports'/f'training_recovery_{stage}.json',{
+                    'schema_version':'gad.training_recovery.v1','stage':stage,'reason':reason,
+                    'original_record':str(run_dir/f'stage_{stage}.json'),
+                    'inputs':stage_inputs_digest(cfg,stage),'training_completed':True,
+                    'evaluation_verified':False})
             continue
         plans.append(run_stage(cfg, run_dir, stage, dry_run=args.dry_run, resume_requested=args.resume_gad))
         if plans[-1].get("invocation_limit_reached"):
@@ -1472,7 +1590,10 @@ def main() -> int:
             "--tp", str(int(cfg.get("eval.tensor_parallel_size"))),
             "--gpu-memory-utilization", str(cfg.get("eval.gpu_memory_utilization")),
             "--enable-thinking", "true" if cfg.get("rollout.enable_thinking") else "false",
+            '--scorer-path', str(cfg.require('validation.scorer_path')),
         ]
+        if cfg.get('scoring.math.version') == 'math_unified_v1':
+            eval_argv += ['--scoring-config-json',json.dumps({key[13:]:value for key,value in cfg.data.items() if key.startswith('scoring.math.')})]
         run_command(eval_argv, component="eval")
 
     log("pipeline finished")

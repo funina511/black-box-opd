@@ -14,6 +14,8 @@ def source_files():
     files = {str(p.relative_to(ROOT / "gad/extensions")): p
              for p in (ROOT / "gad/extensions").rglob("*.py") if "core" not in p.relative_to(ROOT / "gad/extensions").parts}
     files.update({"core/" + p.name: p for p in (ROOT / "rubric/core").glob("*.py")})
+    files.update({'public_scoring/' + str(p.relative_to(ROOT / 'scoring')): p
+                  for p in (ROOT / 'scoring').rglob('*.py') if 'tests' not in p.parts})
     return files
 
 
@@ -83,6 +85,17 @@ def apply(worktree, stage):
         "                from verl.experimental.gad_extensions.worker import record_worker_source\n"
         "                record_worker_source(config)\n", "worker model")
     key = paths[2]
+    texts[key] = replace(texts[key], '    def _validate(self):\n',
+        '    def _validate(self):\n'
+        "        if self.config.trainer.get('disable_validation', False):\n"
+        '            return {}\n', 'bounded smoke validation')
+    texts[key] = replace(texts[key], '        # load checkpoint before doing anything\n        self._load_checkpoint()',
+        "        import random\n"
+        "        if self.config.trainer.get('seed') is not None:\n"
+        "            random.seed(self.config.trainer.seed)\n"
+        "            np.random.seed(self.config.trainer.seed)\n"
+        "            torch.manual_seed(self.config.trainer.seed)\n"
+        '        # load checkpoint before doing anything\n        self._load_checkpoint()', 'explicit driver seed')
     texts[key] = replace(texts[key], "        # load checkpoint before doing anything\n        self._load_checkpoint()",
         "        # ALGORITHM(gad_extensions_v1): lazy driver state; disabled is inert.\n"
         "        self.gad_extensions = None\n"
@@ -104,7 +117,7 @@ def apply(worktree, stage):
         "                is_last_step = self.global_steps >= self.total_training_steps\n"
         "                extension_stop = bool(self.gad_extensions is not None and self.gad_extensions.options.get('max_invocation_steps') and self.gad_extensions.invocation_steps + 1 >= self.gad_extensions.options['max_invocation_steps'])\n", "invocation limit")
     texts[key] = replace(texts[key], "                    if self.config.trainer.save_freq > 0 and (is_last_step or self.global_steps % self.config.trainer.save_freq == 0):\n",
-        "                    if self.config.trainer.save_freq > 0 and (is_last_step or extension_stop or self.global_steps % self.config.trainer.save_freq == 0):\n", "limit checkpoint")
+        "                    if is_last_step or extension_stop or (self.config.trainer.save_freq > 0 and self.global_steps % self.config.trainer.save_freq == 0):\n", "limit checkpoint")
     texts[key] = replace(texts[key], "                if is_last_step:\n                    pprint(f\"Final validation metrics: {last_val_metrics}\")",
         "                if is_last_step or extension_stop:\n                    pprint(f\"Final validation metrics: {last_val_metrics}\")", "limit return")
     texts[key] = replace(texts[key], "        # latest checkpointed iteration tracker (for atomic usage)\n",
@@ -139,8 +152,11 @@ def apply(worktree, stage):
     texts[key] = replace(texts[key], "        if not self.processor_type == \"MiniCPMVImageProcessor\":\n",
         "        if self.gad_extensions_enabled:\n"
         "            row_dict['gad_prompt_truncated'] = bool(input_ids.shape[-1] > self.max_prompt_length)\n"
-        "            row_dict['gad_teacher_token_truncated'] = bool(teacher_response is not None and teacher_response['input_ids'].shape[-1] > self.max_response_length)\n"
         "        if not self.processor_type == \"MiniCPMVImageProcessor\":\n", "dataset provenance")
+    texts[key] = replace(texts[key], '            teacher_response = self.tokenizer(teacher_response, return_tensors="pt", add_special_tokens=False)\n',
+        '            teacher_response = self.tokenizer(teacher_response, return_tensors="pt", add_special_tokens=False)\n'
+        "            if self.gad_extensions_enabled:\n"
+        "                row_dict['gad_teacher_token_truncated'] = bool(teacher_response['input_ids'].shape[-1] > self.max_response_length)\n", 'teacher pre-truncation provenance')
     key = paths[4]
     texts[key] = replace(texts[key], "            response = []\n            rollout_log_probs = []\n",
         "            response = []\n            rollout_log_probs = []\n"
@@ -165,7 +181,7 @@ def apply(worktree, stage):
     texts[key] = replace(texts[key], "data:\n", "data:\n  gad_extensions: {enabled: false}\n", "data yaml")
     start = texts[key].index("actor_rollout_ref:\n")
     end = texts[key].index("\ncritic:\n", start)
-    section = replace(texts[key][start:end], "  rollout:\n", "  rollout:\n    gad_extensions: {enabled: false}\n    seed: null\n", "rollout yaml")
+    section = replace(texts[key][start:end], "  rollout:\n", "  rollout:\n    gad_extensions: {enabled: false}\n    seed: 0\n", "rollout yaml")
     texts[key] = texts[key][:start] + section + texts[key][end:]
     import yaml
     from extension_config import EXTENSION_DEFAULTS
@@ -183,11 +199,14 @@ def apply(worktree, stage):
     def block(value):
         return "".join("  " + line + "\n" for line in yaml.safe_dump(value, sort_keys=False).splitlines())
     driver = nested("rubric")
-    driver.update({"spec_hash": None, "scorer_path": None, "judge_fingerprint": None})
-    worker = {"enabled": False, "mode": "joint", "loss_coef": .1,
+    driver.update({"spec_hash": None, "scorer_path": None, "judge_fingerprint": None, 'scoring_math': None})
+    worker = {"enabled": False, "gradient_diagnostics_dir": None, "mode": "joint", "loss_coef": .1,
+              **{key: EXTENSION_DEFAULTS["rubric." + key] for key in ("loss_mode", "count_gate_tau", "gradient_diagnostics_interval", "gradient_diagnostics_max_pairs")},
+              'version': 'math_v1',
               "head_layout": driver["head_layout"], "spec_hash": None}
     texts[key] = replace(texts[key], "critic:\n", "critic:\n" + block({"rubric": worker, "extensions_code_hash": None, "extensions_enabled": False}), "critic yaml")
     state = {"enabled": False, "identity": None, "stage": None, "start_step": 0,
+             'scorer_identity': None,
              "token_identity": None, "teacher_index": None, "sampling_seed": None, "max_invocation_steps": None}
     texts[key] = replace(texts[key], "trainer:\n", "trainer:\n" + block(
         {"rubric": driver, "critic_replay": nested("replay"), "gad_extensions": state}), "trainer yaml")

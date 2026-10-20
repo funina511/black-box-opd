@@ -41,7 +41,7 @@ from pathlib import Path
 
 GAD_DIR = Path(__file__).resolve().parents[1]
 TOOLS_DIR = GAD_DIR / "tools"
-BACKEND_ROOT = GAD_DIR / ".backends"
+BACKEND_ROOT = Path(os.environ.get("GAD_TEST_BACKEND_ROOT", GAD_DIR / ".backends"))
 SCORER = GAD_DIR.parent / "sample" / "math_scorer.py"
 
 sys.path.insert(0, str(TOOLS_DIR))
@@ -161,7 +161,8 @@ class MathValidationTests(unittest.TestCase):
         # mean of the +/-1 score is 0.0 here, so a score mean must never be
         # reported as accuracy (plan section 3.3).
         self.assertAlmostEqual(summary["score_mean"], 0.0, places=6)
-        self.assertAlmostEqual(summary["answer_parse_failure_rate"], 0.25, places=6)
+        self.assertAlmostEqual(summary["answer_parse_failure_rate"], 0.0, places=6)
+        self.assertAlmostEqual(summary['no_answer_rate'], 0.25, places=6)
         self.assertAlmostEqual(summary["response_len_mean"], 25.0, places=6)
 
     def test_truncation_uses_the_rollout_response_length(self) -> None:
@@ -172,14 +173,18 @@ class MathValidationTests(unittest.TestCase):
         self.assertEqual([row["truncated"] for row in rows], [1.0, 0.0, 1.0])
         self.assertAlmostEqual(self.ray_trainer._gad_math_metrics(rows)["truncated_rate"], 2 / 3, places=6)
 
-    def test_scorer_exception_counts_the_row_as_incorrect(self) -> None:
+    def test_scorer_exception_makes_evaluation_incomplete(self) -> None:
         class Exploding:
             @staticmethod
             def compute_score(solution_str, ground_truth):
                 raise ValueError("boom")
 
         row = self.ray_trainer._gad_score_math_row(Exploding(), "Answer: 1", "1")
-        self.assertEqual(row, {"acc": 0.0, "score": -1.0, "answer_parsed": 0.0})
+        self.assertEqual(row['grader_error'],1.0)
+        self.assertEqual(row['unscorable'],1.0)
+        metrics=self.ray_trainer._gad_math_metrics([{**row,'length':1,'truncated':False}])
+        self.assertFalse(metrics['evaluation_complete'])
+        self.assertIsNone(metrics['acc'])
 
     # ------------------------------------------------- patched _validate path
     def _run_validate_blocks(self, *, scorer_path: str | None, local_dir: Path, out_dir: Path):
@@ -223,6 +228,9 @@ class MathValidationTests(unittest.TestCase):
             "json": json,
             "time": time,
             "scope": "full",
+            "rouge_enabled":False,
+            "sample_inputs":["p1","p2"], "sample_outputs":["Answer: 142","Answer: 3"],
+            "loader":type("Loader",(),{"dataset":[1,2]})(),
             "_gad_started": time.perf_counter(),
             "_gad_timing": {"generation": 0.0, "decode": 0.0, "rouge_l": 0.0, "math_scoring": 0.0},
         }
@@ -312,7 +320,8 @@ class MathValidationTests(unittest.TestCase):
                 shutil.copy2(pristine / relative, expected / relative)
             for patch in (backend_patches.ResumeWorkerStatePatch(),
                           backend_patches.MathValidationPatch(),
-                          backend_patches.ValidationScopePatch()):
+                          backend_patches.ValidationScopePatch(),
+                          backend_patches.ValidationDiagnosticsPatch()):
                 patch.apply(expected)
             self.assertEqual((expected / trainer).read_text(encoding="utf-8"), self.source)
 

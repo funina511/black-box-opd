@@ -1,0 +1,16 @@
+scoring:
+  math:
+    version: math_unified_v1
+    entrypoint: /mnt/jinbo/RLRM/LMOps/scoring/math.py
+    timeout_seconds: 2.0
+rollout:
+  seed: 42
+run:
+  seed: 42
+models:
+  discriminator_init: /mnt/jinbo/RLRM/LMOps/runs/_initialization/qwen3_0.6b_math_v2_adv_seed42
+replay:
+  enabled: false
+rubric:
+  enabled: false
+  version: math_process_v2

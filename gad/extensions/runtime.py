@@ -31,6 +31,7 @@ class Runtime:
                 if not record.get("_header"):
                     uid = str(record.get("uid", record.get("index", "")))
                     self.teacher_provenance[uid] = {"sampling": record.get("sampling", {}),
+                                                    'candidate_hashes': [__import__('hashlib').sha256(text.encode()).hexdigest() for text in record.get('teacher_answers', [])],
                                                     "finish_reason": record.get("finish_reason"),
                                                     "truncated": record.get("truncated", False)}
         self.pending = None
@@ -45,8 +46,19 @@ class Runtime:
         for pair in fresh:
             source = self.teacher_provenance.get(pair["source_index"], {})
             sampling = source.get("sampling", {})
-            finish = (sampling.get("finish_reasons") or [source.get("finish_reason")])[0]
-            truncated = bool((sampling.get("truncated") or [source.get("truncated", False)])[0]) or finish == "length"
+            selected = pair['teacher'].get('selected_teacher_index')
+            hashes = source.get('candidate_hashes', [])
+            if selected is None:
+                if len(hashes) > 1:
+                    raise ValueError('teacher multi-candidate provenance missing; migrate data before training')
+                selected = 0
+            if hashes and (selected >= len(hashes) or pair['teacher'].get('selected_teacher_text_sha256', hashes[selected]) != hashes[selected]):
+                raise ValueError('selected teacher text hash differs from source candidate')
+            def source_field(name, default):
+                values = sampling.get(name) or []
+                return values[selected] if selected < len(values) else default
+            finish = pair['teacher'].get('source_finish_reason', source_field('finish_reasons', source.get('finish_reason')))
+            truncated = bool(pair['teacher'].get('source_truncated', source_field('truncated', source.get('truncated', False)))) or finish == 'length'
             pair["teacher"]["source_truncated"] = truncated
             pair["teacher"]["truncated"] |= truncated
             pair["teacher"]["source_finish_reason"] = finish
@@ -93,7 +105,7 @@ class Runtime:
         fresh, stage_step, step, stats = self.pending
         if self.replay:
             self.replay.commit(fresh, stage_step)
-            stats.update({"replay/size_pairs": len(self.replay.entries), "replay/bytes": self.replay.bytes,
+            stats.update({"replay/size_pairs": len(self.replay.entries), "replay/serialized_bytes": self.replay.bytes,
                           "replay/evicted_age": self.replay.evicted_age,
                           "replay/evicted_capacity": self.replay.evicted_capacity})
         self.stage_step, self.committed_step = stage_step, step

@@ -1,0 +1,26 @@
+{
+  "cpu_suites": 26,
+  "cpu_tests": 290,
+  "skipped_tests": 0,
+  "protocol": {
+    "input": "rubric.input.v2.3",
+    "wire": "rubric.events.v2.4"
+  },
+  "scorer_before": "e3aaaac272846f564ce6ca6af969b395b1382ec7740a3884d7c689591ab3cb1c",
+  "scorer_after": "2a2b8a02925ecd3b6a5ff99f32a7cd04df03c8b962278c42a1099eb4380467b7",
+  "new_8b_joint_config_valid": true,
+  "history_raw_unchanged": {
+    "runs/baseline_math_v2_06b5k/evaluation/math_unified_v1_n8_math500n2_8k/gad/AIME24/generation/raw_samples.jsonl": true,
+    "runs/baseline_math_v2_06b5k/evaluation/math_unified_v1_n8_math500n2_8k/gad/AIME25/generation/raw_samples.jsonl": true,
+    "runs/baseline_math_v2_06b5k/evaluation/math_unified_v1_n8_math500n2_8k/gad/AMC23/generation/raw_samples.jsonl": true,
+    "runs/baseline_math_v2_06b5k/evaluation/math_unified_v1_n8_math500n2_8k/gad/MATH-500/generation/raw_samples.jsonl": true
+  },
+  "old_unified_run_fingerprint_rejection_preserved": true,
+  "gad_only_smoke_resume_dry_run": 0,
+  "new_model_requests": 0,
+  "training_steps": 0,
+  "git_tracking": "critical framework sources staged for review; no commit/push performed",
+  "document_links_checked": true,
+  "strict_explicit_scorer_path_verified": true,
+  "source_bundle_sha256": "17080bf805d915d3b1559a7185d586fad3444c6c8140969c00b78d9944d82ead"
+}

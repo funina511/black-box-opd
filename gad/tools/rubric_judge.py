@@ -29,6 +29,9 @@ def main():
     args = p.parse_args()
     cfg = load_run_config(args.run) if args.run else compose_config(args.config, settings=args.set)
     options = {key[13:]: value for key, value in cfg.data.items() if key.startswith("rubric.judge.")}
+    thinking = options['enable_thinking']
+    if type(thinking) is not bool or (thinking and options['reasoning_parser'] != 'deepseek_r1') or (not thinking and options['reasoning_parser'] is not None):
+        raise ValueError('judge thinking/parser combination is unsupported on vLLM 0.8.5')
     url = urlparse(options["base_url"])
     port = url.port or 8010
     directory = ROOT / "runs/_rubric_judge" / str(port)
@@ -80,8 +83,11 @@ def main():
             "--cpu-offload-gb", str(options["cpu_offload_gb"]),
             "--max-num-seqs", "16", "--enforce-eager", "--disable-log-requests",
             "--guided-decoding-backend", "xgrammar"]
+    if thinking:
+        argv += ['--enable-reasoning', '--reasoning-parser', options['reasoning_parser']]
     if args.dry_run:
-        print(json.dumps({"argv": argv, "gpu_ids": gpu_ids, "identity_hash": expected, "log": str(log)}, indent=2))
+        print(json.dumps({"argv": argv, "gpu_ids": gpu_ids, "identity_hash": expected, "log": str(log),
+                          "environment": {'VLLM_USE_V1': '0'}, 'enable_thinking': thinking}, indent=2))
         return
     if owner and Path(f"/proc/{owner['pid']}").exists():
         if process_birth(owner["pid"]) == owner["birth"]:
@@ -97,7 +103,7 @@ def main():
                    "model_sha256": service_identity(cfg, full=True)["model_sha256"], "gpu_ids": gpu_ids}
     fingerprint_file.write_text(json.dumps(fingerprint, indent=2))
     env = dict(os.environ, CUDA_VISIBLE_DEVICES=gpu_ids, GAD_JUDGE_FINGERPRINT_FILE=str(fingerprint_file),
-               VLLM_WORKER_MULTIPROC_METHOD="spawn", TOKENIZERS_PARALLELISM="false")
+               VLLM_WORKER_MULTIPROC_METHOD="spawn", TOKENIZERS_PARALLELISM="false", VLLM_USE_V1="0")
     if options.get("api_key_env"):
         if not os.environ.get(options["api_key_env"]):
             raise RuntimeError("judge API key environment variable is unset")

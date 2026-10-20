@@ -1,0 +1,110 @@
+[
+  {
+    "run": "runs/baseline_math_v2_06b5k",
+    "returncode": 2,
+    "last_lines": [
+      "[gad] CONFIG ERROR: saved math scorer/dependency fingerprint differs; new run required"
+    ]
+  },
+  {
+    "run": "runs/gad_qwen3_0.6b_17k/qwen3-0.6b-17k-n2",
+    "returncode": 0,
+    "last_lines": [
+      "rollout       : n=2 temperature=0.8 tp=1 thinking=False (control=on)",
+      "gpus          : 4 x 1 node(s)",
+      "checkpoints   : save every 50 steps; keep last 5 saves per stage (plus handoff and exported models)",
+      "",
+      "------------------------------------------------------------------------------",
+      "eval after train: False",
+      "nothing was executed (dry-run)"
+    ]
+  },
+  {
+    "run": "runs/gad_qwen3_0.6b_5k/qwen3-0.6b-5k-seed42-n2",
+    "returncode": 0,
+    "last_lines": [
+      "rollout       : n=2 temperature=0.8 tp=1 thinking=False (control=on)",
+      "gpus          : 4 x 1 node(s)",
+      "checkpoints   : save every 50 steps; keep last 5 saves per stage (plus handoff and exported models)",
+      "",
+      "------------------------------------------------------------------------------",
+      "eval after train: False",
+      "nothing was executed (dry-run)"
+    ]
+  },
+  {
+    "run": "runs/gad_qwen3_1.7b/qwen3-1.7b-4x3090",
+    "returncode": 0,
+    "last_lines": [
+      "      critic.use_dynamic_bsz=False \\",
+      "      critic.ppo_micro_batch_size_per_gpu=1 \\",
+      "      trainer.resume_mode=auto \\",
+      "      trainer.resume_load_worker_state=True",
+      "------------------------------------------------------------------------------",
+      "eval after train: False",
+      "nothing was executed (dry-run)"
+    ]
+  },
+  {
+    "run": "runs/naive_rubric_0.6b_17k",
+    "returncode": 0,
+    "last_lines": [
+      "      data.gad_extensions.enabled=true \\",
+      "      actor_rollout_ref.rollout.gad_extensions.enabled=true \\",
+      "      critic.ppo_mini_batch_size=64 \\",
+      "      trainer.resume_load_worker_state=True",
+      "------------------------------------------------------------------------------",
+      "eval after train: False",
+      "nothing was executed (dry-run)"
+    ]
+  },
+  {
+    "run": "runs/online_correctness_smoke_v2",
+    "returncode": 1,
+    "last_lines": [
+      "[gad] resume-gad: the GAD stage will restore optimizer/scheduler/RNG state",
+      "[gad] FATAL: explicit Warmup initialization is for --stages gad only"
+    ],
+    "appropriate_stages": "gad",
+    "appropriate_stage_dry_run_returncode": 0
+  },
+  {
+    "run": "runs/online_replay_smoke_v2",
+    "returncode": 0,
+    "last_lines": [
+      "      data.gad_extensions.enabled=true \\",
+      "      actor_rollout_ref.rollout.gad_extensions.enabled=true \\",
+      "      critic.ppo_mini_batch_size=8 \\",
+      "      trainer.resume_load_worker_state=True",
+      "------------------------------------------------------------------------------",
+      "eval after train: False",
+      "nothing was executed (dry-run)"
+    ]
+  },
+  {
+    "run": "runs/online_wg_smoke_v1",
+    "returncode": 0,
+    "last_lines": [
+      "      data.gad_extensions.enabled=true \\",
+      "      actor_rollout_ref.rollout.gad_extensions.enabled=true \\",
+      "      critic.ppo_mini_batch_size=8 \\",
+      "      trainer.resume_load_worker_state=True",
+      "------------------------------------------------------------------------------",
+      "eval after train: False",
+      "nothing was executed (dry-run)"
+    ]
+  },
+  {
+    "run": "runs/qwen3_0.6b_dapo_math_5k_rubric_0.6b_5k_20261012-215342-839723",
+    "returncode": 0,
+    "last_lines": [
+      "      data.gad_extensions.enabled=true \\",
+      "      actor_rollout_ref.rollout.gad_extensions.enabled=true \\",
+      "      critic.ppo_mini_batch_size=64 \\",
+      "      trainer.resume_load_worker_state=True",
+      "------------------------------------------------------------------------------",
+      "eval after train: False",
+      "nothing was executed (dry-run)"
+    ]
+  }
+]

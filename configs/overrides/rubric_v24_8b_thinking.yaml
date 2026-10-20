@@ -1,0 +1,33 @@
+# v2.4 research candidate: wire events.v2.7/input.v2.5; targeted review v4. Frozen B/C snapshot is in reports/rubric_v24_bc_20261017/.
+rubric:
+  enabled: true
+  mode: joint
+  stages: [warmup, gad]
+  version: math_process_v2
+  loss_mode: legacy_active # Phase A isolates judge changes.
+  spec: /mnt/jinbo/RLRM/LMOps/rubric/specs/math_process_v27.yaml
+  prompt: /mnt/jinbo/RLRM/LMOps/rubric/prompts/judge_math_process_v27.txt
+  semantic_check: true
+  semantic_max_extra_requests: 1
+  judge:
+    model: Qwen3-8B
+    tokenizer_path: /mnt/jinbo/RLRM/model/Qwen/Qwen3-8B
+    base_url: http://127.0.0.1:8021/v1
+    enable_thinking: true
+    reasoning_parser: deepseek_r1
+    temperature: 0.6
+    top_p: 0.95
+    top_k: 20
+    min_p: 0.0
+    dtype: bfloat16
+    tensor_parallel_size: 2
+    max_context_tokens: 32768
+    max_output_tokens: 8192
+    concurrency: 1
+    request_timeout_seconds: 300
+    step_timeout_seconds: 1800
+    max_retries: 0
+resources:
+  judge_gpus: 6,7
+replay:
+  enabled: false

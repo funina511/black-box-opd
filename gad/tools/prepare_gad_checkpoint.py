@@ -250,7 +250,8 @@ def fix_critic_config(critic_hf: Path, *, hidden_size: int | None) -> dict:
     if labels not in (1, 4):
         raise PipelineError(f"unsupported critic score shape: {shape}")
     if labels == 4:
-        from extension_config import LAYOUT
+        from rubric.core.contracts import layout_for
+        LAYOUT = layout_for(config.get('rubric_version', 'math_v1'))
         if config.get("rubric_head_layout") != list(LAYOUT) or not config.get("rubric_hash"):
             raise PipelineError("four-channel critic is missing its layout/rubric hash")
         config["id2label"] = dict(enumerate(LAYOUT))

@@ -14,6 +14,7 @@ external evaluation. Loading is strict on purpose:
 from __future__ import annotations
 
 from pathlib import Path
+import re
 from typing import Any
 
 from common import PipelineError, TRAIN_STAGES, flatten_dict
@@ -143,6 +144,8 @@ DEFAULTS: dict[str, Any] = {
     "eval.dev_do_sample": False,
     "validation.scorer_path": None,
     "validation.require_math_metrics": True,
+    "validation.rouge_l_enabled": False,
+    "validation.block_training_on_incomplete": False,
     "validation.quick_enabled": False,
     "validation.quick_size": 128,
     "validation.quick_seed": 42,
@@ -170,6 +173,7 @@ PATH_KEYS = (
     "data.manifest",
     "eval.parquet",
     "validation.scorer_path",
+    'scoring.math.entrypoint',
     "validation.quick_file",
     "rubric.spec",
     "rubric.prompt",
@@ -193,7 +197,11 @@ class Config:
     """Resolved pipeline configuration with dotted-key access."""
 
     def __init__(self, data: dict, *, path: Path):
-        self.data = data
+        self.data = dict(data)
+        for key, value in self.data.items():
+            if (key == 'rollout.n' or key in ('rollout.n_seqkd','rollout.n_warmup','rollout.val_n') or
+                    key.startswith(('budget.stage_epochs.','budget.epochs_override.'))):
+                if isinstance(value,str) and re.fullmatch(r'[+-]?\d+',value.strip()):self.data[key] = int(value)
         self.path = path
         self.identity_data = None
         self.selection = {}
@@ -208,6 +216,10 @@ class Config:
         if not overlay:
             return self
         data = {**self.data, **overlay}
+        # A stage-local group size wins over a global/default STAGE_N_* value.
+        specific = f'rollout.n_{stage}'
+        if stage in ('seqkd','warmup') and 'rollout.n' in overlay and specific not in overlay:
+            data[specific] = overlay['rollout.n']
         for key in self.runtime_overrides:
             data[key] = self.data[key]
         result = Config(data, path=self.path)
@@ -377,6 +389,17 @@ def _resolved_config(data: dict, path: Path) -> Config:
     if not resolved.get("validation.scorer_path"):
         candidate = GAD_DIR.parent / "sample" / "math_scorer.py"
         resolved["validation.scorer_path"] = str(candidate) if candidate.is_file() else None
+    if resolved.get('scoring.math.version') == 'math_unified_v1':
+        import sys
+        sys.path.insert(0, str(GAD_DIR.parent))
+        from scoring.math import identity
+        entry = str(GAD_DIR.parent / 'scoring/math.py')
+        supplied = data.get('validation.scorer_path')
+        if supplied and str(Path(supplied).resolve()) != entry:
+            raise PipelineError('validation.scorer_path conflicts with unified scoring.math')
+        resolved['scoring.math.entrypoint'] = resolved.get('scoring.math.entrypoint') or entry
+        resolved['validation.scorer_path'] = resolved['scoring.math.entrypoint']
+        resolved['scoring.math.fingerprint'] = resolved.get('scoring.math.fingerprint') or identity(resolved['scoring.math.timeout_seconds'])['fingerprint']
     cfg = Config(resolved, path=path)
     from extension_config import configure_profile
     configure_profile(cfg)
@@ -560,7 +583,7 @@ def validate_config(config: Config) -> list[str]:
     for stage in TRAIN_STAGES:
         value = config.get(f"budget.stage_epochs.{stage}")
         if value is not None:
-            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            if type(value) is not int or value < 1:
                 problems.append(f"budget.stage_epochs.{stage} must be a positive integer")
             continue
         key = STAGE_STEPS_KEY[stage]
@@ -574,7 +597,7 @@ def validate_config(config: Config) -> list[str]:
 
     warmup_epochs = config.get("budget.stage_epochs.warmup")
     gad_epochs = config.get("budget.stage_epochs.gad")
-    if (config.get("budget.gad_new_steps") is None and isinstance(warmup_epochs, int) and isinstance(gad_epochs, int)
+    if (config.get("budget.gad_new_steps") is None and type(warmup_epochs) is int and type(gad_epochs) is int
             and gad_epochs <= warmup_epochs):
         problems.append("GAD absolute epoch target must exceed the Warmup epoch budget")
 
@@ -617,6 +640,8 @@ def validate_config(config: Config) -> list[str]:
     if config.get("resources.keep_last_epochs") is not None:
         problems.append("resources.keep_last_epochs was replaced by resources.keep_last_checkpoints")
 
+    for flag in ("validation.rouge_l_enabled","validation.block_training_on_incomplete"):
+        if type(config.get(flag)) is not bool:problems.append(flag+" must be boolean")
     if config.get("validation.quick_enabled"):
         quick = config.get("validation.quick_file")
         if not quick or not Path(str(quick)).is_file():
@@ -636,6 +661,9 @@ def validate_config(config: Config) -> list[str]:
     # only the first candidate per uid anyway) and dapo_check_gad_rollout_n refuses GAD with
     # n<2, because GRPO normalises advantages inside a uid group.
     for key in ("rollout.n_seqkd", "rollout.n_warmup"):
+        if type(config.get(key)) is not int:
+            problems.append(f"{key} must be an integer")
+            continue
         try:
             n = int(config.get(key) or 1)
         except (TypeError, ValueError):
@@ -643,6 +671,8 @@ def validate_config(config: Config) -> list[str]:
             continue
         if n < 1:
             problems.append(f"{key} must be >= 1 (rollout.n for that stage)")
+    if type(config.get('rollout.n')) is not int:
+        problems.append('rollout.n must be an integer')
     try:
         gad_n = int(config.get("rollout.n") or 0)
     except (TypeError, ValueError):

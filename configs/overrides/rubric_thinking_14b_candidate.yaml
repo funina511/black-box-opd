@@ -1,0 +1,22 @@
+# Appendix E: unvalidated judge candidate; actor rollout settings are inherited unchanged.
+rubric:
+  judge:
+    model: Qwen3-14B
+    tokenizer_path: /mnt/jinbo/RLRM/model/Qwen/Qwen3-14B
+    base_url: http://127.0.0.1:8019/v1
+    enable_thinking: true
+    reasoning_parser: deepseek_r1
+    temperature: 0.6
+    top_p: 0.95
+    top_k: 20
+    min_p: 0.0
+    dtype: bfloat16
+    tensor_parallel_size: 2
+    max_context_tokens: 32768
+    max_output_tokens: 8192 # One TOTAL budget for reasoning + final JSON, not two reservations.
+    concurrency: 1
+    request_timeout_seconds: 300
+    step_timeout_seconds: 1800
+    max_retries: 1
+resources:
+  judge_gpus: 6,7

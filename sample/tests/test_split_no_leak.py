@@ -412,6 +412,7 @@ class RunSampleTeacherWrapperTests(unittest.TestCase):
             except Exception:
                 time.sleep(0.1)
         proc.kill()
+        proc.wait(timeout=5)
         raise unittest.SkipTest("could not start the fake OpenAI endpoint")
 
     def _config(self, root: Path, port: int, model: str) -> Path:

@@ -1,0 +1,17 @@
+# Appendix D candidate for bounded verification; not a certified production default.
+rubric:
+  max_empty_student_process_steps: 3
+  judge:
+    model: Qwen3-14B
+    tokenizer_path: /mnt/jinbo/RLRM/model/Qwen/Qwen3-14B
+    base_url: http://127.0.0.1:8018/v1
+    dtype: bfloat16
+    tensor_parallel_size: 2
+    max_context_tokens: 32768
+    max_output_tokens: 1536
+    concurrency: 1
+    max_retries: 1
+    request_timeout_seconds: 180
+    step_timeout_seconds: 1200
+resources:
+  judge_gpus: 6,7

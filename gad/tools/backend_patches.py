@@ -29,7 +29,7 @@ Patches
     Add the plan's primary validation metric: CARD-aligned math accuracy on the
     student texts that ``_validate()`` already generates (no extra generation, no
     gradient, nothing written back into rewards/advantages/discriminator labels).
-    ROUGE-L is kept as the original auxiliary diagnostic. The scorer path comes
+    ROUGE-L is an optional auxiliary diagnostic, disabled by default. The scorer path comes
     from ``GAD_MATH_SCORER`` (set by the pipeline for every stage); a configured
     but unusable scorer is a hard error instead of a silent ROUGE-only run. Each
     validation pass also appends one line to
@@ -64,7 +64,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from common import PipelineError, insert_after, log, replace_once, sha256_text
+from common import PipelineError, insert_after, log, replace_once, sha256_file, sha256_text
 
 MARKER_PREFIX = "PATCH(gad:"
 
@@ -378,8 +378,8 @@ class MathValidationPatch(BackendPatch):
     The plan (section 3.3) requires the three branches to report dev-set math
     accuracy on the texts ``_validate()`` already generates. This patch adds the
     metric without touching the training reward, the advantage, the discriminator
-    labels or the update order: ROUGE-L stays exactly where it was and the math
-    numbers are additional validation output.
+    labels or the update order: ROUGE-L is independently optional and the math
+    numbers are validation output.
     """
 
     name = "gad-math-validation"
@@ -435,7 +435,15 @@ def _gad_load_math_scorer(path):
 
 
 def _gad_score_math_row(scorer, response, ground_truth):
-    """One row's CARD-aligned score; a scorer failure counts as incorrect."""
+    """Preserve grading failure separately from a genuine incorrect answer."""
+    if getattr(scorer, 'VERSION', None) == 'math_unified_v1':
+        result = scorer.compute_score(response or '', ground_truth)
+        return {**result, 'acc': float(result['acc']) if result['acc'] is not None else 0.0,
+                'score': float(result['score']) if result['score'] is not None else 0.0,
+                'answer_parsed': float(result['parse_status'] == 'ok'),
+                'grader_error': float(result['grade_status'] in ('error', 'timeout')),
+                'unscorable': float(not result['evaluation_valid']),
+                'no_answer': float(result['parse_status'] == 'no_answer')}
     try:
         result = scorer.compute_score(response or "", str(ground_truth or ""))
         prediction = str(result.get("pred", ""))
@@ -443,12 +451,15 @@ def _gad_score_math_row(scorer, response, ground_truth):
             "acc": float(bool(result.get("acc"))),
             "score": float(result.get("score", -1.0)),
             "answer_parsed": 0.0 if prediction == "[INVALID]" else 1.0,
+            "grader_error": 0.0, "unscorable": 0.0,
+            "no_answer": float(prediction == "[INVALID]"),
         }
     except Exception as exc:  # noqa: BLE001 - one bad row must not abort validation
         _GAD_MATH_SCORE_ERRORS[0] += 1
         if _GAD_MATH_SCORE_ERRORS[0] <= 5:
-            print(f"[gad] math scoring failed ({type(exc).__name__}: {exc}); row counted as incorrect")
-        return {"acc": 0.0, "score": -1.0, "answer_parsed": 0.0}
+            print(f"[gad] math scoring failed ({type(exc).__name__}: {exc}); evaluation incomplete")
+        return {"acc": 0.0, "score": 0.0, "answer_parsed": 0.0,
+                "grader_error": 1.0, "unscorable": 1.0, "no_answer": 0.0}
 
 
 def _gad_math_metrics(rows):
@@ -460,11 +471,20 @@ def _gad_math_metrics(rows):
     if not rows:
         return {}
     count = len(rows)
+    complete = not any(row.get('unscorable', 0) or row.get('grader_error', 0) for row in rows)
+    provisional = float(sum(row['acc'] for row in rows) / count)
     return {
         "count": count,
-        "acc": float(sum(row["acc"] for row in rows) / count),
+        "acc": provisional if complete else None,
+        "provisional_acc": provisional,
+        "evaluation_complete": complete,
+        "grader_error_rate": sum(row.get('grader_error',0) for row in rows) / count,
+        "unscorable_rate": sum(row.get('unscorable',0) for row in rows) / count,
+        "no_answer_rate": sum(row.get('no_answer',0) for row in rows) / count,
+        "scorer_version": rows[0].get('scorer_version','legacy_card_v1'),
+        "scorer_fingerprint": rows[0].get('scorer_fingerprint'),
         "score_mean": float(sum(row["score"] for row in rows) / count),
-        "answer_parse_failure_rate": float(sum(1.0 - row["answer_parsed"] for row in rows) / count),
+        "answer_parse_failure_rate": float(sum(row.get('parse_status') in ('malformed','ambiguous') if 'parse_status' in row else 0 for row in rows) / count),
         "response_len_mean": float(sum(row["length"] for row in rows) / count),
         "truncated_rate": float(sum(row["truncated"] for row in rows) / count),
     }
@@ -517,6 +537,8 @@ def _gad_score_math_batch(scorer, output_texts, ground_truths, response_lengths,
     FINGERPRINT = (
         "def _gad_score_math_batch(scorer, output_texts, ground_truths, response_lengths, max_response_length)",
         "_gad_score_math_batch(\n",
+        '"evaluation_complete": complete',
+        '"unscorable": 1.0',
     )
     EXPECTED_END_MARKERS = 3
 
@@ -556,7 +578,7 @@ def _gad_score_math_batch(scorer, output_texts, ground_truths, response_lengths,
                 "        if math_scorer is None:\n"
                 "            print(\n"
                 "                \"[gad] WARNING: validation math metrics are DISABLED (no GAD_MATH_SCORER); \"\n"
-                "                \"only the original ROUGE-L diagnostic is reported\"\n"
+                "                \"no mathematical accuracy will be published\"\n"
                 "            )\n"
                 "        math_rows = []\n"
                 "        math_max_response_length = int(\n"
@@ -599,7 +621,11 @@ def _gad_score_math_batch(scorer, output_texts, ground_truths, response_lengths,
                 "        # " + self.MARKER + " primary metric, plus the diagnostics the plan asks for.\n"
                 "        math_summary = _gad_math_metrics(math_rows)\n"
                 "        if math_summary:\n"
-                "            metric_dict[\"val/math/acc\"] = math_summary[\"acc\"]\n"
+                '            metric_dict["val/math/evaluation_complete"] = float(math_summary.get("evaluation_complete", True))\n'
+                '            metric_dict["val/math/grader_error_rate"] = math_summary.get("grader_error_rate", 0)\n'
+                '            metric_dict["val/math/no_answer_rate"] = math_summary.get("no_answer_rate", 0)\n'
+                '            accuracy_key = "val/math/acc" if math_summary.get("evaluation_complete", True) else "val/math/provisional_acc"\n'
+                '            metric_dict[accuracy_key] = math_summary["acc"] if math_summary.get("evaluation_complete", True) else math_summary["provisional_acc"]\n'
                 "            metric_dict[\"val/math/score_mean\"] = math_summary[\"score_mean\"]\n"
                 "            metric_dict[\"val/math/answer_parse_failure_rate\"] = math_summary[\"answer_parse_failure_rate\"]\n"
                 "            metric_dict[\"val/math/response_len_mean\"] = math_summary[\"response_len_mean\"]\n"
@@ -648,11 +674,26 @@ def _gad_score_math_batch(scorer, output_texts, ground_truths, response_lengths,
             "def _gad_score_math_batch(scorer, output_texts, ground_truths, response_lengths, max_response_length)",
             "_gad_math_scorer_path(self.config)",
             'reward_extra_infos_dict["acc"].extend',
-            'metric_dict["val/math/acc"] = math_summary["acc"]',
             "validation_math_metrics.jsonl",
         ):
             if marker not in text:
                 problems.append(f"{self.RAY_TRAINER}: missing {marker!r}")
+        # The algorithm profile replaces the legacy unconditional accuracy
+        # assignment: grader failures are reported as provisional accuracy.
+        # Preparation verifies existing worktrees before applying that profile
+        # again, so both complete implementations must remain verifiable.
+        accuracy_variants = (
+            ('metric_dict["val/math/acc"] = math_summary["acc"]',),
+            (
+                'metric_dict["val/math/evaluation_complete"] = float(math_summary.get("evaluation_complete", True))',
+                'metric_dict["val/math/grader_error_rate"] = math_summary.get("grader_error_rate", 0)',
+                'metric_dict["val/math/no_answer_rate"] = math_summary.get("no_answer_rate", 0)',
+                'accuracy_key = "val/math/acc" if math_summary.get("evaluation_complete", True) else "val/math/provisional_acc"',
+                'metric_dict[accuracy_key] = math_summary["acc"]',
+            ),
+        )
+        if not any(all(marker in text for marker in variant) for variant in accuracy_variants):
+            problems.append(f"{self.RAY_TRAINER}: missing complete math accuracy reporting (legacy or provisional)")
         if text.count(self.MARKER + " end") != self.EXPECTED_END_MARKERS:
             problems.append(
                 f"{self.RAY_TRAINER}: expected {self.EXPECTED_END_MARKERS} {self.MARKER} end markers, "
@@ -802,6 +843,106 @@ class ValidationScopePatch(BackendPatch):
         except SyntaxError as exc:
             problems.append(f"{path}: {exc}")
         return not problems, problems
+
+
+class ValidationDiagnosticsPatch(BackendPatch):
+    """Optional ROUGE and durable math rows, shared by all pinned branches."""
+    name = "gad-validation-diagnostics-v2"
+    description = "disable optional ROUGE work and retain traceable math validation rows"
+    RAY_TRAINER = "verl/trainer/ppo/ray_trainer.py"
+    MARKER = f"{MARKER_PREFIX}validation-diagnostics-v2)"
+
+    HELPERS = r'''
+def _gad_validation_rows(directory, step, scope, inputs, outputs, rows):
+    # A new file for each pass: revalidation cannot overwrite earlier evidence.
+    if not directory:
+        return None
+    import uuid
+    os.makedirs(str(directory), exist_ok=True)
+    target = os.path.join(str(directory), f"validation_rows_{scope}_{step}_{uuid.uuid4().hex}.jsonl")
+    try:
+        with open(target, "x", encoding="utf-8") as handle:
+            for i, (prompt, output, row) in enumerate(zip(inputs, outputs, rows)):
+                row.update(row_index=i, response_id=f"{scope}:{step}:{i}", source_file=target, source_line=i+1)
+                handle.write(json.dumps({"input":prompt,"output":output, **row}, ensure_ascii=False)+"\n")
+        return target
+    except Exception as exc:
+        print(f"[gad] validation response persistence failed: {exc}")
+        return None
+
+'''
+
+    def apply(self, worktree):
+        path = worktree / self.RAY_TRAINER
+        text = _read(path)
+        if self.MARKER in text:
+            ok, problems = self.verify(worktree)
+            if not ok: raise PipelineError(str(problems))
+            return PatchResult(self.name, False, [self.RAY_TRAINER])
+        text = replace_once(text, "from rouge_score import rouge_scorer\n", "", what="lazy ROUGE import")
+        text = replace_once(text, MathValidationPatch.ANCHOR_SCORER,
+            '        # '+self.MARKER+' optional diagnostic; never an optimization signal.\n'
+            '        rouge_enabled = bool(self.config.trainer.get("validation_rouge_l_enabled", False))\n'
+            '        scorer = None\n'
+            '        if rouge_enabled:\n'
+            '            from rouge_score import rouge_scorer\n'
+            '            scorer = rouge_scorer.RougeScorer(["rougeL"], use_stemmer=True)\n', what="conditional ROUGE construction")
+        text = replace_once(text, '            teacher_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in teacher_ids]\n',
+            '            teacher_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in teacher_ids] if rouge_enabled else []\n', what="skip teacher-only decode")
+        text = replace_once(text,
+            '            scores = [safe_rouge_score(ref, cand) for ref, cand in zip(teacher_texts, output_texts)]\n'
+            '            _gad_timing["rouge_l"] += time.perf_counter() - _gad_tick\n',
+            '            scores = [safe_rouge_score(ref, cand) for ref, cand in zip(teacher_texts, output_texts)] if rouge_enabled else []\n'
+            '            if rouge_enabled:\n'
+            '                _gad_timing["rouge_l"] += time.perf_counter() - _gad_tick\n', what="skip actual ROUGE calls")
+        text = replace_once(text, '            reward_extra_infos_dict["reward"].extend(scores)\n',
+            '            if rouge_enabled:\n                reward_extra_infos_dict["reward"].extend(scores)\n',what="no fake diagnostic values")
+        text = replace_once(text, '            print(f"len reward_extra_infos_dict[\'reward\']: {len(reward_extra_infos_dict[\'reward\'])}")\n','',what="no empty reward insertion")
+        text = replace_once(text, '["unknown"] * len(scores)', '["unknown"] * len(output_texts)',what="source cardinality")
+        # The optional sample table/dump requires an actual score vector. Durable
+        # math rows below preserve inputs and outputs with ROUGE disabled.
+        a=text.index('        self._maybe_log_val_generations(',text.index('    def _validate('))
+        b=text.index('        for key_info, lst in reward_extra_infos_dict.items():',a)
+        text=text[:a]+'        if rouge_enabled:\n'+''.join('    '+line if line.strip() else line for line in text[a:b].splitlines(keepends=True))+text[b:]
+        text=replace_once(text,'assert len(lst) == 0 or len(lst) == len(sample_scores)', 'assert len(lst) == 0 or len(lst) == len(sample_outputs)',what="math-only cardinality")
+        text=replace_once(text,MathValidationPatch.ANCHOR_METRIC,
+            '        if rouge_enabled:\n    '+MathValidationPatch.ANCHOR_METRIC,what="no empty mean")
+        text=replace_once(text,'        math_summary = _gad_math_metrics(math_rows)\n',
+            '        expected_count = len(loader.dataset) * int(self.config.actor_rollout_ref.rollout.val_kwargs.n)\n'
+            '        row_file = _gad_validation_rows(self.config.trainer.get("default_local_dir", None), self.global_steps, scope, sample_inputs, sample_outputs, math_rows)\n'
+            '        math_summary = _gad_math_metrics(math_rows)\n'
+            '        if math_summary:\n'
+            '            math_summary.update(expected_count=expected_count, actual_count=len(math_rows), rows_file=row_file,\n'
+            '                rouge_l_enabled=rouge_enabled, rouge_l_status="computed" if rouge_enabled else "disabled",\n'
+            '                provisional_denominator=expected_count, unknown_contribution="zero_in_provisional_only",\n'
+            '                failures=[{k:r.get(k) for k in ("row_index","response_id","question_id","source_file","source_line","parse_status","grade_status","error_reason","scorer_version","scorer_fingerprint")} for r in math_rows if r.get("unscorable") or r.get("grader_error")])\n'
+            '            math_summary["provisional_acc"] = sum(r["acc"] for r in math_rows) / max(expected_count, 1)\n'
+            '            if len(math_rows) != expected_count:\n'
+            '                math_summary.update(evaluation_complete=False, acc=None, incomplete_reason="sample_count_mismatch")\n'
+            '            if not math_summary["evaluation_complete"]:\n'
+            '                metric_dict = {key.replace("/acc/", "/provisional_acc/"):value for key,value in metric_dict.items()}\n',what="traceable math summary")
+        text=replace_once(text,'                math_rows.extend(batch_rows)\n',
+            '                for i, row in enumerate(batch_rows):\n'
+            '                    row["ground_truth"] = str(test_batch.non_tensor_batch["reward_model"][i].get("ground_truth", ""))\n'
+            '                    row["question_id"] = str(test_batch.non_tensor_batch.get("extra_info", [{} for _ in batch_rows])[i].get("index", len(math_rows)+i))\n'
+            '                math_rows.extend(batch_rows)\n',what="row reference provenance")
+        text=replace_once(text,'class RayPPOTrainer:',self.HELPERS+'class RayPPOTrainer:',what="durable row writer")
+        _write(path,text)
+        config=worktree/'verl/trainer/config/ppo_trainer.yaml'
+        config_text=_read(config)
+        config_text=replace_once(config_text,'trainer:\n','trainer:\n  validation_rouge_l_enabled: false\n',what="ROUGE config")
+        _write(config,config_text)
+        _assert_compiles(path,what=self.name)
+        return PatchResult(self.name,True,[self.RAY_TRAINER,str(config.relative_to(worktree))])
+
+    def verify(self,worktree):
+        text=_read(worktree/self.RAY_TRAINER)
+        needles=(self.MARKER,'if rouge_enabled else []','if rouge_enabled:\n            from rouge_score',
+            'rouge_l_status="computed" if rouge_enabled else "disabled"','def _gad_validation_rows(', 'expected_count = len(loader.dataset)')
+        problems=[f"{self.RAY_TRAINER}: missing {n}" for n in needles if n not in text]
+        try:compile(text,self.RAY_TRAINER,'exec')
+        except SyntaxError as exc:problems.append(str(exc))
+        return not problems,problems
 
 
 class TeacherAwareMicroBatchPatch(BackendPatch):
@@ -1129,6 +1270,7 @@ ALL_PATCHES: tuple[BackendPatch, ...] = (
     ResumeWorkerStatePatch(),
     MathValidationPatch(),
     ValidationScopePatch(),
+    ValidationDiagnosticsPatch(),
     TeacherAwareMicroBatchPatch(),
     VllmEngineLimitsPatch(),
 )
@@ -1169,3 +1311,37 @@ __all__ = [
     "apply_patches",
     "verify_patches",
 ]
+
+
+def verify_frozen_backend(worktree: Path) -> dict:
+    """Verify deployed bytes against their original manifest, without new patches."""
+    worktree = Path(worktree)
+    import json
+    import subprocess
+    engineering = worktree / '.gad_engineering_manifest.json'
+    if engineering.is_file():
+        entry = json.loads(engineering.read_text())
+        head = subprocess.check_output(['git','-C',str(worktree),'rev-parse','HEAD'],text=True).strip()
+        if entry.get('schema_version') != 'gad.engineering_backend.v1' or entry.get('stage') != worktree.name or entry.get('backend_commit') != head:
+            raise PipelineError(f'frozen engineering backend identity mismatch: {worktree}')
+        for name, expected in entry['patched_files'].items():
+            candidate = worktree / name
+            if not candidate.is_file() or sha256_file(candidate) != expected:
+                raise PipelineError(f'frozen engineering backend source changed: {candidate}')
+    elif (worktree / '.gad_algorithm_manifest.json').exists():
+        from algorithm_patches import verify
+        return verify(worktree)
+    else:
+        manifest = json.loads((worktree.parent / 'backend_manifest.json').read_text())
+        entry = manifest.get('backends', {}).get(worktree.name)
+        if not entry:
+            raise PipelineError(f'frozen backend provenance missing: {worktree}; use a new backend root')
+    diff = subprocess.check_output(['git','-C',str(worktree),'diff'],text=True).strip()
+    # common.capture_command strips stdout before write_patch_file adds one LF.
+    actual = sha256_text(diff+'\n' if diff else '# no engineering patches applied to this backend\n')
+    if actual != entry['patch_sha256']:
+        raise PipelineError(f'frozen engineering backend changed: {worktree}')
+    if (worktree / '.gad_algorithm_manifest.json').exists():
+        from algorithm_patches import verify
+        return verify(worktree)
+    return entry

@@ -170,7 +170,16 @@ def check_backends(cfg: Config, report: Report, stages: list[str]) -> dict:
         if (backend / "verl").is_dir():
             from backend_patches import verify_patches
 
-            ok, patch_problems = verify_patches(backend)
+            frozen = (backend / ".gad_backend_used").exists() and cfg.get("backends.profile") == "gad_extensions_v1"
+            if frozen:
+                try:
+                    from backend_patches import verify_frozen_backend
+                    verify_frozen_backend(backend)
+                    ok, patch_problems = True, []
+                except (OSError, ValueError, RuntimeError, KeyError) as exc:
+                    ok, patch_problems = False, [f"frozen backend validation failed: {exc}"]
+            else:
+                ok, patch_problems = verify_patches(backend)
             entry["patches_ok"] = ok
             entry["patch_problems"] = patch_problems
             problems.extend(patch_problems)
@@ -178,9 +187,10 @@ def check_backends(cfg: Config, report: Report, stages: list[str]) -> dict:
                 try:
                     from algorithm_patches import verify, code_hash
                     algorithm = verify(backend)
-                    if algorithm["extension_code_hash"] != code_hash():
+                    if not frozen and algorithm["extension_code_hash"] != code_hash():
                         raise ValueError("backend extension source is stale")
                     entry["algorithm"] = algorithm
+                    entry["frozen_deployed_backend"] = frozen
                 except (ValueError, RuntimeError, OSError) as exc:
                     problems.append(f"algorithm profile validation failed: {exc}")
         results[stage] = {**entry, "problems": problems}
@@ -448,6 +458,27 @@ def check_validation_metrics(cfg: Config, report: Report) -> None:
     expected, reason = validation_metrics_expected(cfg)
     path = cfg.get("validation.scorer_path")
     entry: dict = {"expected": bool(expected), "reason": reason, "scorer_path": str(path) if path else None}
+    if cfg.get('scoring.math.version') == 'math_unified_v1':
+        import os
+        external = os.environ.get('GAD_MATH_SCORER')
+        if external and Path(external).resolve() != Path(path).resolve():
+            report.fail('GAD_MATH_SCORER conflicts with unified scoring.math')
+        from scoring.math import validate_ground_truth, identity
+        import pyarrow.parquet as pq
+        from hashlib import sha256
+        for kind in ('train', 'val'):
+            columns = ['reward_model'] + (['extra_info', 'teacher_response'] if kind == 'train' else [])
+            for i, row in enumerate(pq.read_table(cfg.require('data.' + kind + '_file'), columns=columns).to_pylist()):
+                try:
+                    validate_ground_truth(row['reward_model']['ground_truth'])
+                    if kind == 'train' and cfg.get('rubric.version') == 'math_process_v2' and cfg.get('rubric.enabled'):
+                        meta = row['extra_info']
+                        if meta.get('teacher_metadata_version') != 'teacher.selection.v2' or meta.get('selected_teacher_text_sha256') != sha256(row['teacher_response'].encode()).hexdigest():
+                            raise ValueError('selected teacher metadata missing/changed; migrate derived data first')
+                except (ValueError, KeyError) as exc:
+                    report.fail(f'{kind} row {i} data preflight: {exc}')
+                    break
+        entry['scorer_identity'] = identity(cfg.get('scoring.math.timeout_seconds'))
     if not path:
         entry["status"] = "disabled"
         if cfg.get("validation.require_math_metrics"):
@@ -484,7 +515,7 @@ def check_validation_metrics(cfg: Config, report: Report) -> None:
         if probe.get("acc") != 1 or float(probe.get("score", 0)) != 1.0:
             report.fail(f"the math scorer did not score a correct answer as correct: {probe}")
         else:
-            report.ok(f"math scorer ready: {scorer} (CARD-aligned compute_score)")
+            report.ok(f"math scorer ready: {scorer} ({cfg.get('scoring.math.version')})")
     entry["status"] = "enabled" if expected else "configured-but-unused"
     report.sections["validation_metrics"] = entry
 

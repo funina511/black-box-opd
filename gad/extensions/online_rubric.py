@@ -24,21 +24,55 @@ class OnlineRubric:
         module = importlib.util.module_from_spec(module_spec)
         module_spec.loader.exec_module(module)
         self.scorer = module.compute_score
+        self.version = options.get('version', 'math_v1')
+        if self.version == 'math_process_v2':
+            from scoring.math import identity, score
+            from .core import process_v2
+            self.annotation_contract_hash = file_hash(process_v2.__file__)
+            self.protocol_identity = process_v2.protocol_identity(self.spec, self.instruction)
+            self.protocol_identity['semantic_policy'] = {key:options.get(key, default) for key,default in (('semantic_check',False),('semantic_max_extra_requests',1))}
+            from .core import semantic_v24
+            self.protocol_identity['semantic_module_hash'] = file_hash(semantic_v24.__file__)
+            self.scoring_config = options['scoring_math']
+            self.scorer_identity = identity(self.scoring_config['timeout_seconds'])
+            if self.scorer_identity['fingerprint'] != self.scoring_config['fingerprint']:
+                raise ValueError('V2 scorer/dependency identity changed')
+            self.scorer = lambda response, gt: score(response, gt, self.scoring_config)
         self.cache = LabelCache(self.directory.parent / "rubric_label_cache")
+        if self.version == 'math_process_v2':
+            from .core.contracts import V2_SCHEMA_VERSION
+            namespace = 'rubric_label_cache_' + V2_SCHEMA_VERSION.replace('rubric.', '').replace('.', '_')
+            if options['mode'] == 'joint' and options['judge'].get('enable_thinking', False):
+                namespace += '_thinking_' + options['judge_fingerprint'][:12]
+            self.cache = LabelCache(self.directory.parent / namespace)
         self.judge = None
         if options["mode"] == "joint":
-            self.judge = JudgeClient({**options["judge"], "seed": options["seed"]}, options["judge_fingerprint"])
-            self.judge.health()
+            self.judge = JudgeClient({**options["judge"], "seed": options["seed"], 'rubric_version': self.version}, options["judge_fingerprint"])
+            try:self.judge.health()
+            except Exception as exc:
+                append_json(self.directory / 'judge_step_failures.jsonl', {'phase': 'initialize', 'error': str(exc),
+                            'protocol_identity': getattr(self, 'protocol_identity', None), 'received_results': 0})
+                raise
         self.empty_student_steps = 0
+        self.v2_empty_student_process_steps = 0
+        self.v2_coverage_state_version = 'student.process.coverage.v2.1'
+        self.v2_counter_initialization = 'new_stage_zero'
 
     def cache_key(self, pair, role):
         return digest({"prompt": pair["prompt_hash"], "response": pair[role]["response_id"],
                        "GT": pair["ground_truth"], "spec": self.spec_hash, "prompt_version": self.prompt_hash,
                        "judge": self.options["judge_fingerprint"], "scorer": self.scorer_hash,
                        "prompt_truncated": pair["prompt_truncated"], "response_truncated": pair[role]["truncated"],
-                       "mode": self.options["mode"]})
+                       "mode": self.options["mode"], 'version': self.version,
+                       'annotation_contract_hash': getattr(self, 'annotation_contract_hash', None),
+                       'protocol_identity': getattr(self, 'protocol_identity', None),
+                       'scorer_identity': getattr(self, 'scorer_identity', None),
+                       'visibility': {key: pair[role].get(key) for key in ('source_truncated', 'training_token_truncated', 'source_finish_reason', 'selected_teacher_index')}})
 
     def annotate(self, pairs, batch, global_mini, dp_size, step):
+        if self.version == 'math_process_v2':
+            from .online_v2 import annotate
+            return annotate(self, pairs, batch, global_mini, dp_size, step)
         import torch
         started = time.monotonic()
         deadline = started + self.options['judge']['step_timeout_seconds'] if self.judge else None

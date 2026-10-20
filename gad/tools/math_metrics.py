@@ -1,26 +1,12 @@
 #!/usr/bin/env python3
-"""CARD-aligned math metrics for dev monitoring and external evaluation.
+"""Version-aware math metrics for dev monitoring and external evaluation.
 
-The scoring rule itself is **not** re-implemented here: it is the vendored copy
-of CARD's ``math_dapo.compute_score`` that lives in ``LMOps/sample/math_scorer.py``
-(searched in this order: ``$GAD_MATH_SCORER``, ``--scorer-path``, the sibling
-``LMOps/sample`` directory). This module only adds aggregation, diagnostics and
-a parity self-test, so the numbers stay comparable with CARD.
-
-What the underlying scorer does (verified by ``--self-test``):
-
-* it looks at the **last 300 characters** of the completion and takes the last
-  ``Answer: ...`` match, case-insensitively;
-* ``\\boxed{...}`` alone, without an ``Answer:`` line, is **not** parsed;
-* normalization strips ``$``, spaces, commas inside plain numbers and some LaTeX
-  wrappers, but it does **not** do numeric equivalence: ``142.0`` does not match
-  ``142`` and ``0.5`` does not match ``\\frac{1}{2}``;
-* ``score`` is ±1 while ``acc`` is 0/1 - an accuracy is the mean of ``acc`` (or
-  ``score > 0``), never the mean of ``score``.
-
-Nothing in this module ever writes back into training: these numbers are
-diagnostics only and never become a reward, an advantage or a discriminator
-label.
+The default is math_unified_v1 (explicit answers/boxes and exact mathematical
+normalization). An explicitly selected sample/math_scorer.py keeps historical
+CARD extraction/string comparison. Self-tests use fixtures for the loaded
+version. Grader failures and malformed/ambiguous answers make evaluation
+incomplete; they never become official incorrect labels or complete accuracy.
+No metric here is fed into actor reward or advantages.
 """
 
 from __future__ import annotations
@@ -37,6 +23,7 @@ from typing import Any, Iterable
 GAD_DIR = Path(__file__).resolve().parents[1]
 DEFAULT_SCORER_PATHS = (
     Path(os.environ.get("GAD_MATH_SCORER", "")) if os.environ.get("GAD_MATH_SCORER") else None,
+    GAD_DIR.parent / "scoring" / "math.py",
     GAD_DIR.parent / "sample" / "math_scorer.py",
     GAD_DIR / "sample" / "math_scorer.py",
 )
@@ -47,8 +34,10 @@ class MathScorerNotFound(RuntimeError):
 
 
 def load_scorer(scorer_path: str | Path | None = None):
-    """Import the vendored CARD scorer as a standalone module."""
-    candidates = ([Path(scorer_path)] if scorer_path else []) + [p for p in DEFAULT_SCORER_PATHS if p]
+    """Import an explicitly selected scorer, or the unified default."""
+    inherited = json.loads(os.environ.get('GAD_SCORING_MATH_CONFIG','{}'))
+    legacy = [GAD_DIR.parent/'sample/math_scorer.py'] if not scorer_path and inherited.get('version') == 'legacy_card_v1' else []
+    candidates = [Path(scorer_path)] if scorer_path else legacy + [p for p in DEFAULT_SCORER_PATHS if p]
     for candidate in candidates:
         path = Path(candidate).expanduser()
         if path.is_file():
@@ -70,15 +59,24 @@ SCORER = None
 
 def scorer():
     global SCORER
-    if SCORER is None:
+    inherited = json.loads(os.environ.get('GAD_SCORING_MATH_CONFIG','{}'))
+    if SCORER is None or inherited.get('version') == 'legacy_card_v1' and getattr(SCORER,'VERSION',None) == 'math_unified_v1':
         SCORER = load_scorer()
     return SCORER
 
 
 def score_response(response: str, ground_truth: str, *, scorer_module=None) -> dict:
     module = scorer_module or scorer()
-    result = module.compute_score(response or "", ground_truth or "")
+    try:
+        result = module.compute_score(response or "", ground_truth if ground_truth is not None else "")
+    except Exception as exc:
+        return {'acc':None, 'score':None, 'pred':None, 'answer_parsed':False,
+                'evaluation_valid':False, 'grade_status':'error', 'parse_status':'unknown',
+                'error_reason':f'{type(exc).__name__}: {exc}'}
     prediction = result["pred"]
+    if result.get("scorer_version") == "math_unified_v1":
+        return {**result, "acc": bool(result["acc"]) if result['acc'] is not None else None,
+                "answer_parsed": result["parse_status"] == "ok"}
     return {
         "score": float(result["score"]),
         "acc": bool(result["acc"]),
@@ -119,22 +117,32 @@ def aggregate(records: Iterable[dict], *, answer_token_limit: int | None = None)
 
     correct = sum(1 for r in records if r.get("acc"))
     parsed = sum(1 for r in records if r.get("answer_parsed"))
-    scores = [float(r.get("score", 1.0 if r.get("acc") else -1.0)) for r in records]
+    invalid = sum(r.get('evaluation_valid') is False or r.get('acc') is None for r in records)
+    scores = [float(r.get("score", 1.0 if r.get("acc") else -1.0)) for r in records if r.get('acc') is not None]
+    no_answer = sum(r.get('parse_status') == 'no_answer' or r.get('pred') == '[INVALID]' for r in records)
+    parse_failed = sum(r.get('parse_status') in ('malformed','ambiguous') for r in records)
+    errors = sum(r.get('grade_status') in ('error','timeout') for r in records)
     lengths = [int(r["num_tokens"]) for r in records if r.get("num_tokens") is not None]
     truncated = sum(1 for r in records if r.get("truncated") or r.get("finish_reason") == "length")
 
     report = {
         "count": total,
+        'evaluation_complete':invalid == 0,
+        'scorable_count':total-invalid, 'unscorable_count':invalid,
+        'grader_error_rate':errors/total, 'no_answer_rate':no_answer/total,
         "accuracy": correct / total,
         "correct": correct,
-        "incorrect": total - correct,
+        "incorrect": total - invalid - correct,
         # Kept for comparison only - NOT an accuracy.
-        "score_mean_pm1": statistics.fmean(scores),
+        "score_mean_pm1": statistics.fmean(scores) if scores else None,
         "answer_parsed": parsed,
-        "answer_parse_failure_rate": (total - parsed) / total,
+        "answer_parse_failure_rate": parse_failed / total,
         "truncated": truncated,
         "truncation_rate": truncated / total,
     }
+    if invalid:
+        report['provisional_metrics'] = {'accuracy_lower_bound':report.pop('accuracy')}
+        report['scorable_score_mean_pm1'] = report.pop('score_mean_pm1')
     if lengths:
         report["response_tokens"] = _quantiles(lengths)
         if answer_token_limit:
@@ -189,12 +197,16 @@ def summarize_sampling(per_question: dict[str, list[dict]], *, answer_token_limi
         entry["samples_per_question"] = (len(records) / len(by_uid)) if by_uid else 0
         entry["pass_at_1"] = pass_at_1(groups)
         entry["pass_at_n_any_success"] = pass_at_n(groups)
+        if not entry.get('evaluation_complete',False):
+            entry.setdefault('provisional_metrics',{}).update({k:entry.pop(k) for k in ('pass_at_1','pass_at_n_any_success')})
         result["benchmarks"][benchmark] = entry
     if all_records:
         overall = aggregate(all_records, answer_token_limit=answer_token_limit)
         overall["questions"] = len(all_groups)
         overall["pass_at_1"] = pass_at_1(all_groups)
         overall["pass_at_n_any_success"] = pass_at_n(all_groups)
+        if not overall.get('evaluation_complete',False):
+            overall.setdefault('provisional_metrics',{}).update({k:overall.pop(k) for k in ('pass_at_1','pass_at_n_any_success')})
         overall["aggregation"] = "question-weighted mean over benchmarks present in the run"
         result["overall"] = overall
     return result
@@ -222,7 +234,15 @@ PARITY_CASES = [
 def self_test(*, verbose: bool = True) -> tuple[bool, list[str]]:
     module = scorer()
     problems: list[str] = []
-    for response, ground_truth, expected, note in PARITY_CASES:
+    cases = list(PARITY_CASES)
+    if getattr(module,'VERSION',None) == 'math_unified_v1':
+        notes={4:'unified numeric equivalence',5:'unified integral decimal equivalence',
+               6:'unified exact fraction equivalence',7:'unified boxed extraction',9:'unified full-response marker scan'}
+        cases = [(response,gt,True if index in (4,5,6,7) else expected,notes.get(index,note))
+                 for index,(response,gt,expected,note) in enumerate(cases)]
+        cases += [('- Answer: **42**','42',True,'Markdown list/value'),
+                  ('Answer: 1 2','12',False,'digit groups must not concatenate')]
+    for response, ground_truth, expected, note in cases:
         result = score_response(response, ground_truth, scorer_module=module)
         if bool(result["acc"]) != expected:
             problems.append(
@@ -250,7 +270,7 @@ def main() -> int:
     parser.add_argument("--response-field", default="response")
     parser.add_argument("--ground-truth-field", default="ground_truth")
     parser.add_argument("--answer-token-limit", type=int, default=None)
-    parser.add_argument("--self-test", action="store_true", help="Run the CARD parity fixtures and exit.")
+    parser.add_argument("--self-test", action="store_true", help="Run fixtures for the loaded scorer version and exit.")
     args = parser.parse_args()
 
     global SCORER
@@ -258,7 +278,7 @@ def main() -> int:
     print(f"[math_metrics] scorer: {getattr(SCORER, '__gad_source__', 'unknown')}", file=sys.stderr)
 
     if args.self_test:
-        print("[math_metrics] CARD parity self-test")
+        print(f"[math_metrics] {getattr(SCORER, 'VERSION', 'legacy_card_v1')} self-test")
         ok, problems = self_test()
         for problem in problems:
             print(f"  FAIL: {problem}")

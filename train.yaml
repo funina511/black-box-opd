@@ -16,10 +16,10 @@ catalog:
   datasets:
     dapo_math_5k:
       data:
-        train_file: data/dapo_math_5k_gad/gad_train.parquet
+        train_file: data/dapo_math_5k_gad_v2/gad_train.parquet
         val_file: data/dapo_math_17k_gad/gad_dev.parquet
         teacher_index: data/dapo_math_17k_gad/teacher_index.jsonl
-        manifest: data/dapo_math_5k_gad/manifest.json
+        manifest: data/dapo_math_5k_gad_v2/manifest.json
         expected_fingerprint_digest: 40d9199b0a66f34f8fb180725ef1b5e7f1c305f4f4fde628da3be55dd3ae2035
       validation:
         quick_file: data/dapo_math_17k_gad/quick_dev.parquet
@@ -65,6 +65,7 @@ data:
   train_batch_size: 64
   val_batch_size: 64
 rollout:
+  seed: 42
   name: vllm
   n: 2
   n_seqkd: 1
@@ -126,14 +127,16 @@ eval:
   math500_n: 2
   temperature: 1.0
   top_p: 0.95
-  max_tokens: 16384
-  max_model_len: 20480
+  max_tokens: 8192
+  max_model_len: 10240
   tensor_parallel_size: 1
   gpu_memory_utilization: 0.85
   backend: vllm
   dev_n: 1
   dev_do_sample: false
 validation:
+  rouge_l_enabled: false
+  block_training_on_incomplete: false
   scorer_path: ''
   require_math_metrics: true
   quick_size: 128
@@ -141,24 +144,38 @@ validation:
   final_full: true
   quick_enabled: true
 
+scoring:
+  math:
+    version: math_unified_v1
+    entrypoint: scoring/math.py
+    timeout_seconds: 2.0
+
 # Online supervision begins with the first Warmup critic update; actor reward stays adv.
 rubric:
+  version: math_process_v2
   enabled: false
   stages: [warmup, gad]
   mode: joint # correctness_only uses the rule scorer without a process judge.
   loss_coef: 0.1
-  spec: rubric/specs/math_v1.yaml
-  prompt: rubric/prompts/judge_math_v1.txt
-  head_layout: [adv, answer_correctness, reasoning_validity, condition_coverage]
+  loss_mode: legacy_active # fixed_dimension / fixed_dimension_gated are opt-in.
+  count_gate_tau: 4
+  semantic_check: false # One targeted request; model agreement is not human truth.
+  semantic_max_extra_requests: 1
+  gradient_diagnostics_interval: 0 # Opt-in; separate backward passes on a frozen batch.
+  gradient_diagnostics_max_pairs: 4
+  spec: rubric/specs/math_process_v27.yaml
+  prompt: rubric/prompts/judge_math_process_v27.txt
+  head_layout: [adv, answer_correctness, verified_progress, unresolved_error_severity]
   reward_source: adv_only
   label_source: online
   label_scope: selected_critic_batch
   teacher_cache: true
   student_cache: true
-  truncated_process_policy: mask
+  truncated_process_policy: visible_prefix
   on_annotation_error: mask
   on_service_unavailable: abort_step
   seed: 42
+  max_empty_student_process_steps: 3
   judge:
     backend: openai_compatible
     base_url: http://127.0.0.1:8010/v1
@@ -166,14 +183,20 @@ rubric:
     model_revision: local-sha256
     tokenizer_path: ../model/Qwen/Qwen3-8B
     api_key_env: null
+    enable_thinking: false # Judge only; does not inherit actor rollout.enable_thinking.
+    reasoning_parser: null # Thinking on vLLM 0.8.5 uses deepseek_r1 with the v0 engine.
     temperature: 0
+    top_p: 1.0
+    top_k: -1
+    min_p: 0.0
     max_output_tokens: 768
     max_context_tokens: 16384
     structured_output: required
     concurrency: 8
     request_timeout_seconds: 120
     step_timeout_seconds: 600
-    max_retries: 2
+    max_retries: 1
+    request_budget: null # Bounded calibration overrides this to <=24 total calls.
     dtype: bfloat16
     tensor_parallel_size: 2
     gpu_memory_utilization: 0.85

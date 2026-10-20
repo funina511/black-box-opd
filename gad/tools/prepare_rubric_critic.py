@@ -15,6 +15,10 @@ def prepare(source, target, seed, spec, single=False):
     import torch
     from transformers import AutoConfig, AutoModelForTokenClassification, AutoTokenizer
     source, target = Path(source), Path(target)
+    import yaml
+    from rubric.core.contracts import layout_for
+    version = yaml.safe_load(Path(spec).read_text())['version']
+    LAYOUT = layout_for(version)
     weights = sorted(source.glob("*.safetensors"))
     signature = {"source": str(source.resolve()), "weights": {p.name: file_hash(p) for p in weights},
                  "config": file_hash(source / "config.json"), "seed": seed,
@@ -36,7 +40,7 @@ def prepare(source, target, seed, spec, single=False):
     classifier = any("ForTokenClassification" in a for a in config.architectures or [])
     four = bool(getattr(config, "rubric_head_layout", None))
     if four:
-        validate_head(config, True, file_hash(spec))
+        validate_head(config, True, file_hash(spec), version)
         if single:
             raise ValueError("implicit four-head to one-head export is unsupported")
     else:
@@ -64,7 +68,7 @@ def prepare(source, target, seed, spec, single=False):
     with torch.no_grad():
         before_logits = model(fixture).logits.detach()
     if not four and not single:
-        expand_head(model, seed, file_hash(spec))
+        expand_head(model, seed, file_hash(spec), version)
     with torch.no_grad():
         after_logits = model(fixture).logits.detach()
     if not torch.equal(before_weight[0], model.score.weight[0]) or (before_bias is not None and not torch.equal(before_bias[0], model.score.bias[0])):

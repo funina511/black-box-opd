@@ -30,7 +30,7 @@ import unittest
 from pathlib import Path
 
 GAD_DIR = Path(__file__).resolve().parents[1]
-BACKEND_ROOT = GAD_DIR / ".backends"
+BACKEND_ROOT = Path(os.environ.get("GAD_TEST_BACKEND_ROOT", GAD_DIR / ".backends"))
 PYTHON = sys.executable
 
 CHILD = r'''
@@ -142,6 +142,12 @@ def run_child(scenario: dict) -> dict:
 
 
 class ResumePatchTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        import importlib.util
+        if importlib.util.find_spec('rouge_score') is None:
+            raise unittest.SkipTest('optional rouge_score is required to import the complete pinned trainer')
+
     def test_default_keeps_original_weight_handoff_semantics(self) -> None:
         import tempfile
 

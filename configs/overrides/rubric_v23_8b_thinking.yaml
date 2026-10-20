@@ -1,0 +1,27 @@
+# Simplified source fragments; candidate, not an actor-quality result.
+rubric:
+  enabled: true
+  mode: joint
+  stages: [warmup, gad]
+  judge:
+    model: Qwen3-8B
+    tokenizer_path: /mnt/jinbo/RLRM/model/Qwen/Qwen3-8B
+    base_url: http://127.0.0.1:8021/v1
+    enable_thinking: true
+    reasoning_parser: deepseek_r1
+    temperature: 0.6
+    top_p: 0.95
+    top_k: 20
+    min_p: 0.0
+    dtype: bfloat16
+    tensor_parallel_size: 2
+    max_context_tokens: 32768
+    max_output_tokens: 8192
+    concurrency: 1
+    request_timeout_seconds: 300
+    step_timeout_seconds: 1800
+    max_retries: 1
+resources:
+  judge_gpus: 6,7
+replay:
+  enabled: false

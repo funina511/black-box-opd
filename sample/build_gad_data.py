@@ -45,6 +45,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from teacher_index import TeacherIndex, TeacherIndexError  # noqa: E402
 from task_template import extract_final_answer, normalize_raw_prompt, sha256_file  # noqa: E402
 from math_scorer import compute_score  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from gad.extensions.teacher_provenance import bind_selected
+from scoring.math import compute_score
 
 GAD_OUTPUT_SCHEMA = pa.schema(
     [
@@ -53,7 +56,9 @@ GAD_OUTPUT_SCHEMA = pa.schema(
         ("data_source", pa.string()),
         ("ability", pa.string()),
         ("reward_model", pa.struct([("ground_truth", pa.string()), ("style", pa.string())])),
-        ("extra_info", pa.struct([("index", pa.string())])),
+        ("extra_info", pa.struct([("index", pa.string()), ('selected_teacher_index', pa.int64()),
+            ('selected_teacher_text_sha256', pa.string()), ('source_finish_reason', pa.string()),
+            ('source_truncated', pa.bool_()), ('teacher_metadata_version', pa.string())])),
     ]
 )
 
@@ -68,7 +73,7 @@ SELECT_CHOICES = ("all", "first", "correct", "nontruncated", "correct-nontruncat
 MISSING_REASONS = ("not_in_teacher_index", "no_teacher_answer")
 
 
-def pick_teacher_answer(answers: list[str], *, select: str, ground_truth: str,
+def pick_teacher_candidate(answers: list[str], *, select: str, ground_truth: str,
                         truncated: list[bool] | None = None) -> tuple[str | None, str]:
     """Return (answer, reason). ``answer is None`` means the prompt must be dropped.
 
@@ -82,33 +87,41 @@ def pick_teacher_answer(answers: list[str], *, select: str, ground_truth: str,
     sampler's per-answer ``truncated`` flags instead of inferring them from the score.
     """
     if not answers:
-        return None, "no_teacher_answer"
+        return None, "no_teacher_answer", None
     flags = list(truncated or [])
     flags += [False] * (len(answers) - len(flags))
 
     def first_ok(require_correct: bool, require_complete: bool) -> str | None:
-        for answer, was_truncated in zip(answers, flags):
+        for i, (answer, was_truncated) in enumerate(zip(answers, flags)):
             if require_complete and was_truncated:
                 continue
-            if require_correct and float(compute_score(answer, ground_truth)["score"]) <= 0.5:
-                continue
-            return answer
+            if require_correct:
+                graded = compute_score(answer, ground_truth)
+                if graded.get('grade_status') in ('error', 'timeout'):
+                    raise ValueError('teacher correctness filtering has unresolved grader error: ' + str(graded.get('error_reason')))
+                if float(graded['score']) <= .5:continue
+            return (answer, i)
         return None
 
     if select in ("all", "first"):
-        return answers[0], select
+        return answers[0], select, 0
     if select == "nontruncated":
         answer = first_ok(require_correct=False, require_complete=True)
-        return (answer, "first_nontruncated") if answer is not None else (None, "all_answers_truncated")
+        return (answer[0], 'first_nontruncated', answer[1]) if answer is not None else (None, 'all_answers_truncated', None)
     answer = first_ok(require_correct=True, require_complete=select == "correct-nontruncated")
     if answer is not None:
-        return answer, "first_correct_nontruncated" if select == "correct-nontruncated" else "first_correct"
+        return answer[0], "first_correct_nontruncated" if select == "correct-nontruncated" else "first_correct", answer[1]
     if select == "correct-nontruncated":
         # Distinguish "wrong" from "right but cut off" so the report is actionable.
         if first_ok(require_correct=True, require_complete=False) is not None:
-            return None, "correct_but_truncated"
-        return None, "no_correct_answer"
-    return None, "no_correct_answer"
+            return None, "correct_but_truncated", None
+        return None, "no_correct_answer", None
+    return None, "no_correct_answer", None
+
+
+def pick_teacher_answer(*args, **kwargs):
+    answer, reason, _ = pick_teacher_candidate(*args, **kwargs)
+    return answer, reason
 
 
 def main() -> int:
@@ -180,7 +193,7 @@ def main() -> int:
             continue
 
         truncation_flags = list((record.sampling or {}).get("truncated") or [])
-        answer, reason = pick_teacher_answer(
+        answer, reason, selected_index = pick_teacher_candidate(
             record.teacher_answers,
             select=args.select,
             ground_truth=ground_truth,
@@ -190,13 +203,14 @@ def main() -> int:
         if answer is None:
             dropped.append({"uid": uid, "reason": reason, "num_answers": len(record.teacher_answers)})
             continue
-        if truncation_flags and truncation_flags[record.teacher_answers.index(answer)]:
+        provenance = bind_selected(record.teacher_answers, record.sampling or {}, answer, selected_index)
+        if provenance['source_truncated']:
             truncated_selected += 1
 
         selection_report.append(
             {
                 "uid": uid,
-                "selected_index": record.teacher_answers.index(answer),
+                "selected_index": selected_index,
                 "num_answers": len(record.teacher_answers),
                 "reason": reason,
                 "teacher_answer_chars": len(answer),
@@ -213,7 +227,7 @@ def main() -> int:
                     "ground_truth": ground_truth,
                     "style": row["reward_model"].get("style", "rule-lighteval/MATH_v2"),
                 },
-                "extra_info": {"index": uid},
+                "extra_info": {**row['extra_info'], "index": uid, **provenance},
             }
         )
 

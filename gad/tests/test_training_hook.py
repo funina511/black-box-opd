@@ -1,5 +1,8 @@
 """Execute the deployed trainer update block, including failure and Warmup gate."""
 import ast
+import os
+import sys
+import tempfile
 from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
@@ -9,10 +12,25 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 class TrainingHookTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        configured=os.environ.get('GAD_TEST_EXTENSION_ROOT')
+        if configured:
+            cls.backend_root=Path(configured)
+        else:
+            sys.path.insert(0,str(ROOT/'gad/tests'))
+            from backend_fixture import prepare,cleanup
+            temporary=tempfile.TemporaryDirectory(prefix='gad-hook-cpu-')
+            cls.addClassCleanup(temporary.cleanup)
+            cls.backend_root=Path(temporary.name)/'extensions'
+            cls.addClassCleanup(cleanup,cls.backend_root)
+            prepare(cls.backend_root,'gad_extensions_v1','warmup,gad')
+
     def block(self, stage):
-        path = ROOT / 'gad/.backends_gad_extensions_v1' / stage / 'verl/trainer/ppo/ray_trainer.py'
-        if not path.exists():
-            self.skipTest('deploy the isolated engineering backend to execute its trainer hook')
+        import sys
+        sys.path.insert(0, str(ROOT / 'gad/tools'))
+        path = self.backend_root / stage / 'verl/trainer/ppo/ray_trainer.py'
+        self.assertTrue(path.exists(),'current isolated backend must be prepared for the optimizer barrier test')
         tree = ast.parse(path.read_text())
         fit = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == 'fit')
         locations = {}
@@ -80,6 +98,34 @@ class TrainingHookTests(unittest.TestCase):
             block = self.block(stage)
             self.assertEqual(['annotate'], self.execute(block, fail='judge'))
             self.assertEqual(['annotate', 'critic', 'actor'], self.execute(block, fail='actor'))
+
+    def test_teacher_truncation_is_observed_before_length_cap(self):
+        import torch
+        source=self.backend_root/'gad/verl/utils/dataset/rl_dataset.py'
+        tree=ast.parse(source.read_text())
+        code=None
+        for parent in ast.walk(tree):
+            for _,body in ast.iter_fields(parent):
+                if not isinstance(body,list):continue
+                for i,node in enumerate(body[:-1]):
+                    if (isinstance(node,ast.Assign) and any(isinstance(t,ast.Name) and t.id=='teacher_response' for t in node.targets)
+                            and isinstance(node.value,ast.Call) and ast.unparse(node.value.func)=='self.tokenizer'):
+                        self.assertIsInstance(body[i+1],ast.If)
+                        self.assertIn('gad_teacher_token_truncated',ast.unparse(body[i+1]))
+                        code=compile(ast.fix_missing_locations(ast.Module(body=body[i:i+2],type_ignores=[])),str(source),'exec')
+        self.assertIsNotNone(code)
+        for length in (2,5):
+            namespace={'self':SimpleNamespace(gad_extensions_enabled=True,max_response_length=3,
+                tokenizer=lambda *a,**k:{'input_ids':torch.ones((1,length),dtype=torch.long)}),
+                'teacher_response':'a teacher answer','row_dict':{}}
+            exec(code,namespace)
+            namespace['teacher_response']['input_ids']=namespace['teacher_response']['input_ids'][:,:3]
+            self.assertEqual(length>3,namespace['row_dict']['gad_teacher_token_truncated'])
+
+    def test_unset_extension_seed_matches_upstream_default(self):
+        import yaml
+        cfg=yaml.safe_load((self.backend_root/'gad/verl/trainer/config/ppo_trainer.yaml').read_text())
+        self.assertEqual(0,cfg['actor_rollout_ref']['rollout']['seed'])
 
 
 if __name__ == '__main__':

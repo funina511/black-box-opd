@@ -78,10 +78,29 @@ def save(runtime, path):
     if runtime.rubric:
         references = runtime.rubric.cache.snapshot(directory / "labels")
         target = directory / "rubric_state.json"
-        atomic_json(target, {"cache_references": references, "empty_student_steps": runtime.rubric.empty_student_steps,
-                             "human_review_status": "unreviewed_exploratory"})
+        state = {"cache_references": references, "empty_student_steps": runtime.rubric.empty_student_steps,
+                 "human_review_status": "unreviewed_exploratory",
+                 "quality_monitor_state": getattr(runtime.rubric, "quality_monitor_state", {}),
+                 "judge_request_count": getattr(getattr(runtime.rubric, "judge", None), "request_count", 0)}
+        if getattr(runtime.rubric, 'version', None) == 'math_process_v2':
+            state.update(protocol_identity=runtime.rubric.protocol_identity,
+                         coverage_state_version=runtime.rubric.v2_coverage_state_version,
+                         v2_empty_student_process_steps=runtime.rubric.v2_empty_student_process_steps,
+                         counter_initialization=runtime.rubric.v2_counter_initialization)
+        atomic_json(target, state)
         files[target.name] = file_hash(target)
+    trainer=getattr(runtime,'trainer',None)
+    critic_config=getattr(getattr(trainer,'config',None),'critic',None)
+    diagnostic_dir=critic_config.get('rubric',{}).get('gradient_diagnostics_dir') if critic_config is not None else None
+    if diagnostic_dir and Path(diagnostic_dir).exists():
+        import shutil
+        dest=directory/'gradient_diagnostics';dest.mkdir(exist_ok=True)
+        for source in Path(diagnostic_dir).glob('rank_*'):
+            shutil.copy2(source,dest/source.name)
+            files[str((dest/source.name).relative_to(directory))]=file_hash(dest/source.name)
     manifest = {"version": VERSION, "identity": runtime.identity, "world_size": runtime.world_size,
+                'rubric_protocol_identity': getattr(runtime.rubric, 'protocol_identity', None),
+                'scorer_identity': getattr(runtime, 'options', {}).get('scorer_identity'),
                 "verify_model_shards": hasattr(runtime, "trainer"),
                 "stage": runtime.stage, "stage_start": runtime.stage_start, "stage_step": runtime.stage_step,
                 "committed_global_step": runtime.committed_step, "files": files, "cache_references": references,
@@ -111,8 +130,12 @@ def restore(runtime, path):
         raise ValueError("cannot resume extension checkpoint: " + "; ".join(problems))
     directory = path / "training_extensions"
     manifest = json.loads((directory / "manifest.json").read_text())
+    if manifest.get('scorer_identity') != getattr(runtime, 'options', {}).get('scorer_identity'):
+        raise ValueError('resume scorer version/dependency identity mismatch')
     if manifest["identity"] != runtime.identity or manifest["world_size"] != runtime.world_size or manifest["stage"] != runtime.stage:
         raise ValueError("same-stage resume algorithm/source/world-size identity mismatch")
+    if manifest.get('rubric_protocol_identity') != getattr(runtime.rubric, 'protocol_identity', None):
+        raise ValueError('same-stage resume judge protocol/parser identity mismatch; start a new run')
     runtime.stage_start = manifest["stage_start"]
     runtime.stage_step = manifest["stage_step"]
     runtime.committed_step = manifest["committed_global_step"]
@@ -120,8 +143,29 @@ def restore(runtime, path):
         runtime.replay.load_state_dict(torch.load(directory / "replay_state.pt", weights_only=False))
     if runtime.rubric:
         state = json.loads((directory / "rubric_state.json").read_text())
+        if getattr(runtime.rubric, 'version', None) == 'math_process_v2':
+            if state.get('coverage_state_version') != runtime.rubric.v2_coverage_state_version or state.get('protocol_identity') != runtime.rubric.protocol_identity:
+                raise ValueError('V2.1 student coverage state missing or incompatible; refusing counter reset')
+            counter = state.get('v2_empty_student_process_steps')
+            if type(counter) is not int or counter < 0:
+                raise ValueError('invalid V2.1 student coverage counter')
+            runtime.rubric.v2_empty_student_process_steps = counter
+            runtime.rubric.v2_counter_initialization = 'same_stage_checkpoint_restore'
         runtime.rubric.cache.restore(directory / "labels", state["cache_references"])
         runtime.rubric.empty_student_steps = state["empty_student_steps"]
+        runtime.rubric.quality_monitor_state = state.get('quality_monitor_state', {})
+        if getattr(runtime.rubric, "judge", None) is not None:
+            runtime.rubric.judge.request_count = state.get('judge_request_count', 0)
+    trainer=getattr(runtime,'trainer',None)
+    critic_config=getattr(getattr(trainer,'config',None),'critic',None)
+    diagnostic_dir=critic_config.get('rubric',{}).get('gradient_diagnostics_dir') if critic_config is not None else None
+    if diagnostic_dir and (directory/'gradient_diagnostics').exists():
+        import shutil
+        dest=Path(diagnostic_dir);dest.mkdir(parents=True,exist_ok=True)
+        for source in (directory/'gradient_diagnostics').iterdir():
+            target=dest/source.name
+            if target.exists() and file_hash(target)!=file_hash(source):raise ValueError('fixed gradient diagnostic batch differs on resume')
+            if not target.exists():shutil.copy2(source,target)
     rng = torch.load(directory / "sampling_rng.pt", weights_only=False)
     random.setstate(rng["python"])
     np.random.set_state(rng["numpy"])

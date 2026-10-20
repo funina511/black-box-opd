@@ -38,7 +38,9 @@ class ConfigTests(unittest.TestCase):
         cfg = compose_config()
         self.assertFalse(cfg.get("rubric.enabled"))
         self.assertFalse(cfg.get("replay.enabled"))
-        self.assertEqual([], hydra_overrides(cfg, "warmup", Path("/tmp"), 0))
+        overrides = hydra_overrides(cfg, "warmup", Path("/tmp"), 0)
+        self.assertTrue(any(arg == 'trainer.rubric={enabled:false}' for arg in overrides))
+        self.assertTrue(any(arg == 'critic.rubric={enabled:false}' for arg in overrides))
         cfg.data["budget.gad_new_steps"] = 80
         self.assertEqual(80, stage_step_budget(cfg, "gad", 271, handoff_step=271))
 
@@ -167,10 +169,11 @@ class ClientTests(unittest.TestCase):
             def apply_chat_template(self, *a, **k): return [1]
         c = JudgeClient(self.options(), "fp", Tokenizer())
         c.health = lambda *a, **k: None
-        c.request = lambda *a, **k: {"choices": [{"finish_reason": "stop", "message": {"content": "bad"}}]}
+        c.request = lambda *a, **k: {"choices": [{"finish_reason": "stop", "message": {"content": "bad"}}], 'usage': {'completion_tokens': 3}}
         result = c.annotate({"r": []})["r"]
         self.assertFalse(result["cacheable"])
         self.assertNotIn("parsed", result)
+        self.assertEqual(6, result['usage']['completion_tokens']) # Both bounded legacy format attempts are counted.
         def fail(*a, **k): raise ServiceUnavailable("down")
         c.request = fail
         with self.assertRaises(ServiceUnavailable): c.annotate({"r": []})

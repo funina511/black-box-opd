@@ -131,6 +131,7 @@ dmypy.json
 # Local Qwen3 experiment artifacts and shared resource links
 /runs/
 /assets/
+/reports/
 /data/
 /gad/outputs/
 /gad/.backends_gad_extensions*/

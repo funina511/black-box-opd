@@ -1,3 +1,4 @@
+import os
 import sys
 import unittest
 from copy import deepcopy
@@ -5,7 +6,7 @@ from pathlib import Path
 
 ROOT=Path(__file__).resolve().parents[2]
 sys.path.insert(0,str(ROOT))
-sys.path.insert(0,str(ROOT/'gad/.backends/gad'))
+sys.path.insert(0,str(Path(os.environ.get('GAD_TEST_BACKEND_ROOT',ROOT/'gad/.backends'))/'gad'))
 from test_online_rubric import pair
 
 

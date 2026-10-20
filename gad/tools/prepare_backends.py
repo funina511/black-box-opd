@@ -151,6 +151,8 @@ def main() -> int:
 
     config = load_config(args.config)
     backends_cfg = config.get("backends", {}) if isinstance(config, dict) else {}
+    if isinstance(config, dict):
+        backends_cfg = {**backends_cfg, **{key[len("backends."):]:value for key,value in config.items() if key.startswith("backends.")}}
     profile = args.profile or backends_cfg.get("profile", "original")
     repo = Path(
         args.repo
@@ -210,6 +212,16 @@ def main() -> int:
         path = backend_root / stage
         log(f"--- {stage}: branch={branch} commit={commit[:10]} -> {path}")
         fetched = ensure_commit(repo, branch, commit, allow_fetch=args.fetch)
+        if (path / ".gad_backend_used").exists():
+            if args.recreate:
+                raise PipelineError(f"refusing to recreate a used backend: {path}; choose a new root")
+            if git_rev_parse(path,"HEAD") != commit:
+                raise PipelineError(f"used backend commit mismatch: {path}")
+            from backend_patches import verify_frozen_backend
+            verify_frozen_backend(path)
+            log(f"{stage}: verified frozen deployed backend; no source or patch files changed")
+            manifest["backends"][stage] = {"frozen":True,"head_commit":commit,"requested_commit":commit,"worktree":str(path)}
+            continue
         create_worktree(repo, path, commit, recreate=args.recreate)
 
         applied: list[dict] = []
@@ -229,6 +241,19 @@ def main() -> int:
         patch_file = backend_root / f"{stage}.patch"
         patch_sha, patch_lines = write_patch_file(path, patch_file)
 
+        # A shared root may already contain a used stage. Its historical root
+        # manifest remains read-only, so newly added SeqKD needs its own proof.
+        # SeqKD has no algorithm manifest: its patches only change engineering.
+        patched_paths = {name for result in applied for name in result["files"]}
+        write_json(path / ".gad_engineering_manifest.json", {
+            "schema_version": "gad.engineering_backend.v1",
+            "stage": stage,
+            "backend_commit": git_rev_parse(path, "HEAD"),
+            "patch_sha256": patch_sha,
+            "patched_files": {name: sha256_file(path / name) for name in sorted(patched_paths)
+                              if (path / name).is_file()},
+        })
+
         manifest["backends"][stage] = {
             "branch": branch,
             "requested_commit": commit,
@@ -247,7 +272,8 @@ def main() -> int:
 
     manifest["ok"] = not failures
     manifest["problems"] = failures
-    write_json(backend_root / "backend_manifest.json", manifest)
+    if not any(entry.get("frozen") for entry in manifest["backends"].values()):
+        write_json(backend_root / "backend_manifest.json", manifest)
 
     if failures:
         for problem in failures:

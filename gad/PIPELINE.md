@@ -153,10 +153,10 @@ bash LMOps/gad/scripts/pipeline/run_math_eval.sh \
    `_load_checkpoint` 中恢复 actor/critic 的模型、optimizer、scheduler 与 RNG。默认
    **关闭**，保持原版"权重来自 `model.path` + 恢复步数与 dataloader"的语义。
 3. `gad-math-validation`：在三个分支的 `_validate()` 里，对**已经生成**的 student 文本追加
-   CARD 对齐的数学评分（无额外生成、无梯度），ROUGE-L 原样保留：
+   配置的数学评分（新数学实验为 `math_unified_v1`，无额外生成、无梯度）。数学任务默认关闭额外 ROUGE-L 计算，可用 `validation.rouge_l_enabled=true` 显式开启：
 
    * 评分器由环境变量 `GAD_MATH_SCORER`（pipeline 对每个阶段注入，来自
-     `validation.scorer_path`，默认 `LMOps/sample/math_scorer.py`）指定，与离线评测**同一份**
+     `validation.scorer_path`，新实验为 `LMOps/scoring/math.py`）指定，与离线评测**同一份**
      实现；配置了却加载失败时**直接报错**，不会静默退化成"只有 ROUGE-L"；
    * 指标：`val/math/acc`（`acc` 的均值，才是正确率）、`val/math/score_mean`（±1 score 均值，
      明确不叫正确率）、`val/math/answer_parse_failure_rate`、`val/math/response_len_mean`、
@@ -166,7 +166,7 @@ bash LMOps/gad/scripts/pipeline/run_math_eval.sh \
      自己的 attention mask，与该分支构造 response mask 的方式一致；
    * 每次验证追加一行 `<stage_out>/validation_math_metrics.jsonl`（含 global_step、样本数、
      scorer 路径、`val_kwargs.n/do_sample/temperature`），因此**不依赖 logger 后端**即可核对；
-   * pipeline 在没有该产物时会**拒绝把阶段标记为完成**（见 3.7）。
+   * pipeline 将训练/checkpoint 与评估分别验收：有效训练产物默认允许交接，缺失或不完整的数学评估保留警告，不发布正式 `acc`。显式 `validation.block_training_on_incomplete=true` 才阻断交接。
 
    `tests/test_math_validation.py` 直接 import 打过补丁的 `ray_trainer`，把插入的三段代码
    从源码里抽出来对假 batch 执行，并对 `ray_trainer.py` 与 pinned 版本做逐行 diff：
@@ -421,9 +421,10 @@ AssertionError: Expandable segments are not compatible with memory pool.
 * ground truth 只保存在 `reward_model.ground_truth`，不进入 prompt、不进入 GAD reward；
 * 教师文本只经文本接口获得（黑盒），索引按 `(uid, raw_prompt_hash)` 建键，并与采样指纹
   摘要绑定；指纹变化时采样器**拒绝写入**旧索引，也不会删除用户已有文件；
-* 数学评分对齐 CARD：末次 `Answer:`、只看末尾 300 字符、`acc` 才是正确率。
-  `tools/math_metrics.py --self-test` 用 11 组对照样例固定这些行为，其中明确包含
-  "仅 `\boxed{}` 不算对""`142.0` 与 `142` 不等价"等已知限制。
+* 新实验默认`math_unified_v1`：显式答案/boxed、数值等价、Markdown前缀及typed数学对象；
+  malformed/ambiguous/grader异常使评估不完整，无最终答案按既定口径计0。
+  显式选择`sample/math_scorer.py`才沿用CARD末尾300字符和字符串比较等历史规则。
+  `tools/math_metrics.py --self-test`按加载版本选择预期，不再用CARD断言验证统一评分器。
 
 ### 3.6 一键脚本的保证
 
@@ -464,6 +465,10 @@ GAD 阶段校验过的 `last_step`，否则报错。`run_summary.json` 里记录
 ### 已完成（CPU，可复现）
 
 一条命令跑完全部 CPU 验证：`bash LMOps/gad/tests/run_all.sh <python_bin>`
+
+2026-10-15核查修复后，该入口发现全部CPU套件并使用临时隔离backend；26套件、290项通过，无skip。
+当前版本同时覆盖rubric/V2、训练失败屏障、截断溯源和两种scorer自测；下表其余数字保留为历史记录。
+详见[核查修复报告](../reports/code_audit_fixes_20261015/report.md)。未启动真实judge或训练。
 （本次结果：**12 个套件、176 个用例 + 评分自测全部 PASSED**）。
 
 | 项目 | 命令 | 本次结果 |
@@ -494,7 +499,7 @@ GAD 阶段校验过的 `last_step`，否则报错。`run_summary.json` 里记录
 | 教师采样：断点续采不重写、指纹变化拒绝、服务失败非零退出、泄漏拒发、截断记录 | `sample/tests/test_teacher_sampling.py` | 7 passed |
 | 评测集构建：缺失基准显式列出、`--strict` 失败、重复题与训练集泄漏上报 | `sample/tests/test_eval_data.py` | 5 passed |
 | 真实 DAPO 去重与划分（重新生成，泄漏为 0） | `prepare_prompts.py --expected-unique 17917` | 17,405 / 512，`leaked_prompt_hashes=[]`，dev 496 组（含 15 个多 id 组） |
-| CARD 评分对照（11 组样例 + acc/score 区分） | `tools/math_metrics.py --self-test` | passed |
+| scorer版本对照：默认统一评分与显式legacy CARD，invalid不发布完整准确率 | `tools/math_metrics.py --self-test`，以及显式legacy路径 | passed（2026-10-15） |
 | 预检（含"发现外部 verl"告警 + scorer 真实探针 + vLLM KV 预算 + 教师池截断口径） | `tools/preflight.py --config …` | passed（本沙箱无 CUDA，KV 预算一项如实降级为 warning；另报 train 12.6% / val 10.7% 截断） |
 | 评测链路（CPU/HF 后端 2 题烟测） | `evaluate_math.py --backend hf --limit 2` | predictions/report 正常输出 |
 
@@ -568,3 +573,28 @@ python LMOps/gad/tools/check_ray_guard.py --backend LMOps/gad/.backends/gad
   此时需要人工指定初始模型路径，pipeline 不会猜。
 * **`validation.scorer_path` 默认值**：默认指向本目录的 `LMOps/sample/math_scorer.py`；
   若把 `LMOps/gad` 单独拷走，需要显式配置该路径（预检会报错并指出）。
+
+2026-10-16：研究 V2.4 新协议、三种辅助 loss、定向复核及固定 batch 诊断见
+[实现说明](../docs/Rubric监督v2.4实现与验收说明.md)。8B 真实有界结果见
+[实测报告](../reports/rubric_v24_holdout_window1_20261016/report.md)；人工质量与真实标签训练关卡仍待完成。
+
+
+## 2026-10-17：附录 B/C 交付
+
+新实验默认 `validation.rouge_l_enabled=false`：不初始化 ROUGE scorer、不解码仅供 ROUGE 使用的 Teacher 文本、不逐条计算，不输出假 0 分。数学评分与生成不变；`timing_seconds.rouge_l=0` 同时记录 `rouge_l_status=disabled`。quick/full 和 SeqKD/Warmup/GAD 共用补丁均覆盖。
+
+阶段验证 schema 为 `gad.stage_verification.v2`，分开记录 `training_status/checkpoint_status/evaluation_status/handoff_ready`。阶段完成标记 `gad.training_completion.v2` 表示训练完成，**不是评估完整**。评估 missing/incomplete/failed 默认不阻断有效 checkpoint；训练非零退出、步数不足、配置身份冲突和必要产物损坏/缺失仍阻断。`acc=null` 安全输出，临时准确率不能替代正式成绩。
+
+旧版无完成标记时，以历史 exit=0、原始 trainer argv、冻结 backend 原始 hash、步数及 checkpoint 重新验收；恢复认可写入新的 `reports/training_recovery_<stage>.json`，不重写旧失败记录。GAD resume-complete 也需要真实成功退出依据，不能仅凭存在 checkpoint。已使用 backend 仅核验原部署内容，禁止套用新补丁；旧 backend 保持原诊断行为，新 run 使用新 hash 的独立 backend。
+
+每轮数学验证保存 `validation_rows_<scope>_<step>_<uuid>.jsonl`，包含回答、标准答案、原始索引、解析/评分状态与指纹。`validation_math_metrics.jsonl` 引用失败行文件及行号。独立补评分使用新目录：
+
+```bash
+/mnt/jinbo/miniconda3/envs/gad/bin/python gad/tools/rescore_validation.py \
+  --rows /path/to/validation_rows_full_78_UUID.jsonl \
+  --expected-count 512 --step 78 --scope full --output /path/to/NEW_rescore
+```
+
+旧记录未保存完整回答时，需要重新生成，不能仅靠旧 aggregate 文件补出成绩。数学 scorer 口径不变；两组正式比较使用相同 scorer 指纹。
+
+冻结 Judge、配置对照、有限测试、成本和启动命令见 [附录 B/C 报告](../reports/rubric_v24_bc_20261017/README.md)。

@@ -42,7 +42,7 @@ from common import PipelineError, kv_cache_bytes_per_token, kv_cache_gib, parse_
 import preflight  # noqa: E402
 
 PYTHON = sys.executable
-BACKEND_ROOT = GAD_DIR / ".backends"
+BACKEND_ROOT = Path(os.environ.get("GAD_TEST_BACKEND_ROOT", GAD_DIR / ".backends"))
 
 
 def write_json(path: Path, payload) -> None:
@@ -122,6 +122,7 @@ def base_config(tmp: Path, **overrides) -> dict:
     model = tmp / "model"
     make_model_dir(model)
     data = {
+        "backends": {"root": str(BACKEND_ROOT)},
         "run": {"output_root": str(tmp / "runs"), "python_bin": PYTHON, "log_backend": "console"},
         "models": {"student": str(model)},
         "data": {
@@ -808,9 +809,10 @@ class StageSelectionTests(unittest.TestCase):
             run_dir = tmp_path / "runs" / "r1"
             marker = pipeline.completion_marker(run_dir, "seqkd")
 
-            self.assertEqual(pipeline.check_skip(cfg, run_dir, "seqkd"), (False, "no completion marker"))
+            self.assertEqual(pipeline.check_skip(cfg, run_dir, "seqkd"), (False, "no successful training exit record"))
 
-            write_json(marker, {"verified": {"ok": True}, "inputs": pipeline.stage_inputs_digest(cfg, "seqkd")})
+            StageArtifactTests()._complete_checkpoint(pipeline.stage_out_dir(cfg,run_dir,"seqkd"),4)
+            write_json(marker, {"total_steps":4,"verified": {"ok": True}, "inputs": pipeline.stage_inputs_digest(cfg, "seqkd")})
             skip, reason = pipeline.check_skip(cfg, run_dir, "seqkd")
             self.assertTrue(skip, reason)
 
@@ -831,6 +833,7 @@ class StageSelectionTests(unittest.TestCase):
             run_dir = tmp_path / "runs/r1"
             snapshot = run_dir / "reports/resolved_configs/before_performance.yaml"
             write_yaml(snapshot, cfg.to_dict())
+            StageArtifactTests()._complete_checkpoint(pipeline.stage_out_dir(cfg,run_dir,"seqkd"),10)
             old_inputs = pipeline.stage_inputs_digest(cfg, "seqkd")
             old_inputs["config_signature"] = pipeline.legacy_stage_signature(cfg, "seqkd")["signature"]
             write_json(pipeline.completion_marker(run_dir, "seqkd"),
@@ -1036,7 +1039,7 @@ class StageArtifactTests(unittest.TestCase):
             self._complete_checkpoint(out, 10)
 
             report = pipeline.verify_stage_artifacts(
-                "warmup", out, expected_step=10, math_metrics_expected=True, math_metrics_reason="test"
+                "warmup", out, expected_step=10, math_metrics_expected=True, strict_evaluation=True, math_metrics_reason="test"
             )
             self.assertFalse(report["ok"])
             self.assertIn("validation_math_metrics.jsonl", " ".join(report["problems"]))
@@ -1051,7 +1054,7 @@ class StageArtifactTests(unittest.TestCase):
                 encoding="utf-8",
             )
             report = pipeline.verify_stage_artifacts(
-                "warmup", out, expected_step=10, math_metrics_expected=True, math_metrics_reason="test"
+                "warmup", out, expected_step=10, math_metrics_expected=True, strict_evaluation=True, math_metrics_reason="test"
             )
             self.assertTrue(report["ok"], report["problems"])
             self.assertEqual(report["math_metrics"]["records"], 2)
@@ -1060,7 +1063,7 @@ class StageArtifactTests(unittest.TestCase):
 
             artifact.write_text("{not json}\n", encoding="utf-8")
             report = pipeline.verify_stage_artifacts(
-                "warmup", out, expected_step=10, math_metrics_expected=True, math_metrics_reason="test"
+                "warmup", out, expected_step=10, math_metrics_expected=True, strict_evaluation=True, math_metrics_reason="test"
             )
             self.assertFalse(report["ok"])
 
@@ -1072,14 +1075,14 @@ class StageArtifactTests(unittest.TestCase):
             artifact.write_text(json.dumps({"global_step": 10, "acc": 0.5, "count": 128,
                                             "validation_scope": "quick"}) + "\n")
             report = pipeline.verify_stage_artifacts(
-                "warmup", out, expected_step=10, math_metrics_expected=True,
+                "warmup", out, expected_step=10, math_metrics_expected=True, strict_evaluation=True,
                 require_final_full=True, full_count=512)
             self.assertFalse(report["ok"])
             self.assertIn("final validation must be full", " ".join(report["problems"]))
             artifact.write_text(json.dumps({"global_step": 10, "acc": 0.5, "count": 512,
                                             "validation_scope": "full"}) + "\n")
             report = pipeline.verify_stage_artifacts(
-                "warmup", out, expected_step=10, math_metrics_expected=True,
+                "warmup", out, expected_step=10, math_metrics_expected=True, strict_evaluation=True,
                 require_final_full=True, full_count=512)
             self.assertTrue(report["ok"], report["problems"])
 

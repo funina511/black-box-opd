@@ -9,6 +9,8 @@ def main():
     import importlib.metadata
     if importlib.metadata.version("vllm") != "0.8.5":
         raise RuntimeError("judge launch/guided JSON was verified with vLLM 0.8.5; validate a new version explicitly")
+    if os.environ.get('VLLM_USE_V1') != '0':
+        raise RuntimeError('judge requires explicit v0 engine; reasoning plus guided JSON is not verified on v1')
     import uvloop
     from vllm.entrypoints.openai import api_server
     from vllm.entrypoints.openai.cli_args import make_arg_parser, validate_parsed_serve_args
@@ -26,6 +28,9 @@ def main():
     cli_env_setup()
     parser = make_arg_parser(FlexibleArgumentParser(description=__doc__))
     args = parser.parse_args()
+    expected = fingerprint['identity']
+    if bool(args.enable_reasoning) != expected['enable_thinking'] or args.reasoning_parser != expected['reasoning_parser']:
+        raise RuntimeError('reasoning service arguments differ from fingerprint')
     validate_parsed_serve_args(args)
     uvloop.run(api_server.run_server(args))
 

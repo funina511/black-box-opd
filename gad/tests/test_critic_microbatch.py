@@ -2,12 +2,13 @@
 from __future__ import annotations
 
 import sys
+import os
 import unittest
 from pathlib import Path
 
 import torch
 
-BACKEND = Path(__file__).resolve().parents[1] / ".backends/warmup"
+BACKEND = Path(os.environ.get("GAD_TEST_BACKEND_ROOT", Path(__file__).resolve().parents[1] / ".backends")) / "warmup"
 if BACKEND.is_dir():
     sys.path.insert(0, str(BACKEND))
 

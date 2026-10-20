@@ -1,0 +1,203 @@
+{
+  "all": {
+    "frozen_rows": 1800,
+    "before": {
+      "known_correct": 493,
+      "scorable": 1712,
+      "parse_status": {
+        "ok": 1500,
+        "no_answer": 294,
+        "malformed": 6
+      },
+      "grade_status": {
+        "incorrect": 925,
+        "error": 82,
+        "not_attempted": 300,
+        "correct": 493
+      }
+    },
+    "after": {
+      "known_correct": 497,
+      "scorable": 1734,
+      "parse_status": {
+        "ok": 1470,
+        "malformed": 39,
+        "no_answer": 291
+      },
+      "grade_status": {
+        "incorrect": 946,
+        "not_attempted": 330,
+        "correct": 497,
+        "error": 27
+      }
+    },
+    "correct_count_delta": 4,
+    "fixed_denominator_lower_bound_before": 0.2738888888888889,
+    "fixed_denominator_lower_bound_after": 0.2761111111111111,
+    "delta_percentage_points": 0.2222222222222222,
+    "official_accuracy_available_under_new_policy": false
+  },
+  "by_source": {
+    "runs/baseline_math_v2_06b5k/evaluation/math_unified_v1_n8_math500n2_8k/gad/AIME24/generation/raw_samples.jsonl": {
+      "frozen_rows": 240,
+      "before": {
+        "known_correct": 8,
+        "scorable": 231,
+        "parse_status": {
+          "ok": 165,
+          "no_answer": 74,
+          "malformed": 1
+        },
+        "grade_status": {
+          "incorrect": 149,
+          "error": 8,
+          "not_attempted": 75,
+          "correct": 8
+        }
+      },
+      "after": {
+        "known_correct": 8,
+        "scorable": 234,
+        "parse_status": {
+          "ok": 161,
+          "malformed": 5,
+          "no_answer": 74
+        },
+        "grade_status": {
+          "incorrect": 152,
+          "not_attempted": 79,
+          "correct": 8,
+          "error": 1
+        }
+      },
+      "correct_count_delta": 0,
+      "fixed_denominator_lower_bound_before": 0.03333333333333333,
+      "fixed_denominator_lower_bound_after": 0.03333333333333333,
+      "delta_percentage_points": 0.0,
+      "official_accuracy_available_under_new_policy": false
+    },
+    "runs/baseline_math_v2_06b5k/evaluation/math_unified_v1_n8_math500n2_8k/gad/AIME25/generation/raw_samples.jsonl": {
+      "frozen_rows": 240,
+      "before": {
+        "known_correct": 4,
+        "scorable": 232,
+        "parse_status": {
+          "ok": 170,
+          "no_answer": 69,
+          "malformed": 1
+        },
+        "grade_status": {
+          "incorrect": 159,
+          "correct": 4,
+          "not_attempted": 70,
+          "error": 7
+        }
+      },
+      "after": {
+        "known_correct": 4,
+        "scorable": 235,
+        "parse_status": {
+          "ok": 167,
+          "no_answer": 69,
+          "malformed": 4
+        },
+        "grade_status": {
+          "incorrect": 162,
+          "correct": 4,
+          "not_attempted": 73,
+          "error": 1
+        }
+      },
+      "correct_count_delta": 0,
+      "fixed_denominator_lower_bound_before": 0.016666666666666666,
+      "fixed_denominator_lower_bound_after": 0.016666666666666666,
+      "delta_percentage_points": 0.0,
+      "official_accuracy_available_under_new_policy": false
+    },
+    "runs/baseline_math_v2_06b5k/evaluation/math_unified_v1_n8_math500n2_8k/gad/AMC23/generation/raw_samples.jsonl": {
+      "frozen_rows": 320,
+      "before": {
+        "known_correct": 65,
+        "scorable": 309,
+        "parse_status": {
+          "ok": 266,
+          "no_answer": 54
+        },
+        "grade_status": {
+          "incorrect": 190,
+          "correct": 65,
+          "not_attempted": 54,
+          "error": 11
+        }
+      },
+      "after": {
+        "known_correct": 67,
+        "scorable": 315,
+        "parse_status": {
+          "ok": 263,
+          "no_answer": 52,
+          "malformed": 5
+        },
+        "grade_status": {
+          "incorrect": 196,
+          "correct": 67,
+          "not_attempted": 57
+        }
+      },
+      "correct_count_delta": 2,
+      "fixed_denominator_lower_bound_before": 0.203125,
+      "fixed_denominator_lower_bound_after": 0.209375,
+      "delta_percentage_points": 0.625,
+      "official_accuracy_available_under_new_policy": false
+    },
+    "runs/baseline_math_v2_06b5k/evaluation/math_unified_v1_n8_math500n2_8k/gad/MATH-500/generation/raw_samples.jsonl": {
+      "frozen_rows": 1000,
+      "before": {
+        "known_correct": 416,
+        "scorable": 940,
+        "parse_status": {
+          "ok": 899,
+          "no_answer": 97,
+          "malformed": 4
+        },
+        "grade_status": {
+          "correct": 416,
+          "incorrect": 427,
+          "error": 56,
+          "not_attempted": 101
+        }
+      },
+      "after": {
+        "known_correct": 418,
+        "scorable": 950,
+        "parse_status": {
+          "ok": 879,
+          "malformed": 25,
+          "no_answer": 96
+        },
+        "grade_status": {
+          "correct": 418,
+          "incorrect": 436,
+          "not_attempted": 121,
+          "error": 25
+        }
+      },
+      "correct_count_delta": 2,
+      "fixed_denominator_lower_bound_before": 0.416,
+      "fixed_denominator_lower_bound_after": 0.418,
+      "delta_percentage_points": 0.2,
+      "official_accuracy_available_under_new_policy": false
+    }
+  },
+  "changed_rows": 79,
+  "changed_labels": 48,
+  "old_fingerprint": "e3aaaac272846f564ce6ca6af969b395b1382ec7740a3884d7c689591ab3cb1c",
+  "new_fingerprint": "2a2b8a02925ecd3b6a5ff99f32a7cd04df03c8b962278c42a1099eb4380467b7",
+  "raw_sources_unchanged": {
+    "runs/baseline_math_v2_06b5k/evaluation/math_unified_v1_n8_math500n2_8k/gad/AIME24/generation/raw_samples.jsonl": true,
+    "runs/baseline_math_v2_06b5k/evaluation/math_unified_v1_n8_math500n2_8k/gad/AIME25/generation/raw_samples.jsonl": true,
+    "runs/baseline_math_v2_06b5k/evaluation/math_unified_v1_n8_math500n2_8k/gad/AMC23/generation/raw_samples.jsonl": true,
+    "runs/baseline_math_v2_06b5k/evaluation/math_unified_v1_n8_math500n2_8k/gad/MATH-500/generation/raw_samples.jsonl": true
+  },
+  "scope": "Same frozen 1800 existing outputs only, no generation. Unknowns are not official incorrect labels; fixed-denominator lower bounds quantify changes without dropping them."
+}

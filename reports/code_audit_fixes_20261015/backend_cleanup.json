@@ -1,0 +1,139 @@
+[
+  {
+    "path": "gad/.backends_gad_extensions_v1_002184a73bd7",
+    "runtime_references": [],
+    "used_stages": [],
+    "action": "archived_unused_then_removed",
+    "archive": "reports/code_audit_fixes_20261015/retired_backends/.backends_gad_extensions_v1_002184a73bd7.tar.gz",
+    "archive_sha256": "6d148a91ecf743ba81a16295e509011aba52d02adc74bed6ce8aabe913654521",
+    "stages": [
+      {
+        "stage": "warmup",
+        "commit": "b6e88286c3e16d6f364e698f60c3be608f1a36cc"
+      },
+      {
+        "stage": "gad",
+        "commit": "707757b9202c466d986e529a4658434d0ac6a7ee"
+      }
+    ]
+  },
+  {
+    "path": "gad/.backends_gad_extensions_v1_4f12b6439386",
+    "runtime_references": [
+      "runs/baseline_math_v2_06b5k/train.yaml",
+      "runs/baseline_math_v2_06b5k/stage_warmup.json",
+      "runs/baseline_math_v2_06b5k/stage_gad.json",
+      "runs/baseline_math_v2_06b5k/run_summary.json"
+    ],
+    "used_stages": [
+      "gad",
+      "warmup"
+    ],
+    "action": "retained_referenced_or_used"
+  },
+  {
+    "path": "gad/.backends_gad_extensions_v1_5e744a183384",
+    "runtime_references": [],
+    "used_stages": [],
+    "action": "archived_unused_then_removed",
+    "archive": "reports/code_audit_fixes_20261015/retired_backends/.backends_gad_extensions_v1_5e744a183384.tar.gz",
+    "archive_sha256": "50e6d992e107d073a2cd61a249846cba8dcf9983f0ed1c906b2ad410b51044ec",
+    "stages": [
+      {
+        "stage": "warmup",
+        "commit": "b6e88286c3e16d6f364e698f60c3be608f1a36cc"
+      },
+      {
+        "stage": "gad",
+        "commit": "707757b9202c466d986e529a4658434d0ac6a7ee"
+      }
+    ]
+  },
+  {
+    "path": "gad/.backends_gad_extensions_v1_871e18228d8d",
+    "runtime_references": [],
+    "used_stages": [],
+    "action": "archived_unused_then_removed",
+    "archive": "reports/code_audit_fixes_20261015/retired_backends/.backends_gad_extensions_v1_871e18228d8d.tar.gz",
+    "archive_sha256": "fb07641f2fb0ac8af4fbcfe857a57163a23e6fa4d696a4ce43c22744abf584e4",
+    "stages": [
+      {
+        "stage": "warmup",
+        "commit": "b6e88286c3e16d6f364e698f60c3be608f1a36cc"
+      },
+      {
+        "stage": "gad",
+        "commit": "707757b9202c466d986e529a4658434d0ac6a7ee"
+      }
+    ]
+  },
+  {
+    "path": "gad/.backends_gad_extensions_v1_9abad7f38ace",
+    "runtime_references": [],
+    "used_stages": [],
+    "action": "archived_unused_then_removed",
+    "archive": "reports/code_audit_fixes_20261015/retired_backends/.backends_gad_extensions_v1_9abad7f38ace.tar.gz",
+    "archive_sha256": "20f143045ed7135a8bb6bc8971099b21628074345867b3a98e591307a7992c7b",
+    "stages": [
+      {
+        "stage": "warmup",
+        "commit": "b6e88286c3e16d6f364e698f60c3be608f1a36cc"
+      },
+      {
+        "stage": "gad",
+        "commit": "707757b9202c466d986e529a4658434d0ac6a7ee"
+      }
+    ]
+  },
+  {
+    "path": "gad/.backends_gad_extensions_v1_bd141ca6ed74",
+    "runtime_references": [
+      "runs/qwen3_0.6b_dapo_math_5k_rubric_0.6b_5k_20261012-215342-839723/train.yaml",
+      "runs/qwen3_0.6b_dapo_math_5k_rubric_0.6b_5k_20261012-215342-839723/stage_warmup.json",
+      "runs/qwen3_0.6b_dapo_math_5k_rubric_0.6b_5k_20261012-215342-839723/stage_gad.json",
+      "runs/qwen3_0.6b_dapo_math_5k_rubric_0.6b_5k_20261012-215342-839723/run_summary.json",
+      "runs/online_replay_smoke_v2/train.yaml",
+      "runs/online_replay_smoke_v2/stage_warmup.json",
+      "runs/online_replay_smoke_v2/stage_gad.json",
+      "runs/online_replay_smoke_v2/run_summary.json",
+      "runs/online_correctness_smoke_v2/train.yaml",
+      "runs/online_correctness_smoke_v2/stage_gad.json",
+      "runs/online_correctness_smoke_v2/run_summary.json",
+      "runs/naive_rubric_0.6b_17k/train.yaml"
+    ],
+    "used_stages": [
+      "gad",
+      "warmup"
+    ],
+    "action": "retained_referenced_or_used"
+  },
+  {
+    "path": "gad/.backends_gad_extensions_v1_d3663a071c93",
+    "runtime_references": [
+      "runs/rubric_v2_smoke_baseline/stage_warmup.json",
+      "runs/rubric_v2_smoke_baseline/run_summary.json"
+    ],
+    "used_stages": [
+      "warmup"
+    ],
+    "action": "retained_referenced_or_used"
+  },
+  {
+    "path": "gad/.backends_gad_extensions_v1_dac98c110b37",
+    "runtime_references": [],
+    "used_stages": [],
+    "action": "archived_unused_then_removed",
+    "archive": "reports/code_audit_fixes_20261015/retired_backends/.backends_gad_extensions_v1_dac98c110b37.tar.gz",
+    "archive_sha256": "1f4858aaaefa755455f00baa1bb6ce55794196c38c12f32ad125e6fb1d19c818",
+    "stages": [
+      {
+        "stage": "warmup",
+        "commit": "b6e88286c3e16d6f364e698f60c3be608f1a36cc"
+      },
+      {
+        "stage": "gad",
+        "commit": "707757b9202c466d986e529a4658434d0ac6a7ee"
+      }
+    ]
+  }
+]

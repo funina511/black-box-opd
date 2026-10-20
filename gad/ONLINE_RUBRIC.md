@@ -1,5 +1,33 @@
 # GAD 在线 Rubric 与历史 Replay
 
+> 2026-10-16 最新：研究 V2.4 已实现；实际 input v2.4/wire v2.5。
+> 15次有界8B Thinking请求处理8条真实回答，保留progress5个/error2个；人工可靠性与真实标签训练尚未验收。
+> [实现、配置及验收边界](../docs/Rubric监督v2.4实现与验收说明.md)；[本轮实测](../reports/rubric_v24_holdout_window1_20261016/report.md)。下文版本状态为历史记录。
+
+
+> 本页为 V1 历史说明。2026-10-14 起，全局新实验使用公共数学 scorer 与 Rubric V2；
+> 当前状态、验证限制和命令见 [V2交接报告](../reports/rubric_v2_handoff.md)。
+>
+> 核查修复后活动input v2.3/wire v2.4，scorer指纹已变化，旧标签不能静默续用。
+> 26套件290项CPU验证通过；judge数学语义与新协议真实训练仍未验证，实验保持停止。
+> 见[核查修复报告](../reports/code_audit_fixes_20261015/report.md)。
+>
+> 当前活动input v2.2/wire v2.3改为程序片段ID、最多4个事件和局部失效。
+> 8B测试按用户要求中止：8条完整返回，引用能回填但仍有明确语义误判；正式训练未启动。
+> 见[片段简化与8B中止总结](../reports/rubric_v2/simplified_8b_20261015/report.md)。以下为历史说明。
+>
+> 2026-10-15 补完：冻结24条已全部处理（复用6条、新请求18条）；21条正式thinking解析，
+> 真实两维覆盖0/16，包括5条原始数学判断合理但证据失效的正确对照。部分改善有校准价值，
+> 过程监督尚未就绪。见[24条补完报告](../reports/rubric_v2/thinking_judge_complete24_20261015/report.md)。
+>
+> 附录 E：judge支持独立thinking，14B已真实产生推理和最终JSON，部分判断改善；
+> 污染进展及真实证据可靠性仍未通过，8B仅候选。见[Thinking报告](../reports/rubric_v2/thinking_judge_20261015/report.md)。
+>
+> 2026-10-15 附录 D：活动 V2 wire 已为 `rubric.events.v2.2`，输入为 `rubric.input.v2.1`。
+> 新增最终学生过程标签覆盖保护、独立计数恢复和新缓存 namespace；旧协议不静默续训。
+> 48 项 CPU 回归与 2 项部署接线检查通过，但真实长回答有效标签仍为零，**joint 尚未就绪**。
+> 14B/32k/1536/并发1仅为候选，详见[改造报告](../reports/rubric_v2/judge_protocol_v21_20261015/report.md)。
+
 统一配置为 `LMOps/train.yaml`，启动入口为 `scripts/train.sh`。
 `rubric.enabled` 与 `replay.enabled` 均默认关闭。
 工程证据见 [ONLINE_RUBRIC_VERIFICATION.md](ONLINE_RUBRIC_VERIFICATION.md)；
@@ -153,3 +181,12 @@ bash evaluate/run_eval.sh --run /绝对路径/实验目录 \
 
 工程冒烟不比较数学准确率。正式实验比较相同 Warmup＋GAD预算后的 actor 性能，
 同时报告各自 Warmup 起点、输出长度、截断和额外 judge 成本。
+
+
+### v2.4 附录 B 冻结（2026-10-17）
+
+当前新候选使用 wire `rubric.events.v2.7`、input `rubric.input.v2.5`、targeted review v4。证据字段采用可省略的 r1…r8 对象槽，空证据 `{}`；实际 xgrammar 禁止 r9。保留 `process_v25.py`（旧 ID）、`process_v26.py`/`evidence_ranges_v1.py`（旧数组）、`semantic_review_v2.py`/`semantic_review_v3.py` 解释器。旧原始 spec/prompt 与已部署 backend 不变；新路径为 `math_process_v27.yaml`、`judge_math_process_v27.txt`。
+
+8B Thinking / TP2 / concurrency2 只做了一次固定4条检查；新协议解决生成期证据容量，不认证数学准确性。已知噪声按探索性训练记录，不再等待全面人工门槛；保留技术失败、未知、连续空 Student 过程监督与数值保护。固定维度分母3、门控tau4、辅助系数0.1、Replay关闭；不能让早期候选的 `legacy_active` 覆盖正式 Loss。正式试验与 Actor 评估由用户运行。
+
+[完整交付与成本](../reports/rubric_v24_bc_20261017/README.md)。当前 full batch 的 Judge 成本可能达数小时/步，延长截止不是提速。

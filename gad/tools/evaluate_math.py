@@ -90,6 +90,7 @@ def run_vllm(model: str, prompts: list[str], *, n_per_prompt: list[int], tempera
         gpu_memory_utilization=gpu_memory_utilization,
         max_model_len=max_model_len,
         trust_remote_code=True,
+        seed=seed,
     )
     results: list[list[dict]] = []
     # vLLM applies one SamplingParams per request, so group by sample count.
@@ -183,8 +184,36 @@ def main() -> int:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--label", default=None, help="Report label, e.g. 'seqkd' or 'initial-student'.")
     parser.add_argument("--scorer-path", default=None)
+    parser.add_argument("--scoring-config-json", default=None)
     parser.add_argument("--dry-run", action="store_true", help="Print the plan; generate nothing.")
     args = parser.parse_args()
+    if args.scoring_config_json:
+        scoring_config = json.loads(args.scoring_config_json)
+        if scoring_config.get('version') == 'math_unified_v1':
+            os.environ["GAD_SCORING_MATH_CONFIG"] = args.scoring_config_json
+            if not args.scorer_path:args.scorer_path = scoring_config.get('entrypoint')
+        elif scoring_config.get('version') == 'legacy_card_v1':
+            os.environ.pop('GAD_SCORING_MATH_CONFIG',None)
+            if not args.scorer_path:args.scorer_path = str(Path(__file__).resolve().parents[2]/'sample/math_scorer.py')
+        else:raise PipelineError('unsupported scoring config version')
+    elif not args.scorer_path:
+        inherited = json.loads(os.environ.get('GAD_SCORING_MATH_CONFIG','{}'))
+        if inherited.get('version') == 'legacy_card_v1':
+            args.scorer_path = str(Path(__file__).resolve().parents[2]/'sample/math_scorer.py')
+            os.environ.pop('GAD_SCORING_MATH_CONFIG',None)
+    # Resolve the scorer before GPU generation. A legacy config must never be
+    # sent to the unified implementation after paying for all model outputs.
+    scorer_module = load_scorer(args.scorer_path)
+    requested = json.loads(args.scoring_config_json or '{}').get('version')
+    actual = getattr(scorer_module,'VERSION','legacy_card_v1')
+    if requested and requested != actual:
+        raise PipelineError('selected scorer conflicts with requested scoring config version')
+    if getattr(scorer_module,'VERSION',None) == 'math_unified_v1':
+        effective = json.loads(os.environ.get('GAD_SCORING_MATH_CONFIG','{}'))
+        if effective.get('version','math_unified_v1') != 'math_unified_v1':
+            raise PipelineError('selected unified scorer conflicts with legacy scoring config')
+        if effective.get('fingerprint') and effective['fingerprint'] != scorer_module.identity(effective.get('timeout_seconds',2.0))['fingerprint']:
+            raise PipelineError('scorer fingerprint changed; create a new evaluation config before generation')
 
     parquet_path = Path(args.parquet).expanduser().resolve()
     if not parquet_path.exists():
@@ -244,7 +273,6 @@ def main() -> int:
             top_p=args.top_p, max_tokens=args.max_tokens, seed=args.seed,
         )
 
-    scorer_module = load_scorer(args.scorer_path)
     predictions_path = out_dir / "predictions.jsonl"
     scored_records: list[dict] = []
     with predictions_path.open("w", encoding="utf-8") as handle:
@@ -268,11 +296,26 @@ def main() -> int:
     grouped: dict[str, list[dict]] = {}
     for record in scored_records:
         grouped.setdefault(record["benchmark"], []).append(record)
-    report = summarize_sampling(grouped, answer_token_limit=args.max_tokens)
+    if getattr(scorer_module, 'VERSION', None) == 'math_unified_v1':
+        sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+        from evaluate.rescore import summarize
+        from collections import defaultdict
+        expected = defaultdict(list)
+        sample_counts = {}
+        for row, n in zip(rows, n_per_prompt):
+            expected[row['benchmark']].append(row['uid']);sample_counts[row['benchmark']] = n
+        report = {'benchmarks': {}, 'overall': {}}
+        for benchmark in expected:
+            report['benchmarks'][benchmark] = summarize(grouped.get(benchmark, []), expected_questions=expected[benchmark], n=sample_counts[benchmark])
+        complete = all(item['evaluation_complete'] for item in report['benchmarks'].values())
+        report['overall'] = {'evaluation_complete': complete, 'aggregation': 'benchmark macro mean',
+            'pass_at_1': sum(item['pass_at_1'] for item in report['benchmarks'].values()) / len(expected) if complete else None}
+    else:
+        report = summarize_sampling(grouped, answer_token_limit=args.max_tokens)
     report["label"] = args.label or model_path.name
     report["protocol"] = plan
     report["generated_at"] = utc_timestamp()
-    write_json(out_dir / "report.json", report)
+    write_json(out_dir / "metrics.json", report)
 
     write_json(
         out_dir / "manifest.json",
@@ -290,15 +333,9 @@ def main() -> int:
     )
 
     log(f"predictions -> {predictions_path}")
-    log(f"report      -> {out_dir / 'report.json'}")
-    for benchmark, entry in report["benchmarks"].items():
-        log(
-            f"  {benchmark:9s} n={entry.get('samples_per_question'):.1f} "
-            f"pass@1={entry.get('pass_at_1'):.4f} (any-success {entry.get('pass_at_n_any_success'):.4f}) "
-            f"parse-fail={entry.get('answer_parse_failure_rate'):.3f} trunc={entry.get('truncation_rate'):.3f}"
-        )
-    if report.get("overall"):
-        log(f"  overall   pass@1={report['overall'].get('pass_at_1'):.4f}")
+    log(f"report      -> {out_dir / 'metrics.json'}")
+    for benchmark, entry in report['benchmarks'].items():
+        log(f"  {benchmark}: pass_at_1={entry.get('pass_at_1')}, evaluation_complete={entry.get('evaluation_complete', True)}")
     return 0
 
 

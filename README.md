@@ -1,5 +1,8 @@
 # LMOps
 
+新实验使用 `math_unified_v1` 与显式 rollout seed。Rubric V2 的实现状态、
+校准问题及正式配置入口见 [V2交接报告](reports/rubric_v2_handoff.md)。
+
 Qwen3 的 SeqKD → Warmup → GAD 通用实验入口。新实验通过一份 [train.yaml](train.yaml) 选择模型、准备好的数据集和训练参数；启动时自动将完整配置保存到 `runs/<运行名>/train.yaml`。
 
 ```bash

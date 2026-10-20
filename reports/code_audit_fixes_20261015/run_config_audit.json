@@ -1,0 +1,67 @@
+[
+  {
+    "config": "runs/baseline_math_v2_06b5k/train.yaml",
+    "scorer_version": "math_unified_v1",
+    "epoch_gad": 2,
+    "rollout_n": 2,
+    "problems": [
+      "saved math scorer/dependency fingerprint differs; new run required"
+    ]
+  },
+  {
+    "config": "runs/gad_qwen3_0.6b_17k/qwen3-0.6b-17k-n2/train.yaml",
+    "scorer_version": "legacy_card_v1",
+    "epoch_gad": 2,
+    "rollout_n": 2,
+    "problems": []
+  },
+  {
+    "config": "runs/gad_qwen3_0.6b_5k/qwen3-0.6b-5k-seed42-n2/train.yaml",
+    "scorer_version": "legacy_card_v1",
+    "epoch_gad": 2,
+    "rollout_n": 2,
+    "problems": []
+  },
+  {
+    "config": "runs/gad_qwen3_1.7b/qwen3-1.7b-4x3090/train.yaml",
+    "scorer_version": "legacy_card_v1",
+    "epoch_gad": 2,
+    "rollout_n": 2,
+    "problems": []
+  },
+  {
+    "config": "runs/naive_rubric_0.6b_17k/train.yaml",
+    "scorer_version": "legacy_card_v1",
+    "epoch_gad": 2,
+    "rollout_n": 2,
+    "problems": []
+  },
+  {
+    "config": "runs/online_correctness_smoke_v2/train.yaml",
+    "scorer_version": "legacy_card_v1",
+    "epoch_gad": 2,
+    "rollout_n": 2,
+    "problems": []
+  },
+  {
+    "config": "runs/online_replay_smoke_v2/train.yaml",
+    "scorer_version": "legacy_card_v1",
+    "epoch_gad": 2,
+    "rollout_n": 2,
+    "problems": []
+  },
+  {
+    "config": "runs/online_wg_smoke_v1/train.yaml",
+    "scorer_version": "legacy_card_v1",
+    "epoch_gad": 2,
+    "rollout_n": 2,
+    "problems": []
+  },
+  {
+    "config": "runs/qwen3_0.6b_dapo_math_5k_rubric_0.6b_5k_20261012-215342-839723/train.yaml",
+    "scorer_version": "legacy_card_v1",
+    "epoch_gad": 2,
+    "rollout_n": 2,
+    "problems": []
+  }
+]

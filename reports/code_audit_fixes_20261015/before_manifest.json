@@ -1,0 +1,68 @@
+{
+  "started_epoch": 1792066459.8693647,
+  "scorer_identity": {
+    "version": "math_unified_v1",
+    "fingerprint": "e3aaaac272846f564ce6ca6af969b395b1382ec7740a3884d7c689591ab3cb1c",
+    "protocol": {
+      "version": "math_unified_v1",
+      "timeout_seconds": 2.0,
+      "sources": {
+        "__init__.py": "0d1e83c6ec1d26c704174cd6dc78031838160912da86857eade60999d9f1244a",
+        "math.py": "cf17e27913b485c3975eb3a2a8388a8b4fda7563df639eec5a081f9ccd8d5f9c",
+        "vendor/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "vendor/oprd_math.py": "12fa921f80e966a13ef0e158c878772d776b828944f18d051bf2a07845133ca8"
+      },
+      "dependencies": {
+        "sympy": "1.13.1",
+        "pylatexenc": "2.11"
+      },
+      "python": [
+        3,
+        10
+      ],
+      "numeric_tolerance": "exact",
+      "object_policy": "preserve_units_delimiters_order_conditions",
+      "vendor_source": {
+        "source": "/mnt/jinbo/RLRM/OPRD/verl/verl/utils/reward_score/ttrl_math/math_utils.py",
+        "oprd_commit": "0e3fbe839e961b342d71a84175ba0e436c5ecce7",
+        "source_sha256": "417e696e9335613bc6a28860c0e86585656cd8a5fd00fcfb48edd95b799dc8cc",
+        "retained_symbols": [
+          "_parse_latex",
+          "_strip_string",
+          "_sympy_parse",
+          "grade_answer_mathd",
+          "mathd_normalize_answer",
+          "unit_texts"
+        ],
+        "license": "Apache-2.0",
+        "adaptation": "fixed extraction and typed strict SymPy grading live in scoring/math.py; legacy broad exception/approximation wrappers not reused"
+      }
+    }
+  },
+  "frozen_sources_sha256": {
+    "runs/baseline_math_v2_06b5k/evaluation/math_unified_v1_n8_math500n2_8k/gad/AIME24/generation/raw_samples.jsonl": "cae5762e34a2e69cdd01c7a47e6830feb825f81b5fa12f4ddb3a0f01adc3313f",
+    "runs/baseline_math_v2_06b5k/evaluation/math_unified_v1_n8_math500n2_8k/gad/AIME25/generation/raw_samples.jsonl": "93b647ec6eb1694b6fe5c41a30bf87dddfc8bf62ff7684cabab438d6f241991c",
+    "runs/baseline_math_v2_06b5k/evaluation/math_unified_v1_n8_math500n2_8k/gad/AMC23/generation/raw_samples.jsonl": "25c88325f1e3e5b1dd55a1029097247633a865330a8acb8640e4d5daa0d962b1",
+    "runs/baseline_math_v2_06b5k/evaluation/math_unified_v1_n8_math500n2_8k/gad/MATH-500/generation/raw_samples.jsonl": "ecec308e5bf39a2b47e4e3b7750a86ecc9981ea32e3f5195f5954159ee99dfb9"
+  },
+  "frozen_rows": 1800,
+  "code_sha256": {
+    "scoring/math.py": "cf17e27913b485c3975eb3a2a8388a8b4fda7563df639eec5a081f9ccd8d5f9c",
+    "scoring/vendor/oprd_math.py": "12fa921f80e966a13ef0e158c878772d776b828944f18d051bf2a07845133ca8",
+    "evaluate/rescore.py": "77fc856149ed981bc452b97e69986daa1e1f1d2ce51b0d3a0dc96e88b2a08cc7",
+    "gad/tools/config.py": "7141df11e371c6101282fcd994139773116d522526d35706f0cef5312a443bdf",
+    "gad/tools/extension_config.py": "2237d40d146b89711290f0421863b73e4bc31c62a70cbb8578f4cbab7afd577b",
+    "gad/tools/pipeline.py": "6e05619b8e36caa91e26630684b0f71cb98521a3f6abe64e0a83bbb5b8d874d3",
+    "gad/tools/math_metrics.py": "037f223ce71f6b10cc99a3906d5cb66bd545b44970efd375a1dcf4a4bf6f3349",
+    "gad/tools/evaluate_math.py": "901417ae97a20fa6fc80e66af2bace44efaeb861641c9b1847c86be42c3fdfda",
+    "gad/tools/algorithm_patches.py": "3f83c70d209a6ae2409a74979558a6d8dcb4891741f37f0a8a8ef1f73d22848b",
+    "gad/tools/backend_patches.py": "f752feaa0d91d78295e049669c12155aeedc54c426e52c345a354e95e464bb7f",
+    "rubric/core/process_v2.py": "8bad6d1865150519ddb59da3f79b84bb5c8f2c3e780829d66ec8295e5f47c875",
+    "rubric/core/contracts.py": "4dea1e602ed50f7a1f2e1123612695c964779edc73fd56d402fd6ccab2532991",
+    "rubric/specs/math_process_v2.yaml": "36a411f2da6efe08772ad8b8efec2242b894298c09926bae084c4a0164e3ce71",
+    "rubric/prompts/judge_math_process_v2.txt": "7b654582ca4291a8091f255ef0a063ec5e30108bc0e2d076af851968b1e36b34",
+    "gad/extensions/online_v2.py": "3cf0840388c152cb8d72389445cc45ec2e7bdeb2fb86e17191d50c2d20a6ceb1",
+    "gad/tests/run_all.sh": "80abe644b3b2014c4745a6b762848fdd27b7bda5507e7f21187a219cca1508a1"
+  },
+  "gpu_experiment_started": false
+}

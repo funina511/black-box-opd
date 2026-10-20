@@ -1,7 +1,7 @@
 """FSDP-compatible four-channel forward and globally normalized auxiliary gradients."""
 import torch
 from .core.heads import last_response_logits, validate_head
-from .core.losses import weighted_contribution
+from .core.losses import weighted_contribution, dimension_weights
 
 
 def rubric_enabled(critic):
@@ -65,7 +65,17 @@ def update_joint(critic, proto):
         critic.critic_optimizer.zero_grad()
         numerator = torch.zeros_like(counts)
         adv_total = acc_total = student_mean = teacher_mean = 0.
-        before_head = None
+        mode=critic.config.rubric.get('loss_mode','legacy_active')
+        tau=critic.config.rubric.get('count_gate_tau',4)
+        interval=critic.config.rubric.get('gradient_diagnostics_interval',0)
+        if interval:
+            # Derive the schedule from restored optimizer state, not an
+            # invocation-local counter that resets on resume.
+            steps=[float(v.get('step',0)) for v in critic.critic_optimizer.state.values()]
+            completed=int(max(steps,default=0))
+            if completed % interval==0:
+                from .gradient_diagnostics import diagnose
+                for key,value in diagnose(critic,mini,forward_channels,get_device_id()).items():record(key,value)
         # FP32 master weights are preserved by the original CriticWorker.
         for data in mini.split(micro):
             data = data.to(get_device_id())
@@ -78,7 +88,7 @@ def update_joint(critic, proto):
             for role, logits in (("student", student), ("teacher", teacher)):
                 contribution, local = weighted_contribution(
                     logits[:, 1:], data[role + "_rubric_targets"], data[role + "_rubric_mask"],
-                    data[role + "_aux_weight"], counts, dp)
+                    data[role + "_aux_weight"], counts, dp, mode, tau)
                 aux = aux + contribution
                 numerator += local.detach() * dp
             loss = adv / (size // micro) + critic.config.rubric.loss_coef * aux
@@ -94,7 +104,8 @@ def update_joint(critic, proto):
             raise ValueError("critic optimizer rejected nonfinite gradient; actor must not update")
         active = counts > 0
         per_dimension = numerator / counts.clamp_min(1)
-        auxiliary = per_dimension[active].mean().item() if active.any() else 0.
+        before, gate, after = dimension_weights(counts,mode,tau)
+        auxiliary = (numerator * after).sum().item()
         record("critic/d_loss", adv_total)
         record("critic/loss_adv", adv_total)
         record("critic/d_acc", acc_total)
@@ -103,15 +114,24 @@ def update_joint(critic, proto):
         record("critic/grad_norm", norm.detach().item())
         record("rubric/loss_aux", auxiliary)
         record("rubric/loss_aux_weighted", auxiliary * critic.config.rubric.loss_coef)
-        for index, dimension in enumerate(("answer_correctness", "reasoning_validity", "condition_coverage")):
+        record('critic/loss_total', adv_total + auxiliary * critic.config.rubric.loss_coef)
+        record('critic/optimizer_steps', 1)
+        record('critic/microbatches_per_optimizer_step', size // micro)
+        for index, dimension in enumerate(critic.config.rubric.get('head_layout', ['adv', 'answer_correctness', 'reasoning_validity', 'condition_coverage'])[1:]):
             record("rubric/loss_" + dimension, per_dimension[index].item())
             record("rubric/global_count_" + dimension, counts[index].item())
+            record('rubric/gate_' + dimension,gate[index].item())
+            record('rubric/coefficient_before_gate_' + dimension,before[index].item())
+            record('rubric/coefficient_after_gate_' + dimension,after[index].item())
+            record('rubric/loss_contribution_' + dimension,(numerator[index]*after[index]).item())
+        for candidate in ('legacy_active','fixed_dimension','fixed_dimension_gated'):
+            record('rubric/loss_mode/'+candidate,int(mode==candidate))
     critic.critic_optimizer.zero_grad()
     return metrics
 
 
 def check_model(config, rubric, local_path):
-    validate_head(config, bool(rubric.get("enabled", False)), rubric.get("spec_hash"))
+    validate_head(config, bool(rubric.get("enabled", False)), rubric.get("spec_hash"), rubric.get('version', 'math_v1'))
     from pathlib import Path
     from safetensors import safe_open
     shapes = {}

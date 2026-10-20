@@ -43,6 +43,10 @@ def extract_pairs(batch, tokenizer, token_identity, step, stage):
                 # Source index provenance is joined by the driver before annotation.
             pair[role] = {"response_id": rid, "token_ids": ids, "response": text,
                           "finish_reason": finish, "truncated": truncated}
+            pair[role]['training_token_truncated'] = bool(batch.non_tensor_batch.get('gad_teacher_token_truncated', [False] * len(batch))[i]) if role == 'teacher' else False
+            if role == 'teacher':
+                pair[role].update({key: extra.get(key) for key in ('teacher_metadata_version', 'selected_teacher_index',
+                    'selected_teacher_text_sha256', 'source_finish_reason', 'source_truncated') if key in extra})
         pair["pair_id"] = digest({"prompt": prompt_id, "teacher": pair["teacher"]["response_id"],
                                   "student": pair["student"]["response_id"], "step": step, "occurrence": i})
         pair["source_index"] = str(index)

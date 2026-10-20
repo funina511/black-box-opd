@@ -30,7 +30,7 @@ import unittest
 from pathlib import Path
 
 GAD_DIR = Path(__file__).resolve().parents[1]
-BACKEND_ROOT = GAD_DIR / ".backends"
+BACKEND_ROOT = Path(os.environ.get("GAD_TEST_BACKEND_ROOT", GAD_DIR / ".backends"))
 PYTHON = sys.executable
 
 # The child process is intentionally self-contained: it computes the reference

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Evaluate experiment checkpoints with OPRD sampling and two math graders.
+"""Evaluate experiment checkpoints with OPRD sampling and one versioned public math scorer.
 
 Use evaluate/run_eval.sh to choose an experiment, models, datasets, and parameters.
 Real evaluation requires ready checkpoints and free training GPUs.
@@ -19,6 +19,7 @@ import pyarrow.parquet as pq
 import yaml
 
 LMOPS_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(LMOPS_ROOT))
 sys.path.insert(0, str(LMOPS_ROOT / "gad" / "tools"))
 from config import load_config, nested_config, add_config_arguments, select_config
 from pipeline import stage_step_budget
@@ -158,6 +159,10 @@ def build_plan(train_path: Path, *, methods: list[str], tasks: list[str],
                checkpoint_steps: dict[str, int] | None = None,
                protocol_overrides: dict | None = None, resolved_config=None) -> dict:
     cfg = resolved_config or load_config(train_path)
+    if cfg.get('scoring.math.version') == 'math_unified_v1':
+        from scoring.math import identity
+        if cfg.get('scoring.math.fingerprint') != identity(cfg.get('scoring.math.timeout_seconds'))['fingerprint']:
+            raise ValueError('evaluation scorer differs from frozen run/dependency identity')
     train_path = cfg.path
     train = nested_config(cfg.data)
     if train["rollout"].get("enable_thinking") is not False:
@@ -293,8 +298,9 @@ def build_plan(train_path: Path, *, methods: list[str], tasks: list[str],
                      "gpu_memory_utilization": float(protocol["gpu_memory_utilization"]),
                      "enforce_eager": bool(enforce_eager),
                      "enable_thinking": False, "seed": int(seed)},
-        "scorers": {"reference": "OPRD/sft/score_math.py",
-                    "training_aligned": "LMOps/sample/math_scorer.py"},
+        "scoring_math": {key[13:]: value for key, value in cfg.data.items() if key.startswith('scoring.math.')}
+            if cfg.get('scoring.math.version') == 'math_unified_v1' else __import__('scoring.math', fromlist=['DEFAULT_CONFIG']).DEFAULT_CONFIG,
+        "scorer_identity": __import__('scoring.math', fromlist=['identity']).identity(cfg.get('scoring.math.timeout_seconds')),
     }
 
 
@@ -349,7 +355,7 @@ def execute(plan: dict) -> None:
     saved_plan = out_root / "plan.json"
     if saved_plan.is_file():
         previous = json.loads(saved_plan.read_text(encoding="utf-8"))
-        keys = ("models", "tasks", "protocol", "gpu_ids", "max_prompts")
+        keys = ("models", "tasks", "protocol", "gpu_ids", "max_prompts", 'scoring_math', 'scorer_identity')
         if any(previous.get(key) != plan.get(key) for key in keys):
             raise RuntimeError(f"evaluation settings changed in {out_root}; choose a new PROFILE")
     out_root.mkdir(parents=True, exist_ok=True)
@@ -381,15 +387,10 @@ def execute(plan: dict) -> None:
             print(f"[eval] {method}/{task}: {samples} samples/question", flush=True)
             subprocess.run(sampler, cwd=oprd_root, check=True)
             raw = generation / "raw_samples.jsonl"
-            subprocess.run([python_bin, "-m", "sft.score_math", "--raw-jsonl", str(raw),
-                            "--output-dir", str(scores), "--task-name", task,
-                            "--wandb-mode", "disabled"], cwd=oprd_root, check=True)
-            subprocess.run([python_bin, str(LMOPS_ROOT / "gad" / "tools" / "rescore_oprd_eval.py"),
-                            "--raw-jsonl", str(raw), "--task", task,
-                            "--max-tokens", str(protocol["max_tokens"]),
-                            "--scorer", str(LMOPS_ROOT / "sample" / "math_scorer.py"),
-                            "--output", str(scores / "card_metrics.json")],
-                           cwd=LMOPS_ROOT, check=True)
+            expected = min(dataset['rows'], plan['max_prompts']) if plan['max_prompts'] else dataset['rows']
+            subprocess.run([python_bin, str(LMOPS_ROOT / 'evaluate/rescore.py'), '--raw-jsonl', str(raw),
+                '--output-dir', str(scores), '--task', task, '--n', str(samples), '--expected-prompts', str(expected),
+                '--config-json', json.dumps(plan['scoring_math'])], cwd=LMOPS_ROOT, check=True)
     print(f"[eval] results -> {out_root}")
 
 
