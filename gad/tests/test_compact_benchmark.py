@@ -21,6 +21,8 @@ def review():
     return {'version':VERSION,'labels':{k:d(['e1']) for k in ('verified_progress','unresolved_error_severity')},
             'events':{'e1':{k:v for k,v in d(ranges={'r1':{'start':'s1','end':'s1'}}).items() if k!='event_ids'}}}
 
+from cpu_fixtures import compose_cpu_config as compose_config
+
 
 class LocalClient(JudgeClient):
     def __init__(self,options,expected,tokenizer=None,request_budget=None):
@@ -35,7 +37,7 @@ class LocalClient(JudgeClient):
 class BenchmarkHarnessTests(unittest.TestCase):
     def test_one_start_two_fresh_arms_shared_budget_and_all_rows(self):
         with tempfile.TemporaryDirectory() as folder:
-            root=Path(folder);cfg=compose_config(ROOT/'reports/rubric_v24_holdout_window1_20261016/config.yaml')
+            root=Path(folder);cfg=compose_config(overrides=[str(ROOT/'configs/methods/rubric_joint.yaml')])
             cfg.data['rubric.judge.base_url']='http://127.0.0.1:0/v1'
             config=root/'config.yaml';config.write_text(yaml.safe_dump(cfg.to_dict()))
             output=root/'out';starts=[]
@@ -45,7 +47,7 @@ class BenchmarkHarnessTests(unittest.TestCase):
                     starts.append(cmd);directory=root/'runs/_rubric_judge/0';directory.mkdir(parents=True)
                     (directory/'owner.json').write_text(json.dumps({'pid':os.getpid(),'birth':'test-only'}))
                 return SimpleNamespace(returncode=0)
-            argv=['calibrate','--config',str(config),'--output',str(output),'--samples',str(ROOT/'reports/rubric_v24_appendix_a_20261016/fixed4.jsonl'),
+            argv=['calibrate','--config',str(config),'--output',str(output),'--samples',str(ROOT/'gad/tests/fixtures/fixed4.jsonl'),
                   '--concurrency-groups','1,2','--finish-cohort','--max-requests','12','--wall-seconds','30']
             with patch.object(sys,'argv',argv),patch.object(calibration,'ROOT',root),patch.object(calibration,'JudgeClient',LocalClient),patch.object(calibration.subprocess,'run',side_effect=subprocess_run),patch.object(calibration,'stop_owned_service',return_value={'stopped':True}):
                 calibration.main()

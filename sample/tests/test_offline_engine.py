@@ -315,6 +315,8 @@ class FingerprintFieldTests(unittest.TestCase):
         return teacher_engines.VllmOfflineEngine(**kwargs)
 
     def _payload(self, engine) -> dict:
+        # Field-only fixture. Actual file hashing/CPU template preflight is covered separately.
+        engine._content_identity={'fixture':True};engine.vllm_version='0.8.5-fixture'
         return sample_teacher.build_fingerprint(self.Args(), {}, engine)
 
     def test_engine_fields_that_change_the_text_are_recorded(self) -> None:
@@ -323,9 +325,8 @@ class FingerprintFieldTests(unittest.TestCase):
         engine_fields = payload["engine"]
         for key in ("model_path", "dtype", "tensor_parallel_size", "max_model_len", "chat_template_kwargs"):
             self.assertIn(key, engine_fields)
-        # throughput/memory knobs must not be able to invalidate a sampling
-        for key in ("batch_size", "gpu_memory_utilization", "enforce_eager", "gpus"):
-            self.assertNotIn(key, engine_fields)
+        for key in ('batch_size','gpu_memory_utilization','enforce_eager','seed','content'):
+            self.assertIn(key,engine_fields)
 
     def test_engine_fields_change_the_digest(self) -> None:
         from task_template import hash_teacher_fingerprint
@@ -342,14 +343,13 @@ class FingerprintFieldTests(unittest.TestCase):
         for variant in variants:
             self.assertNotEqual(base_digest, hash_teacher_fingerprint(self._payload(variant)))
 
-    def test_http_payload_is_unchanged_by_the_engine_feature(self) -> None:
-        """Backward compatibility: HTTP digests must stay bit-identical."""
+    def test_http_payload_records_unverified_remote_identity(self) -> None:
         http_payload = sample_teacher.build_fingerprint(self.Args2(), {}, teacher_engines.OpenAIEngine(
             base_url="http://127.0.0.1:18080/v1", api_key="EMPTY", teacher_model="m",
             m=4, temperature=0.7, top_p=0.95, max_tokens=8192,
             concurrency=16, timeout=600.0, retries=3,
         ))
-        self.assertNotIn("engine", http_payload)
+        self.assertEqual('unverified_remote',http_payload['engine']['vllm_version'])
         self.assertEqual(http_payload["provider"], "openai_compatible")
         expected = {
             "provider": "openai_compatible",
@@ -362,6 +362,7 @@ class FingerprintFieldTests(unittest.TestCase):
             "seed": None,
             "extra_body": None,
             "prompt_template_version": http_payload["prompt_template_version"],
+            'engine':http_payload['engine'],
         }
         self.assertEqual(http_payload, expected)
 
@@ -388,12 +389,14 @@ class LazyImportTests(unittest.TestCase):
 class ChatTemplateTests(unittest.TestCase):
     """The offline path must render the same prompt the HTTP path asked for."""
 
-    TOKENIZER = Path("/mnt/jinbo/RLRM/model/Qwen/Qwen3-1.7B")
+    TOKENIZER = None
 
     @classmethod
     def setUpClass(cls) -> None:
-        if not cls.TOKENIZER.is_dir():
-            raise unittest.SkipTest(f"local tokenizer not available: {cls.TOKENIZER}")
+        if not os.environ.get('GAD_TEST_QWEN_TOKENIZER'):
+            raise unittest.SkipTest('optional real tokenizer: set GAD_TEST_QWEN_TOKENIZER')
+        cls.TOKENIZER=Path(os.environ['GAD_TEST_QWEN_TOKENIZER'])
+        if not cls.TOKENIZER.is_dir():raise ValueError('configured integration tokenizer does not exist')
         from transformers import AutoTokenizer
 
         cls.tokenizer = AutoTokenizer.from_pretrained(cls.TOKENIZER, trust_remote_code=True)
@@ -421,11 +424,8 @@ class ChatTemplateTests(unittest.TestCase):
                     raise TypeError(f"unexpected keyword arguments: {sorted(kwargs)}")
                 return "<prompt>"
 
-        text, applied = teacher_engines.render_prompt(
-            StrictTokenizer(), [{"role": "user", "content": "x"}], {"enable_thinking": False}
-        )
-        self.assertFalse(applied)
-        self.assertEqual(text, "<prompt>")
+        with self.assertRaisesRegex(ValueError,'unsupported'):
+            teacher_engines.render_prompt(StrictTokenizer(),[{'role':'user','content':'x'}],{'enable_thinking':False})
 
     def test_none_valued_kwargs_are_not_forwarded(self) -> None:
         class RecordingTokenizer:
@@ -546,6 +546,7 @@ class VllmOfflineEngineTests(unittest.TestCase):
                                                                   "top_p": 0.95, "max_tokens": 8192}})
         self.assertEqual(engine.vllm_version, "0.8.5-fake")
         self.assertTrue(engine.chat_template_kwargs_applied)
+        engine._content_identity={'fixture':True}
         self.assertIn("chat_template_kwargs", engine.fingerprint_fields())
 
     def test_prompts_are_rendered_chunked_and_mapped(self) -> None:

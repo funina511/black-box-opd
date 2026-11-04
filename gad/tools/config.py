@@ -28,6 +28,7 @@ DEFAULTS: dict[str, Any] = {
     "run.run_id": "auto",
     "run.log_backend": "console",
     "run.wandb_project": "",
+    "run.wandb_mode": "offline",
     "run.eval_after_train": False,
     "run.skip_completed_stages": True,
     "run.allow_cpu_smoke": False,
@@ -47,6 +48,12 @@ DEFAULTS: dict[str, Any] = {
     "models.enable_gradient_checkpointing": True,
     "models.param_offload": False,
     "models.optimizer_offload": False,
+    "models.actor_param_offload": None,
+    "models.actor_optimizer_offload": None,
+    "models.critic_param_offload": None,
+    "models.critic_optimizer_offload": None,
+    "models.actor_gradient_checkpointing": None,
+    "models.critic_gradient_checkpointing": None,
     # The KL reference model is forward-only, so the original harness keeps its parameters
     # on CPU (``actor_rollout_ref.ref.fsdp_config.param_offload=True``): a ~3.4GB per-GPU
     # saving in Warmup/GAD on 24GB cards. Kept separate from models.param_offload, which
@@ -298,6 +305,7 @@ GLOBAL_CONFIG = LMOPS_DIR / "train.yaml"
 CONFIG_METADATA = {"selection", "catalog", "legacy_runs", "_stage_overrides"}
 RUNTIME_KEYS = {
     "resources.gpus", "run.python_bin", "run.log_backend", "run.val_before_train",
+    "run.wandb_project", "run.wandb_mode",
     "resources.save_freq", "resources.test_freq", "resources.keep_last_checkpoints",
     "run.max_stage_steps",
 }
@@ -393,9 +401,11 @@ def _resolved_config(data: dict, path: Path) -> Config:
         import sys
         sys.path.insert(0, str(GAD_DIR.parent))
         from scoring.math import identity
-        entry = str(GAD_DIR.parent / 'scoring/math.py')
+        # A frozen run may belong to another checkout. Compare its two scorer
+        # paths with each other; evaluation checks the recorded fingerprint.
+        entry = resolved.get('scoring.math.entrypoint') or str(GAD_DIR.parent / 'scoring/math.py')
         supplied = data.get('validation.scorer_path')
-        if supplied and str(Path(supplied).resolve()) != entry:
+        if supplied and str(Path(supplied).resolve()) != str(Path(entry).resolve()):
             raise PipelineError('validation.scorer_path conflicts with unified scoring.math')
         resolved['scoring.math.entrypoint'] = resolved.get('scoring.math.entrypoint') or entry
         resolved['validation.scorer_path'] = resolved['scoring.math.entrypoint']
@@ -482,6 +492,8 @@ def add_config_arguments(parser, *, config_alias: str | None = None) -> None:
     parser.add_argument("--run", help="Existing run directory or registered historical name")
     parser.add_argument("--model", help="Model name in the global catalog")
     parser.add_argument("--dataset", help="Prepared dataset name in the global catalog")
+    parser.add_argument('--method', choices=['baseline','correctness_only','rubric_joint'], help='Complete method settings for a NEW run')
+    parser.add_argument('--machine', help='Machine YAML path (or name in configs/machines/) for a NEW run')
     parser.add_argument("--overrides", action="append", default=[], help="Small training override YAML")
     parser.add_argument("--set", action="append", default=[], metavar="KEY=VALUE")
     parser.add_argument("--model-name", help="Legacy experiment selector; prefer --model for new runs")
@@ -500,7 +512,7 @@ def select_config(args, *, existing_only: bool = False) -> Config:
         raise PipelineError("choose either --run or a legacy experiment selector")
     run = args.run or legacy
     if run:
-        if args.config or args.model or args.dataset or args.overrides:
+        if args.config or args.model or args.dataset or args.overrides or getattr(args,'method',None) or getattr(args,'machine',None):
             raise PipelineError("--run selects a frozen config; do not combine it with model/data/template selection")
         cfg = load_run_config(run)
         updates = parse_key_values(args.set)
@@ -514,8 +526,13 @@ def select_config(args, *, existing_only: bool = False) -> Config:
     else:
         if existing_only and not args.config:
             raise PipelineError("select an existing experiment with --run or --config")
+        layers=[]
+        if getattr(args,'method',None):layers.append(str(LMOPS_DIR/'configs/methods'/f'{args.method}.yaml'))
+        if getattr(args,'machine',None):
+            machine=Path(args.machine).expanduser()
+            layers.append(str(machine if machine.is_file() else LMOPS_DIR/'configs/machines'/f'{args.machine}.yaml'))
         cfg = compose_config(args.config or GLOBAL_CONFIG, model=args.model or args.model_name,
-                             dataset=args.dataset, overrides=args.overrides, settings=args.set)
+                             dataset=args.dataset, overrides=layers+args.overrides, settings=args.set)
         if existing_only and cfg.global_config:
             raise PipelineError("this operation needs an existing run; pass --run")
         saved_dir = Path(cfg.require("run.output_root")) / str(cfg.get("run.run_id"))
@@ -559,6 +576,8 @@ def validate_paths(config: Config, *, check_exists: bool) -> list[str]:
     if not check_exists:
         return problems
     for key in PATH_KEYS:
+        if key.startswith('rubric.') and not config.get('rubric.enabled'):continue
+        if key.startswith('rubric.judge.') and config.get('rubric.mode')!='joint':continue
         if key == "eval.parquet" and not config.get("eval.enabled"):
             # The evaluation parquet is only an input once evaluation is switched
             # on; keeping the path in the config for later must not fail a training
@@ -747,6 +766,9 @@ def validate_config(config: Config) -> list[str]:
             "CuMemAllocator refuses it (cumem.py:146). Use e.g. max_split_size_mb:128, or "
             "leave it empty."
         )
+
+    if str(config.get("run.wandb_mode") or "offline") not in ("offline", "online"):
+        problems.append("run.wandb_mode must be offline or online")
 
     try:
         length_budget = int(config.get("data.max_prompt_length") or 0) + int(

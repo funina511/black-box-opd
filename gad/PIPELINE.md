@@ -1,3 +1,5 @@
+> 2026-10-20发布说明：新实验使用scripts/train.sh和configs/methods。旧GPT5/7B train/generate shell仅历史归档，不随新运行包交付；本页早期布局描述保留作历史说明。
+
 > Qwen3-1.7B 当前实验请从 `LMOps/scripts/train.sh`、`LMOps/scripts/preflight.sh` 和
 > `LMOps/train.yaml` 进入；运行产物在 `LMOps/runs/`。
 > 下面的 `gad/` 命令仍是通用实现说明。

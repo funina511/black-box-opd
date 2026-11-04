@@ -1,0 +1,70 @@
+# DeepSeek 官方 API，non-thinking，只采回复正文中的解题步骤。
+# 不需要本地教师模型或 GPU；不保存、不拼接 reasoning_content。
+# 官方参数参考：https://api-docs.deepseek.com/guides/thinking_mode/
+# 模型名称参考：https://api-docs.deepseek.com/ （2026-10-27 核对）
+#
+# 密钥由你在终端设置 DEEPSEEK_API_KEY，不要写入此文件。
+# 从 LMOps 目录运行：
+#   export GAD_PYTHON=/mnt/jinbo/miniconda3/envs/gad/bin/python
+#   bash scripts/sample.sh --config sample/configs/sample_deepseek_api.yaml \
+#     --stage prompts,sample,convert,validate
+# 可先加 --dry-run 检查命令，不请求 API，也不生成数据。
+# 相对路径以本 YAML 所在目录为基准；新数据使用独立目录。
+
+prompts:
+  input_parquet: ../../assets/datasets/dapo_math_17k/data/dapo-math-17k.parquet
+  repo_id: BytedTsinghua-SIA/DAPO-Math-17k
+  filename: data/dapo-math-17k.parquet
+  revision: 65877096c24ffa7abc4e4fa5edb95cf3413a5674
+  expected_unique: 17917
+  on_conflict: error
+  seed: 42
+  dev_size: 512
+  out_dir: ../../data/dapo_math_17k_deepseek_flash_nonthinking_20261027
+  card_full_train: false
+  dev_file: ''
+
+teacher:
+  engine: openai
+  base_url: https://cf.api.fan/v1
+  api_key_env: DEEPSEEK_API_KEY
+  # 默认 Flash；如改用其他模型，请同时更换下方所有输出目录，避免混用数据。
+  model: deepseek-flash
+  m: 1
+  temperature: 0.7
+  top_p: 1.0
+  max_tokens: 8192
+  concurrency: 32
+  timeout: 600
+  retries: 3
+  # 不发送服务未承诺支持的 seed 或 Qwen/vLLM 的 chat_template_kwargs。
+  seed: null
+  enable_thinking: null
+  # null 只是不发送 Qwen 开关；真正关闭 DeepSeek thinking 的是下面这一项。
+  extra_body:
+    thinking:
+      type: disabled
+  index_out: ../../data/dapo_math_17k_deepseek_flash_nonthinking_20261027/teacher_index.jsonl
+  log_file: ../../data/dapo_math_17k_deepseek_flash_nonthinking_20261027/logs/sample.log
+  log_every: 100
+
+gad_data:
+  # 训练集和 dev 均保留所有有教师回答的题目，不按正确性或截断状态过滤。
+  # 当前 m=1，每题的采样正文直接写入训练数据；索引保留原始回答及结束标记。
+  # 缺失/空回答需要补采，不静默丢弃。validate 只统计长度，不剔除超长回答。
+  select: all
+  select_val: all
+  out_train: ../../data/dapo_math_17k_deepseek_flash_nonthinking_20261027/gad_train.parquet
+  out_val: ../../data/dapo_math_17k_deepseek_flash_nonthinking_20261027/gad_dev.parquet
+
+student:
+  model_path: ../../assets/models/Qwen3-0.6B
+  tokenizer_path: ../../assets/models/Qwen3-0.6B
+  enable_thinking: false
+
+lengths:
+  max_prompt_length: 2048
+  max_response_length: 8192
+
+eval:
+  out_dir: ''

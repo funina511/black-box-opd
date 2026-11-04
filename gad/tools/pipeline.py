@@ -229,6 +229,10 @@ def stage_env(cfg: Config, run_dir: Path, stage: str, backend: Path, *, log_back
         project = cfg.get("run.wandb_project")
         if project:
             env["WANDB_PROJECT"] = str(project)
+        # Offline by default: training nodes have no internet. Runs land in
+        # <run_dir>/wandb/offline-run-* and are uploaded later by tools/wandb_sync.py.
+        env.update(WANDB_MODE=str(cfg.get("run.wandb_mode") or "offline"), WANDB_DIR=str(run_dir),
+                   WANDB_RUN_GROUP=run_dir.name, WANDB_JOB_TYPE=stage)
     return env
 
 
@@ -265,6 +269,13 @@ def stage_rollout_n(cfg: Config, stage: str) -> int:
     return int(cfg.require("rollout.n"))
 
 
+def role_model_option(cfg, role, option):
+    key='models.'+role+'_'+option
+    value=cfg.get(key)
+    fallback='enable_gradient_checkpointing' if option=='gradient_checkpointing' else option
+    return bool(cfg.get('models.'+fallback) if value is None else value)
+
+
 def build_overrides(cfg: Config, stage: str, *, model_path: str, critic_path: str | None,
                     out_dir: Path, total_steps: int, epochs: int) -> list[str]:
     batch = int(cfg.require("data.train_batch_size"))
@@ -290,7 +301,7 @@ def build_overrides(cfg: Config, stage: str, *, model_path: str, critic_path: st
         f"data.truncation={cfg.get('data.truncation')}",
         f"actor_rollout_ref.model.path={model_path}",
         f"actor_rollout_ref.model.use_remove_padding={bool(cfg.get('models.use_remove_padding'))}",
-        f"actor_rollout_ref.model.enable_gradient_checkpointing={bool(cfg.get('models.enable_gradient_checkpointing'))}",
+        f"actor_rollout_ref.model.enable_gradient_checkpointing={role_model_option(cfg,'actor','gradient_checkpointing')}",
         f"actor_rollout_ref.model.trust_remote_code={bool(cfg.get('models.trust_remote_code'))}",
         f"actor_rollout_ref.actor.optim.lr={cfg.stage_lr(stage)}",
         f"actor_rollout_ref.actor.grad_clip={cfg.get('optim.grad_clip')}",
@@ -300,8 +311,8 @@ def build_overrides(cfg: Config, stage: str, *, model_path: str, critic_path: st
         f"actor_rollout_ref.actor.entropy_coeff={cfg.get('optim.entropy_coeff')}",
         f"actor_rollout_ref.actor.kl_loss_type={cfg.get('optim.kl_loss_type')}",
         "actor_rollout_ref.actor.ulysses_sequence_parallel_size=1",
-        f"actor_rollout_ref.actor.fsdp_config.param_offload={bool(cfg.get('models.param_offload'))}",
-        f"actor_rollout_ref.actor.fsdp_config.optimizer_offload={bool(cfg.get('models.optimizer_offload'))}",
+        f"actor_rollout_ref.actor.fsdp_config.param_offload={role_model_option(cfg,'actor','param_offload')}",
+        f"actor_rollout_ref.actor.fsdp_config.optimizer_offload={role_model_option(cfg,'actor','optimizer_offload')}",
         f"actor_rollout_ref.ref.fsdp_config.param_offload={bool(cfg.get('models.ref_param_offload'))}",
         f"actor_rollout_ref.rollout.name={cfg.get('rollout.name')}",
         f"actor_rollout_ref.rollout.temperature={cfg.get('rollout.temperature')}",
@@ -330,7 +341,7 @@ def build_overrides(cfg: Config, stage: str, *, model_path: str, critic_path: st
         f"trainer.total_training_steps={total_steps}",
         f"trainer.default_local_dir={out_dir}",
         f"trainer.project_name={cfg.get('run.wandb_project') or 'gad'}",
-        f"trainer.experiment_name={stage}",
+        f"trainer.experiment_name={out_dir.parent.name}_{stage}",
         f"hydra.run.dir={out_dir.parent / 'runtime' / 'hydra' / stage}",
     ]
     backend = backend_path(cfg, stage)
@@ -378,9 +389,11 @@ def build_overrides(cfg: Config, stage: str, *, model_path: str, critic_path: st
             f"critic.model.use_remove_padding={bool(cfg.get('models.use_remove_padding'))}",
             f"critic.model.trust_remote_code={bool(cfg.get('models.trust_remote_code'))}",
             f"critic.grad_clip={cfg.get('optim.grad_clip')}",
-            f"critic.model.fsdp_config.param_offload={bool(cfg.get('models.param_offload'))}",
-            f"critic.model.fsdp_config.optimizer_offload={bool(cfg.get('models.optimizer_offload'))}",
+            f"critic.model.fsdp_config.param_offload={role_model_option(cfg,'critic','param_offload')}",
+            f"critic.model.fsdp_config.optimizer_offload={role_model_option(cfg,'critic','optimizer_offload')}",
         ]
+        if cfg.get('models.critic_gradient_checkpointing') is not None or not (backend/'.gad_backend_used').exists():
+            overrides.append(f"critic.model.enable_gradient_checkpointing={role_model_option(cfg,'critic','gradient_checkpointing')}")
         # R5 (reference _dapo_common.sh: CRITIC_DYNAMIC_BSZ=False, CRITIC_MICRO=1): the
         # discriminator's batching is decoupled from the actor and is static by default, so
         # its micro-batches come from ``batch.split(micro)`` and never from the token-budget
@@ -457,7 +470,20 @@ def plan_stage(cfg: Config, run_dir: Path, stage: str, *, steps_per_epoch_value:
     from extension_config import active, hydra_overrides
     if active(cfg, "rubric", stage):
         config_path = Path(critic_path) / "config.json"
+        if stage == 'gad' and not install_guard and not config_path.is_file() and cfg.get('budget.init_from_warmup_run'):
+            # Only planning: the normal handoff has not exported the target HF yet.
+            # Inspect the explicitly selected source, without reinitializing its heads.
+            from config import resolve_run
+            source = resolve_run(cfg.get('budget.init_from_warmup_run'))
+            source_config = source / 'warmup' / f'global_step_{start_step}' / 'critic' / 'config.json'
+            if source_config.is_file():
+                config_path = source_config
         source_four = config_path.is_file() and json.loads(config_path.read_text()).get("rubric_head_layout")
+        if source_four:
+            from types import SimpleNamespace
+            from rubric.core.heads import validate_head
+            validate_head(SimpleNamespace(**json.loads(config_path.read_text())), True,
+                          sha256_file(Path(cfg.require('rubric.spec'))), cfg.get('rubric.version'))
         assumed_four = stage == "gad" and active(cfg, "rubric", "warmup") and not cfg.get("budget.init_from_warmup_run")
         if not source_four and not (not install_guard and assumed_four):
             prepared = run_dir / "initialization" / f"critic_{stage}"
@@ -470,7 +496,9 @@ def plan_stage(cfg: Config, run_dir: Path, stage: str, *, steps_per_epoch_value:
             overrides = build_overrides(cfg, stage, model_path=model_path, critic_path=critic_path,
                                         out_dir=out_dir, total_steps=total_steps, epochs=epochs)
     overrides += hydra_overrides(cfg, stage, out_dir, start_step)
-    if stage in ("warmup", "gad") and cfg.get("run.resume_worker_state"):
+    load_worker = bool(cfg.get('run.resume_worker_state'))
+    if stage=='gad':load_worker=bool(resume and resume.get('mode')=='resume')
+    if stage in ("warmup", "gad") and load_worker:
         # Same-stage full-state resume (requires the gad-resume-worker-state patch).
         overrides.append("trainer.resume_load_worker_state=True")
     argv = [str(python_bin), "-m", "verl.trainer.main_ppo", *overrides]
@@ -482,6 +510,12 @@ def plan_stage(cfg: Config, run_dir: Path, stage: str, *, steps_per_epoch_value:
         "backend_commit": planned_backend_commit(backend, stage),
         "backend_profile": cfg.get("backends.profile"),
         "rubric_enabled": active(cfg, "rubric", stage),
+        "actor_reward": {
+            'source': cfg.get('rubric.reward_source') if stage == 'gad' and active(cfg, 'rubric', stage) else 'adv_only',
+            'coef': cfg.get('rubric.actor_reward_coef') if stage == 'gad' and active(cfg, 'rubric', stage) else 0.,
+            'weights': {d: cfg.get('rubric.actor_reward_weights.' + d) for d in
+                        ('answer_correctness', 'verified_progress', 'unresolved_error_severity')},
+        },
         "replay_enabled": active(cfg, "replay", stage),
         "validation_diagnostics": {
             "configured_rouge_l_enabled": bool(cfg.get("validation.rouge_l_enabled")),
@@ -499,6 +533,7 @@ def plan_stage(cfg: Config, run_dir: Path, stage: str, *, steps_per_epoch_value:
         "epoch_budget": epoch_budget,
         "steps_per_epoch": steps_per_epoch_value,
         "resume": resume or {"requested": False, "mode": "fresh", "from_step": None},
+        'warmup_handoff':handoff_identity(cfg,run_dir) if stage=='gad' else None,
         "argv": argv,
         "env": env,
         "log": str(run_dir / "logs" / f"{stage}.log"),
@@ -517,7 +552,7 @@ def checkpoint_dirs(out_dir: Path) -> list[tuple[int, Path]]:
     return sorted(found)
 
 
-def verify_checkpoint_dir(path: Path, *, roles: tuple[str, ...]) -> list[str]:
+def verify_checkpoint_dir(path: Path, *, roles: tuple[str, ...], extensions_required: bool = False) -> list[str]:
     problems: list[str] = []
     if not path.is_dir():
         return [f"checkpoint directory missing: {path}"]
@@ -543,7 +578,7 @@ def verify_checkpoint_dir(path: Path, *, roles: tuple[str, ...]) -> list[str]:
     if not (path / "data.pt").exists():
         problems.append(f"{path}/data.pt missing (dataloader state; step resume would restart the epoch)")
     from gad.extensions.checkpoint_state import checkpoint_problems
-    problems.extend(checkpoint_problems(path))
+    problems.extend(checkpoint_problems(path, required=extensions_required))
     return problems
 
 
@@ -551,11 +586,11 @@ def verify_stage_artifacts(stage: str, out_dir: Path, *, expected_step: int | No
                            math_metrics_expected: bool = False,
                            math_metrics_reason: str = "",
                            require_final_full: bool = False, full_count: int | None = None,
-                           strict_evaluation: bool = False) -> dict:
+                           strict_evaluation: bool = False, extensions_required: bool = False) -> dict:
     roles = ("actor",) if stage == "seqkd" else ("actor", "critic")
     steps = checkpoint_dirs(out_dir)
     last_step, last_dir = steps[-1] if steps else (None, None)
-    checkpoint_problems = verify_checkpoint_dir(last_dir, roles=roles) if last_dir else [f"{out_dir}: no global_step_* checkpoint was written"]
+    checkpoint_problems = verify_checkpoint_dir(last_dir, roles=roles, extensions_required=extensions_required) if last_dir else [f"{out_dir}: no global_step_* checkpoint was written"]
     training_problems = list(checkpoint_problems)
     if expected_step is not None and last_step != expected_step:
         training_problems.append(f"last checkpoint is global_step_{last_step} but the budget requires global_step_{expected_step}")
@@ -617,11 +652,11 @@ def verify_stage_artifacts(stage: str, out_dir: Path, *, expected_step: int | No
     }
 
 
-def last_complete_checkpoint(out_dir: Path, *, stage: str) -> tuple[int, Path] | None:
+def last_complete_checkpoint(out_dir: Path, *, stage: str, extensions_required: bool = False) -> tuple[int, Path] | None:
     """Highest checkpoint of ``stage`` that is structurally complete."""
     roles = ("actor",) if stage == "seqkd" else ("actor", "critic")
     for step, path in reversed(checkpoint_dirs(out_dir)):
-        if not verify_checkpoint_dir(path, roles=roles):
+        if not verify_checkpoint_dir(path, roles=roles, extensions_required=extensions_required):
             return step, path
     return None
 
@@ -672,7 +707,38 @@ def resolve_gad_resume(cfg: Config, run_dir: Path, *, added_steps: int,
         "handoff": None,
         "reason": "no resume requested",
     }
-    existing = last_complete_checkpoint(out_dir, stage="gad") if out_dir.is_dir() else None
+    from extension_config import active
+    required = active(cfg,'rubric','gad') or active(cfg,'replay','gad')
+    pinned=read_json(run_dir/'runtime/gad_handoff_identity.json',default=None)
+    if pinned and pinned!=handoff_identity(cfg,run_dir):
+        raise PipelineError('GAD resume Warmup handoff content changed; use a new run')
+    recorded=recorded_handoff(run_dir,cfg)
+    checkpoints=checkpoint_dirs(out_dir)
+    if resume_requested and recorded and checkpoints and checkpoints[-1][0]==recorded['step']:
+        initial=out_dir/f'global_step_{recorded["step"]}'
+        # Extension state wins over a stale initialization marker: this is already GAD.
+        extension_state = (initial/'training_extensions').exists() or (initial/'checkpoint_complete.json').exists()
+        if required and extension_state:
+            problems = verify_checkpoint_dir(initial, roles=('actor','critic'), extensions_required=True)
+            if problems:
+                raise PipelineError('incomplete GAD extension checkpoint: ' + str(problems))
+        elif required:
+            marker = read_json(initial/'handoff_initialization.json', default=None)
+            source = read_json(run_dir/'handoff_manifest.json', default={}).get('source_checkpoint')
+            if (not isinstance(marker,dict) or not source or marker.get('source') != source
+                    or marker.get('step') != recorded['step'] or marker.get('same_stage_resume') is not False):
+                raise PipelineError('GAD initial handoff marker missing or inconsistent with recorded source/step')
+        # Copied Warmup optimizer files are not GAD optimizer state.
+        if not (required and extension_state) and not verify_checkpoint_dir(initial,roles=('actor','critic')):
+            decision.update(mode='handoff',from_step=recorded['step'],handoff=recorded,
+                total_steps=recorded['step']+added_steps,reason='reusing initial Warmup handoff with fresh GAD optimizers')
+            return decision
+    existing = last_complete_checkpoint(out_dir, stage="gad", extensions_required=required) if out_dir.is_dir() else None
+    if required and existing is None and resume_requested and checkpoint_dirs(out_dir):
+        latest=checkpoint_dirs(out_dir)[-1][1]
+        # The first Warmup handoff intentionally has fresh optimizers and no extension state.
+        raise PipelineError('no complete extension checkpoint for GAD resume: '+str(
+            verify_checkpoint_dir(latest,roles=('actor','critic'),extensions_required=True)))
     if not resume_requested:
         if existing is not None:
             # Do not let the handoff fail with "refusing to overwrite": say what
@@ -695,6 +761,12 @@ def resolve_gad_resume(cfg: Config, run_dir: Path, *, added_steps: int,
         return decision
 
     step, path = existing
+    history=read_json(run_dir/'stage_gad.json',default={})
+    previous_identity=history.get('plan',{}).get('warmup_handoff')
+    if not history and not pinned:
+        raise PipelineError('GAD resume handoff provenance missing; explicitly reverify legacy provenance or use a new run')
+    if history and (not previous_identity or previous_identity!=handoff_identity(cfg,run_dir)):
+        raise PipelineError('GAD resume handoff provenance missing/changed; preserve this run and use a new run or explicitly reverify legacy provenance')
     handoff = recorded_handoff(run_dir, cfg)
     if handoff is None:
         raise PipelineError(
@@ -725,7 +797,7 @@ def resolve_gad_resume(cfg: Config, run_dir: Path, *, added_steps: int,
 # --------------------------------------------------------------------------- #
 # signatures and manifests
 # --------------------------------------------------------------------------- #
-def _stage_signature(cfg: Config, stage: str, *, legacy: bool) -> dict:
+def _stage_signature(cfg: Config, stage: str, *, legacy: bool, handoff_identity: dict | None = None) -> dict:
     """Build a stage training identity; legacy reproduces pre-performance markers."""
     # Completion identity tracks training inputs. Validation cadence and relocatable
     # paths are recorded elsewhere, so they cannot trigger a second training run.
@@ -738,8 +810,13 @@ def _stage_signature(cfg: Config, stage: str, *, legacy: bool) -> dict:
                 "run.resume_worker_state",
                 "data.val_batch_size", "data.teacher_index", "data.manifest",
                 "backends.source_repo", "backends.root", "validation.scorer_path"}
-    excluded.add("run.max_stage_steps")
-    from extension_config import EXTENSION_DEFAULTS, extension_enabled
+    excluded.update({"run.max_stage_steps", "run.wandb_mode"})
+    excluded.update(key for key in ('models.actor_param_offload','models.actor_optimizer_offload',
+        'models.critic_param_offload','models.critic_optimizer_offload',
+        'models.actor_gradient_checkpointing','models.critic_gradient_checkpointing') if cfg.get(key) is None)
+    from extension_config import EXTENSION_DEFAULTS, extension_enabled, ACTOR_REWARD_DEFAULTS, legacy_reward_defaults
+    if legacy_reward_defaults(cfg):
+        excluded.update(ACTOR_REWARD_DEFAULTS)
     if not extension_enabled(cfg):
         excluded.update(key for key, default in EXTENSION_DEFAULTS.items() if cfg.get(key) == default)
         excluded.update(key for key in cfg.data if key.startswith(("rubric.", "replay.", "resources.judge_")))
@@ -770,13 +847,13 @@ def _stage_signature(cfg: Config, stage: str, *, legacy: bool) -> dict:
     if stage in ("warmup", "gad"):
         payload["discriminator_init"] = cfg.get("models.discriminator_init")
     if stage == "gad":
-        payload["warmup_manifest"] = None  # filled in by the caller once the handoff exists
+        payload["warmup_manifest"] = handoff_identity
     return {"signature": sha256_text(json.dumps(payload, sort_keys=True, default=str)), "payload": payload}
 
 
-def stage_signature(cfg: Config, stage: str) -> dict:
+def stage_signature(cfg: Config, stage: str, *, handoff_identity: dict | None = None) -> dict:
     """Inputs that must match before a completed stage may be skipped."""
-    return _stage_signature(cfg, stage, legacy=False)
+    return _stage_signature(cfg, stage, legacy=False, handoff_identity=handoff_identity)
 
 
 def legacy_stage_signature(cfg: Config, stage: str) -> dict:
@@ -838,14 +915,36 @@ def data_provenance(cfg: Config) -> dict:
     return provenance
 
 
-def stage_inputs_digest(cfg: Config, stage: str) -> dict:
+def handoff_identity(cfg: Config, run_dir: Path) -> dict | None:
+    """Bind GAD completion to its actual Warmup source at the completion/resume boundary."""
+    path=run_dir/'handoff_manifest.json'
+    if not path.is_file():return None
+    manifest=read_json(path)
+    identity={'manifest_sha256':sha256_file(path), 'step':int(manifest['step']),
+              'warmup_source_step':int(Path(manifest.get('source_checkpoint','global_step_'+str(manifest['step']))).name.split('_')[-1])}
+    for role in ('actor','critic'):
+        directory=Path(manifest[role+'_hf'])
+        if not directory.is_dir():raise PipelineError(f'GAD handoff {role} content is missing: {directory}')
+        files=[p for p in sorted(directory.iterdir()) if p.is_file() and
+               (p.suffix in ('.json','.safetensors','.bin','.jinja') or p.name in ('tokenizer.model','merges.txt','vocab.txt'))]
+        if not files:raise PipelineError(f'GAD handoff {role} content is missing: {directory}')
+        identity[role+'_content']={p.name:sha256_file(p) for p in files}
+    return identity
+
+
+def stage_inputs_digest(cfg: Config, stage: str, run_dir: Path | None = None) -> dict:
     cfg = cfg.for_stage(stage)
     digest = {
         "train_file_sha256": sha256_file(Path(str(cfg.require("data.train_file")))),
         "val_file_sha256": sha256_file(Path(str(cfg.require("data.val_file")))),
         "train_rows": dataset_rows(cfg.require("data.train_file")),
     }
-    digest["config_signature"] = stage_signature(cfg, stage)["signature"]
+    handoff=None
+    if stage=='gad':
+        run_dir=run_dir or Path(cfg.require('run.output_root'))/str(cfg.require('run.run_id'))
+        handoff=handoff_identity(cfg,run_dir)
+        digest['warmup_handoff']=handoff
+    digest["config_signature"] = stage_signature(cfg, stage, handoff_identity=handoff)["signature"]
     return digest
 
 
@@ -894,11 +993,14 @@ def recover_completed_stage(cfg: Config, run_dir: Path, stage: str) -> tuple[boo
             frozen._recovery_code_hash = manifest["extension_code_hash"]
         current = plan_stage(frozen, run_dir, stage, steps_per_epoch_value=steps_per_epoch(cfg),
             handoff=recorded_handoff(run_dir, cfg) if stage == "gad" else None, install_guard=False)
+        if stage=='gad' and (not previous.get('warmup_handoff') or previous['warmup_handoff']!=current['warmup_handoff']):
+            return False,'historical GAD handoff identity missing/changed; explicit legacy provenance verification required'
     except (PipelineError, RuntimeError, OSError, ValueError, KeyError) as exc:
         return False, f"historical backend/handoff cannot be verified: {exc}"
     def training_args(argv):
         diagnostic = ('trainer.resume_load_worker_state=', 'trainer.validation_rouge_l_enabled=',
-            'trainer.val_before_train=', 'trainer.test_freq=', 'data.val_files=', 'data.val_batch_size=')
+            'trainer.val_before_train=', 'trainer.test_freq=', 'data.val_files=', 'data.val_batch_size=',
+            'trainer.logger=', 'trainer.project_name=', 'trainer.experiment_name=')
         return [a for a in argv if not a.startswith(diagnostic)]
     if training_args(previous["argv"]) != training_args(current["argv"]):
         return False, "historical launch training identity does not match current plan"
@@ -911,7 +1013,8 @@ def recover_completed_stage(cfg: Config, run_dir: Path, stage: str) -> tuple[boo
         expected_step=current["total_steps"], math_metrics_expected=validation_metrics_expected(cfg)[0],
         require_final_full=bool(cfg.get('validation.final_full')),
         full_count=dataset_rows(cfg.require('data.val_file')) * int(cfg.get('rollout.val_n') or 1),
-        strict_evaluation=bool(cfg.get('validation.block_training_on_incomplete')))
+        strict_evaluation=bool(cfg.get('validation.block_training_on_incomplete')),
+        extensions_required=bool(current.get('rubric_enabled') or current.get('replay_enabled')))
     if not verification["handoff_ready"]:
         return False, "historical training/checkpoint is incomplete: " + str(verification["problems"])
     return True, (f"historical exit=0 and checkpoint {verification['last_step']} reverified; "
@@ -924,8 +1027,12 @@ def check_skip(cfg: Config, run_dir: Path, stage: str) -> tuple[bool, str]:
     if not marker.exists():
         return recover_completed_stage(cfg,run_dir,stage)
     recorded = json.loads(marker.read_text(encoding="utf-8"))
-    expected = stage_inputs_digest(cfg, stage)
+    expected = stage_inputs_digest(cfg, stage, run_dir)
     recorded_inputs = recorded.get("inputs")
+    if stage=='gad' and (not expected.get('warmup_handoff') or not isinstance(recorded_inputs,dict) or
+                        recorded_inputs.get('warmup_handoff') != expected['warmup_handoff']):
+        raise PipelineError('GAD completion Warmup handoff identity missing/changed; existing results are preserved. '
+                            'Use a new run, or explicitly reverify legacy provenance before resume.')
     if recorded_inputs != expected:
         same_data = isinstance(recorded_inputs, dict) and all(
             recorded_inputs.get(key) == expected[key]
@@ -939,12 +1046,16 @@ def check_skip(cfg: Config, run_dir: Path, stage: str) -> tuple[bool, str]:
         return False, "recorded training process did not exit successfully"
     if not recorded.get("verified", {}).get("ok"):
         return False, "the recorded completion was not verified"
+    start=expected['warmup_handoff']['step'] if stage=='gad' else 0
+    target=start+stage_step_budget(cfg,stage,steps_per_epoch(cfg),handoff_step=start)
+    from extension_config import active
     verified=verify_stage_artifacts(stage,stage_out_dir(cfg,run_dir,stage),
-        expected_step=int(recorded.get('total_steps') or recorded.get('verified',{}).get('last_step') or stage_step_budget(cfg,stage,steps_per_epoch(cfg),handoff_step=recorded_handoff(run_dir,cfg)['step'] if stage=='gad' and recorded_handoff(run_dir,cfg) else 0)),
+        expected_step=target,
         math_metrics_expected=validation_metrics_expected(cfg)[0],
         require_final_full=bool(cfg.get('validation.final_full')),
         full_count=dataset_rows(cfg.require('data.val_file')) * int(cfg.get('rollout.val_n') or 1),
-        strict_evaluation=bool(cfg.get('validation.block_training_on_incomplete')))
+        strict_evaluation=bool(cfg.get('validation.block_training_on_incomplete')),
+        extensions_required=active(cfg,'rubric',stage) or active(cfg,'replay',stage))
     if not verified['handoff_ready']:return False,'current checkpoint/evaluation policy no longer permits handoff: '+str(verified['problems'])
     return True, f"training already completed at step {verified['last_step']}; evaluation={verified['evaluation_status']}"
 
@@ -971,7 +1082,7 @@ def write_completion(cfg: Config, run_dir: Path, stage: str, plan: dict, verific
             "finished_at": finished,
             "returncode": returncode,
             "verified": verification,
-            "inputs": stage_inputs_digest(cfg, stage),
+            "inputs": stage_inputs_digest(cfg, stage, run_dir),
         },
     )
 
@@ -1105,6 +1216,11 @@ def run_stage(cfg: Config, run_dir: Path, stage: str, *, dry_run: bool,
         )
 
     verify_backend_import(cfg, run_dir, stage, plan)
+    if stage=='gad':
+        pinned=run_dir/'runtime/gad_handoff_identity.json'
+        identity=plan['warmup_handoff']
+        if pinned.is_file() and read_json(pinned)!=identity:raise PipelineError('GAD handoff identity changed; existing results preserved')
+        if not pinned.exists():write_json(pinned,identity)
     if cfg.get("backends.profile") == "gad_extensions_v1":
         (Path(plan["backend"]) / ".gad_backend_used").touch()
 
@@ -1182,6 +1298,7 @@ def finish_stage(cfg: Config, run_dir: Path, stage: str, plan: dict, *, process,
         require_final_full=bool(cfg.get("validation.final_full")),
         strict_evaluation=bool(cfg.get("validation.block_training_on_incomplete")),
         full_count=dataset_rows(cfg.require("data.val_file")) * int(cfg.get('rollout.val_n') or 1) if cfg.get("validation.final_full") else None,
+        extensions_required=bool(plan.get('rubric_enabled') or plan.get('replay_enabled')),
     )
     returncode = 0 if trainer_skipped else process.returncode
     if not trainer_skipped and process.returncode != 0:
@@ -1267,6 +1384,10 @@ def print_plan(cfg: Config, run_dir: Path, plans: list[dict], *, steps_per_epoch
     print(f"val data      : {cfg.get('data.val_file')}")
     print(f"train rows    : {dataset_rows(cfg.require('data.train_file'))} "
           f"(steps/epoch={steps_per_epoch_value}, batch={cfg.get('data.train_batch_size')})")
+    print(f"drop_last tail: {dataset_rows(cfg.require('data.train_file')) % int(cfg.get('data.train_batch_size'))} rows/epoch")
+    print('offload effective: '+json.dumps({role:{key:role_model_option(cfg,role,key)
+        for key in ('param_offload','optimizer_offload','gradient_checkpointing')} for role in ('actor','critic')})+
+        f"; reference param_offload={bool(cfg.get('models.ref_param_offload'))}")
     print(f"lengths       : prompt={cfg.get('data.max_prompt_length')} "
           f"response={cfg.get('data.max_response_length')}")
     print(f"rollout       : n={cfg.get('rollout.n')} temperature={cfg.get('rollout.temperature')} "
@@ -1285,6 +1406,10 @@ def print_plan(cfg: Config, run_dir: Path, plans: list[dict], *, steps_per_epoch
         print("-" * 78)
         print(f"stage {plan['stage']}")
         print(f"  extensions   : rubric={plan.get('rubric_enabled', False)} replay={plan.get('replay_enabled', False)}")
+        if plan.get('rubric_enabled'):
+            print(f"  actor reward : {plan['actor_reward']}")
+        if plan['stage'] == 'gad' and cfg.get('budget.init_from_warmup_run'):
+            print(f"  warmup source: {cfg.get('budget.init_from_warmup_run')}/warmup/global_step_{plan['start_step']}")
         print(f"  backend      : {plan['backend']} @ {plan['backend_commit'][:10]}")
         print(f"  output       : {plan['out_dir']}")
         print(f"  model path   : {plan['model_path']}")
@@ -1301,6 +1426,13 @@ def print_plan(cfg: Config, run_dir: Path, plans: list[dict], *, steps_per_epoch
                   f"({resume.get('reason')})")
         print(f"  math metric  : {plan['env'].get('GAD_MATH_SCORER') or 'DISABLED'}")
         print(f"  log          : {plan['log']}")
+        first=max(plan['start_step']+1,0 if plan['stage']=='gad' else int(cfg.get('optim.critic_warmup')))
+        actor_calls=max(0,plan['total_steps']-first+1)
+        added=plan['added_steps'];batch=int(cfg.get('data.train_batch_size'));n=stage_rollout_n(cfg,plan['stage'])
+        saves=sum(s%int(cfg.get('resources.save_freq'))==0 or s==plan['total_steps'] for s in range(plan['start_step']+1,plan['total_steps']+1)) if cfg.get('resources.save_freq') else 1
+        tests=sum(s%int(cfg.get('resources.test_freq'))==0 or (s==plan['total_steps'] and cfg.get('validation.final_full')) for s in range(plan['start_step']+1,plan['total_steps']+1)) if cfg.get('resources.test_freq') else 0
+        print(f"  planned calls: actor={actor_calls}, critic={0 if plan['stage']=='seqkd' else added}; "
+              f"prompts={batch*added}, online student responses={0 if plan['stage']=='seqkd' else batch*n*added}; saves={saves}, validations={tests}")
         print(f"  PYTHONPATH   : {plan['env']['PYTHONPATH']}")
         print("  command:")
         print("    " + " \\\n      ".join(plan["argv"]))

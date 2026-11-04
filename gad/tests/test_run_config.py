@@ -17,6 +17,24 @@ from prune_checkpoints import apply_retention, plan_retention
 
 
 class RunConfigTests(unittest.TestCase):
+    def test_frozen_scorer_paths_can_point_to_another_checkout(self):
+        scorer = str(self.root / 'other_checkout/scoring/math.py')
+        saved = self.root / 'frozen.yaml'
+        data = {'scoring.math.version': 'math_unified_v1',
+                'scoring.math.entrypoint': scorer,
+                'scoring.math.fingerprint': 'frozen-training-fingerprint',
+                'validation.scorer_path': scorer}
+        saved.write_text(yaml.safe_dump(data))
+        before = saved.read_bytes()
+        cfg = load_config(saved)
+        self.assertEqual(cfg.get('validation.scorer_path'), scorer)
+        self.assertEqual(cfg.get('scoring.math.fingerprint'), 'frozen-training-fingerprint')
+        self.assertEqual(saved.read_bytes(), before)
+        data['validation.scorer_path'] = str(self.root / 'different.py')
+        saved.write_text(yaml.safe_dump(data))
+        with self.assertRaisesRegex(PipelineError, 'scorer_path conflicts'):
+            load_config(saved)
+
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)

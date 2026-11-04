@@ -23,10 +23,19 @@ EXTENSION_DEFAULTS = {
     "rubric.loss_mode": "legacy_active", "rubric.count_gate_tau": 4,
     "rubric.gradient_diagnostics_interval": 0, "rubric.gradient_diagnostics_max_pairs": 4,
     "rubric.semantic_check": False, "rubric.semantic_max_extra_requests": 1,
+    'rubric.process_protocol':'events_v27',
+    'rubric.review_policy':'legacy', 'rubric.review_seed':42,
+    'rubric.process_sampling.max_unique_per_global_minibatch':None,
+    'rubric.process_sampling.seed':42,
+    'rubric.judge.budget_state_path':None,
     "rubric.judge.request_budget": None,
     "rubric.loss_coef": .1, "rubric.spec": str(ROOT / "rubric/specs/math_v1.yaml"),
     "rubric.prompt": str(ROOT / "rubric/prompts/judge_math_v1.txt"),
     "rubric.head_layout": list(LAYOUT), "rubric.reward_source": "adv_only",
+    "rubric.actor_reward_coef": 0.,
+    "rubric.actor_reward_weights.answer_correctness": 1.,
+    "rubric.actor_reward_weights.verified_progress": 1.,
+    "rubric.actor_reward_weights.unresolved_error_severity": 1.,
     "rubric.label_source": "online", "rubric.label_scope": "selected_critic_batch",
     "rubric.teacher_cache": True, "rubric.student_cache": True,
     "rubric.truncated_process_policy": "mask", "rubric.on_annotation_error": "mask",
@@ -41,6 +50,7 @@ EXTENSION_DEFAULTS = {
     "rubric.judge.max_context_tokens": 16384, "rubric.judge.structured_output": "required",
     "rubric.judge.concurrency": 8, "rubric.judge.request_timeout_seconds": 120,
     "rubric.judge.step_timeout_seconds": 600, "rubric.judge.max_retries": 2,
+    'rubric.judge.max_annotation_attempts':2, 'rubric.judge.unknown_submission_policy':'abort',
     "rubric.judge.dtype": "bfloat16", "rubric.judge.tensor_parallel_size": 2,
     "rubric.judge.gpu_memory_utilization": .85, "rubric.judge.cpu_offload_gb": 0.,
     "replay.enabled": False, "replay.stages": ["gad"], "replay.mix_ratio": .25,
@@ -59,6 +69,15 @@ def extension_enabled(cfg):
     return bool(cfg.get("rubric.enabled") or cfg.get("replay.enabled"))
 
 
+ACTOR_REWARD_DEFAULTS = {key: value for key, value in EXTENSION_DEFAULTS.items()
+                         if key.startswith('rubric.actor_reward_')}
+
+
+def legacy_reward_defaults(cfg):
+    return cfg.get('rubric.reward_source') == 'adv_only' and all(
+        cfg.get(key, default) == default for key, default in ACTOR_REWARD_DEFAULTS.items())
+
+
 def validate(cfg):
     problems = []
     if cfg.get("backends.profile") not in ("original", "gad_extensions_v1"):
@@ -71,8 +90,22 @@ def validate(cfg):
             problems.append("rubric.stages supports [warmup,gad] or [gad]; warmup-only cannot discard auxiliary heads")
         if cfg.get("rubric.mode") not in ("joint", "correctness_only"):
             problems.append("rubric.mode must be joint or correctness_only")
-        if cfg.get("rubric.head_layout") != list(layout_for(cfg.get('rubric.version'))) or cfg.get("rubric.reward_source") != "adv_only":
-            problems.append("rubric requires fixed four-channel layout and adv_only reward")
+        if cfg.get("rubric.head_layout") != list(layout_for(cfg.get('rubric.version'))):
+            problems.append("rubric requires fixed four-channel layout")
+        import math
+        source = cfg.get('rubric.reward_source')
+        coef = cfg.get('rubric.actor_reward_coef')
+        weights = [cfg.get('rubric.actor_reward_weights.' + d) for d in layout_for('math_process_v2')[1:]]
+        if source not in ('adv_only', 'adv_plus_rubric'):
+            problems.append('unsupported rubric.reward_source')
+        for name, value in [('actor_reward_coef', coef), *zip(('actor_reward_weights.' + d for d in layout_for('math_process_v2')[1:]), weights)]:
+            if type(value) not in (int, float) or not math.isfinite(value) or value < 0:
+                problems.append('rubric.' + name + ' must be finite and nonnegative')
+        if source == 'adv_plus_rubric':
+            if cfg.get('rubric.version') != 'math_process_v2' or cfg.get('rubric.mode') != 'joint' or cfg.get('rubric.process_protocol') != 'direct_v1':
+                problems.append('adv_plus_rubric requires math_process_v2 + joint + direct_v1')
+            if type(coef) in (int, float) and coef > 0 and not any(type(w) in (int, float) and math.isfinite(w) and w > 0 for w in weights):
+                problems.append('positive actor_reward_coef requires at least one positive weight')
         for key, expected in {"label_source": "online", "label_scope": "selected_critic_batch",
                               "truncated_process_policy": 'visible_prefix' if cfg.get('rubric.version') == 'math_process_v2' else 'mask', "on_annotation_error": "mask",
                               "on_service_unavailable": "abort_step"}.items():
@@ -93,11 +126,49 @@ def validate(cfg):
             problems.append('semantic_check must be boolean; at most one extra request per trajectory')
         if cfg.get('rubric.semantic_check') and (cfg.get('rubric.version') != 'math_process_v2' or cfg.get('rubric.mode') != 'joint'):
             problems.append('semantic_check requires math_process_v2 joint mode')
+        if cfg.get('rubric.review_policy') not in ('legacy','selective_v1'):
+            problems.append('unsupported rubric.review_policy')
+        if type(cfg.get('rubric.review_seed')) is not int or type(cfg.get('rubric.process_sampling.seed')) is not int:
+            problems.append('review/process sampling seeds must be integers')
+        process_budget=cfg.get('rubric.process_sampling.max_unique_per_global_minibatch')
+        if process_budget is not None and (type(process_budget) is not int or process_budget<2 or cfg.get('rubric.mode')!='joint'):
+            problems.append('process sampling budget must be null or an integer >=2 in joint mode')
         request_budget = cfg.get('rubric.judge.request_budget')
         if request_budget is not None and (type(request_budget) is not int or request_budget < 1):
             problems.append('judge request_budget must be null or a positive integer')
         if cfg.get("rubric.loss_coef") < 0:
             problems.append("rubric.loss_coef must be nonnegative")
+        import yaml
+        try:
+            spec = yaml.safe_load(Path(cfg.require('rubric.spec')).read_text())
+            if not isinstance(spec,dict):
+                problems.append('rubric spec must be a YAML mapping')
+            elif spec.get('version') != cfg.get('rubric.version'):
+                problems.append('rubric spec.version differs from rubric.version')
+        except (OSError,ValueError,yaml.YAMLError) as exc:
+            spec = None
+            problems.append(f'rubric spec unreadable: {exc}')
+        process_protocol=cfg.get('rubric.process_protocol')
+        if process_protocol not in ('events_v27','direct_v1'):problems.append('unsupported rubric.process_protocol')
+        if process_protocol=='direct_v1' and (cfg.get('rubric.semantic_check') or cfg.get('replay.enabled') or cfg.get('rubric.version')!='math_process_v2'):
+            problems.append('direct_v1 requires math_process_v2, no semantic review and no replay')
+        if cfg.get('rubric.version') == 'math_process_v2':
+            from rubric.core.contracts import V2_SCHEMA_VERSION, V2_INPUT_VERSION
+            if process_protocol=='direct_v1':
+                from rubric.core.process_direct import SCHEMA_VERSION as V2_SCHEMA_VERSION, INPUT_VERSION as V2_INPUT_VERSION
+            try:
+                expected={'version':'math_process_v2','schema_version':V2_SCHEMA_VERSION,'input_protocol':V2_INPUT_VERSION}
+                if not isinstance(spec,dict) or any(spec.get(k)!=v for k,v in expected.items()):
+                    problems.append('rubric protocol mismatch in spec; use current v27 spec/prompt for a new run')
+                prompt=Path(cfg.require('rubric.prompt')).read_text()
+                # Historical prompts may omit a declaration; any explicit version must match.
+                import re
+                declarations=re.findall(r'rubric\.(?:events|input)\.v[\d.]+',prompt)
+                if process_protocol=='direct_v1' and isinstance(spec,dict) and spec.get('process_protocol')!='direct_v1':problems.append('direct spec must declare process_protocol=direct_v1')
+                if any(v not in (V2_SCHEMA_VERSION,V2_INPUT_VERSION) for v in declarations):
+                    problems.append('rubric prompt protocol declaration mismatch; use current v27 prompt')
+            except (OSError,ValueError,yaml.YAMLError) as exc:
+                problems.append(f'rubric protocol files unreadable: {exc}')
         limit = cfg.get('rubric.max_empty_student_process_steps')
         if type(limit) is not int or limit < 1:
             problems.append('rubric.max_empty_student_process_steps must be a positive integer')
@@ -138,6 +209,10 @@ def validate(cfg):
                     problems.append("rubric.judge." + key + " must be positive")
             if cfg.get('rubric.judge.max_output_tokens') >= cfg.get('rubric.judge.max_context_tokens'):
                 problems.append('judge reserved output must be smaller than total context')
+            if type(cfg.get('rubric.judge.max_annotation_attempts')) is not int or cfg.get('rubric.judge.max_annotation_attempts')<1:
+                problems.append('judge max_annotation_attempts must be positive')
+            if cfg.get('rubric.judge.unknown_submission_policy') not in ('abort','retry'):
+                problems.append('judge unknown_submission_policy must be abort or explicit retry (remote duplicate cost)')
             if cfg.get('rubric.version') == 'math_process_v2' and (type(cfg.get('rubric.judge.max_retries')) is not int or cfg.get('rubric.judge.max_retries') not in (0, 1)):
                 problems.append('V2.1 permits at most one transport retry and no format retry')
     if cfg.get("replay.enabled"):
@@ -184,7 +259,7 @@ def validate(cfg):
         if type(cfg.get("budget.gad_new_steps")) is not int or cfg.get("budget.gad_new_steps") < 1:
             problems.append("budget.gad_new_steps must be a positive integer")
     if cfg.get("run.max_stage_steps") is not None:
-        if not extension_enabled(cfg) or not cfg.get("run.engineering_smoke") or type(cfg.get("run.max_stage_steps")) is not int or cfg.get("run.max_stage_steps") < 1:
+        if cfg.get('backends.profile')!='gad_extensions_v1' or not cfg.get("run.engineering_smoke") or type(cfg.get("run.max_stage_steps")) is not int or cfg.get("run.max_stage_steps") < 1:
             problems.append("run.max_stage_steps requires a positive engineering extension invocation limit")
     if bool(cfg.get("budget.init_from_warmup_run")) != bool(cfg.get("budget.init_step")):
         problems.append("--init-from-warmup-run and explicit --init-step are required together")
@@ -217,17 +292,19 @@ def service_identity(cfg, full=False):
                 "enable_thinking": options['enable_thinking'], "reasoning_parser": options['reasoning_parser'],
                 "engine": "v0", "server_sha256": file_hash(ROOT / 'gad/tools/rubric_judge_server.py'),
                 "client_sha256": file_hash(ROOT / 'gad/extensions/judge_client.py'),
-                "schema": digest(schema_for(cfg.get('rubric.version'))),
+                "schema": digest(schema_for(cfg.get('rubric.version'),cfg.get('rubric.process_protocol'))),
                 'rubric_version': cfg.get('rubric.version'),
                 "TP": options["tensor_parallel_size"], "context": options["max_context_tokens"],
                 "decoding": "guided_json", "guided_backend_request": guidance_backend(cfg.get('rubric.version')),
                 "guidance_revision": "v0_xgrammar_string_length_hint_projection_v1",
-                "guidance_schema_hash": digest(guidance_schema(cfg.get('rubric.version'))),
+                "guidance_schema_hash": digest(guidance_schema(cfg.get('rubric.version'),process_protocol=cfg.get('rubric.process_protocol'))),
                 "cpu_offload_gb": options["cpu_offload_gb"]}
     identity["request_defaults"] = {key: options[key] for key in ("temperature", "top_p", "top_k", "min_p", "max_output_tokens", "max_context_tokens")}
     identity["judge_seed"] = cfg.get("rubric.seed")
     if cfg.get('rubric.version') == 'math_process_v2':
         from rubric.core.process_v2 import protocol_identity
+        if cfg.get('rubric.process_protocol')=='direct_v1':
+            from rubric.core.process_direct import protocol_identity
         identity['semantic_policy'] = {key: cfg.get('rubric.' + key) for key in ('semantic_check', 'semantic_max_extra_requests')}
         identity['semantic_module_hash'] = file_hash(ROOT / 'rubric/core/semantic_v24.py')
         identity['protocol_identity'] = protocol_identity(Path(cfg.require('rubric.spec')).read_text(), Path(cfg.require('rubric.prompt')).read_text())
@@ -253,6 +330,10 @@ def hydra_overrides(cfg, stage, out_dir, start_step):
     if cfg.get("backends.profile") != "gad_extensions_v1" or stage == "seqkd":
         return []
     declared = {key: value for key, value in cfg.data.items() if key.startswith(("rubric.", "replay."))}
+    if legacy_reward_defaults(cfg):
+        # New no-op defaults must not invalidate pre-existing adv-only identities.
+        for key in ACTOR_REWARD_DEFAULTS:
+            declared.pop(key, None)
     worker = {"enabled": rubric}
     driver = {"enabled": rubric}
     if rubric:
@@ -260,13 +341,33 @@ def hydra_overrides(cfg, stage, out_dir, start_step):
         driver["enabled"] = True
         judge = {key[6:]: driver.pop(key) for key in list(driver) if key.startswith("judge.")}
         driver["judge"] = judge
+        driver['process_sampling']={key[17:]:driver.pop(key) for key in list(driver) if key.startswith('process_sampling.')}
+        driver['actor_reward_weights'] = {key[21:]: driver.pop(key) for key in list(driver) if key.startswith('actor_reward_weights.')}
+        # The existing Warmup Teacher-SFT path never consumes a mixed reward.
+        if stage != 'gad':
+            driver['reward_source'], driver['actor_reward_coef'] = 'adv_only', 0.
         driver["scorer_path"] = cfg.require("validation.scorer_path")
         driver["spec_hash"] = file_hash(driver["spec"])
+        driver['prompt_hash'] = file_hash(driver['prompt'])
+        if driver['version']=='math_process_v2':
+            from rubric.core.process_v2 import protocol_identity
+            if cfg.get('rubric.process_protocol')=='direct_v1':
+                from rubric.core.process_direct import protocol_identity
+            driver['protocol_identity']=protocol_identity(Path(driver['spec']).read_text(),Path(driver['prompt']).read_text())
+            driver['protocol_identity']['semantic_policy']={k:driver[k] for k in ('semantic_check','semantic_max_extra_requests')}
+            driver['protocol_identity']['semantic_module_hash']=file_hash(ROOT/'rubric/core/semantic_v24.py')
         driver["judge_fingerprint"] = digest(service_identity(cfg)) if cfg.get("rubric.mode") == "joint" else "rule_only"
         driver['scoring_math'] = {key[13:]: value for key, value in cfg.data.items() if key.startswith('scoring.math.')}
         worker = {"enabled": True, 'gradient_diagnostics_dir':str(Path(out_dir)/'gradient_diagnostics'), "mode": driver["mode"], "loss_coef": driver["loss_coef"],
-                  **{key: driver[key] for key in ('loss_mode', 'count_gate_tau', 'gradient_diagnostics_interval', 'gradient_diagnostics_max_pairs')},
+                  **{key: driver[key] for key in ('loss_mode', 'count_gate_tau', 'gradient_diagnostics_interval', 'gradient_diagnostics_max_pairs',
+                                                 'reward_source', 'actor_reward_coef', 'actor_reward_weights')},
                   'version': driver['version'], "head_layout": list(layout_for(driver['version'])), "spec_hash": driver["spec_hash"]}
+        if legacy_reward_defaults(cfg):
+            # Used historical backends have no new reward keys in their Hydra schema.
+            for key in ('actor_reward_coef', 'actor_reward_weights'):
+                driver.pop(key, None)
+                worker.pop(key, None)
+            worker.pop('reward_source', None)
     replay_config = {key[7:]: value for key, value in cfg.data.items() if key.startswith("replay.")}
     replay_config["enabled"] = replay
     token_files = {p.name: file_hash(p) for p in Path(cfg.require("models.student")).iterdir()

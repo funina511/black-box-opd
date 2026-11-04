@@ -1,0 +1,74 @@
+run:
+  seed: 42
+rollout:
+  seed: 42
+budget:
+  stage_epochs:
+    seqkd: 2
+    warmup: 1
+    gad: 2
+models:
+  discriminator_init: ../../assets/initialization/qwen3_0.6b_math_v2_adv_seed42
+scoring:
+  math:
+    version: math_unified_v1
+    entrypoint: ../../scoring/math.py
+    timeout_seconds: 2.0
+rubric:
+  count_gate_tau: 4
+  enabled: false
+  gradient_diagnostics_interval: 0
+  gradient_diagnostics_max_pairs: 4
+  head_layout:
+  - adv
+  - answer_correctness
+  - verified_progress
+  - unresolved_error_severity
+  label_scope: selected_critic_batch
+  label_source: online
+  loss_coef: 0.1
+  loss_mode: fixed_dimension_gated
+  max_empty_student_process_steps: 3
+  mode: joint
+  on_annotation_error: mask
+  on_service_unavailable: abort_step
+  prompt: ../../rubric/prompts/judge_math_process_v27.txt
+  reward_source: adv_only
+  seed: 42
+  semantic_check: false
+  semantic_max_extra_requests: 1
+  spec: ../../rubric/specs/math_process_v27.yaml
+  stages:
+  - warmup
+  - gad
+  student_cache: true
+  teacher_cache: true
+  truncated_process_policy: visible_prefix
+  version: math_process_v2
+  judge:
+    api_key_env: null
+    backend: openai_compatible
+    base_url: http://127.0.0.1:8031/v1
+    concurrency: 2
+    cpu_offload_gb: 0
+    dtype: bfloat16
+    enable_thinking: true
+    gpu_memory_utilization: 0.85
+    max_context_tokens: 32768
+    max_output_tokens: 8192
+    max_retries: 0
+    min_p: 0.0
+    model: Qwen3-8B
+    model_revision: local-sha256
+    reasoning_parser: deepseek_r1
+    request_budget: null
+    request_timeout_seconds: 300
+    step_timeout_seconds: 14400
+    structured_output: required
+    temperature: 0.6
+    tensor_parallel_size: 2
+    tokenizer_path: ../../assets/models/Qwen3-8B
+    top_k: 20
+    top_p: 0.95
+replay:
+  enabled: false

@@ -51,6 +51,7 @@ class MockTeacherHandler(BaseHTTPRequestHandler):
     def do_POST(self):  # noqa: N802 - http.server API
         length = int(self.headers.get("Content-Length", 0))
         payload = json.loads(self.rfile.read(length) or b"{}")
+        self.server.requests.append((payload, self.headers.get("Authorization")))
         messages = payload.get("messages") or []
         text = "\n".join(str(m.get("content", "")) for m in messages)
         n = int(payload.get("n") or 1)
@@ -93,6 +94,7 @@ class MockTeacherHandler(BaseHTTPRequestHandler):
 class MockTeacher:
     def __enter__(self):
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), MockTeacherHandler)
+        self.server.requests = []
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
         # Build the URL from the *bound port* rather than the address tuple, which
@@ -184,6 +186,53 @@ class TeacherSamplingTests(unittest.TestCase):
         ]
 
     # ------------------------------------------------------------------ tests
+    def test_deepseek_yaml_sends_non_thinking_request_without_exposing_key(self) -> None:
+        import yaml
+
+        config = yaml.safe_load((SAMPLE_DIR / "configs/sample_deepseek_api.yaml").read_text())
+        config["prompts"]["out_dir"] = str(self.root)
+        config["teacher"].update(
+            base_url=self.teacher.base_url, index_out=str(self.index),
+            log_file=str(self.root / "sample.log"),
+        )
+        config["gad_data"].update(
+            out_train=str(self.root / "gad_train.parquet"),
+            out_val=str(self.root / "gad_dev.parquet"),
+        )
+        config["student"]["tokenizer_path"] = ""
+        config_path = self.root / "api.yaml"
+        config_path.write_text(yaml.safe_dump(config))
+        write_prompts(self.root / "train.parquet", [prompt_row("train", "What is 2+2?")])
+        write_prompts(self.root / "dev.parquet", [prompt_row("dev", "What is 3+4?")])
+        env = dict(os.environ)
+        key = "mock-deepseek-key-not-a-real-secret"
+        env.update(DEEPSEEK_API_KEY=key, NO_PROXY="127.0.0.1,localhost", no_proxy="127.0.0.1,localhost")
+        for name in ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY"):
+            env[name] = ""
+        command = ["bash", str(SAMPLE_DIR / "scripts/run_sample.sh"),
+                   "--config", str(config_path), "--python", sys.executable, "--stage", "sample"]
+
+        dry = subprocess.run([*command, "--dry-run"], capture_output=True, text=True, env=env)
+        self.assertEqual(dry.returncode, 0, dry.stdout + dry.stderr)
+        self.assertNotIn(key, dry.stdout + dry.stderr)
+        self.assertNotIn("--api-key", dry.stdout)
+        self.assertEqual(self.teacher.server.requests, [])
+
+        result = subprocess.run(command, capture_output=True, text=True, env=env)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(len(self.teacher.server.requests), 2)
+        for payload, authorization in self.teacher.server.requests:
+            self.assertEqual(authorization, f"Bearer {key}")
+            self.assertEqual(payload["thinking"], {"type": "disabled"})
+            self.assertEqual(payload["model"], "deepseek-flash")
+            self.assertEqual(payload["max_tokens"], 8192)
+            for unsupported in ("chat_template_kwargs", "seed", "n"):
+                self.assertNotIn(unsupported, payload)
+        self.assertEqual(len(TeacherIndex.load(self.index)), 2)
+        for path in (self.root / "sample.log", self.index,
+                     self.root / "logs/resolved_sample_config.yaml"):
+            self.assertNotIn(key, path.read_text())
+
     def test_happy_path_writes_records_and_resumes_without_resampling(self) -> None:
         result = run_sampler(*self.base_args())
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)

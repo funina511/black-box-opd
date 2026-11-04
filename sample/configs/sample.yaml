@@ -25,6 +25,7 @@ prompts:
   card_full_train: false
   dev_file: ''
 teacher:
+  seed: 42 # New sampling only; historical Teacher seed=None remains unknown.
   base_url: http://127.0.0.1:18080/v1
   api_key_env: GAD_TEACHER_API_KEY
   model: Qwen3-30B-A3B-Instruct-2507
@@ -38,7 +39,7 @@ teacher:
   enable_thinking: false
   index_out: ../../data/dapo_math_17k_gad/teacher_index.jsonl
   engine: vllm_offline
-  model_path: ../../assets/models/teacher
+  model_path: ../../assets/models/Qwen3-30B-A3B-Instruct-2507
   tensor_parallel_size: 4
   max_model_len: 12288
   gpu_memory_utilization: 0.9
@@ -64,8 +65,8 @@ gad_data:
   out_train: ../../data/dapo_math_17k_gad/gad_train.parquet
   out_val: ../../data/dapo_math_17k_gad/gad_dev.parquet
 student:
-  model_path: ../../assets/models/student
-  tokenizer_path: ../../assets/models/student
+  model_path: ../../assets/models/Qwen3-0.6B
+  tokenizer_path: ../../assets/models/Qwen3-0.6B
   enable_thinking: false
 lengths:
   max_prompt_length: 2048

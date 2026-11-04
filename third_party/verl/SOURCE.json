@@ -1,0 +1,19 @@
+{
+  "source": "https://github.com/volcengine/verl",
+  "local_origin": "https://github.com/YTianZHU/verl.git",
+  "refs": {
+    "refs/heads/pinned/seqkd": "c8b3a62f5edd4994e13a15a461cf9527973695bd",
+    "refs/heads/pinned/warmup": "b6e88286c3e16d6f364e698f60c3be608f1a36cc",
+    "refs/heads/pinned/gad": "707757b9202c466d986e529a4658434d0ac6a7ee"
+  },
+  "shallow_boundaries": [
+    "707757b9202c466d986e529a4658434d0ac6a7ee",
+    "b6e88286c3e16d6f364e698f60c3be608f1a36cc",
+    "c8b3a62f5edd4994e13a15a461cf9527973695bd"
+  ],
+  "bundle_sha256": "53f3a43931236737c59f650d634aeb941c60d50436cb3b4ca783e076c4526564",
+  "rebuild": "git clone third_party/verl/verl.bundle gad/verl; never fetch automatically",
+  "clone_command": "git clone --template=third_party/verl/template --branch pinned/gad third_party/verl/verl.bundle gad/verl",
+  "template_sha256": "c5b2908eaf38905feaff0c4d1044f853bf0305d24bad410e21dacdd861c78f17",
+  "history_scope": "Three exact pinned shallow snapshots; full upstream parent history is not present or required for worktree reconstruction."
+}

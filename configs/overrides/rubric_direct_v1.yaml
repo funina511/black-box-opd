@@ -1,0 +1,20 @@
+# Opt-in engineering candidate; label quality is not yet approved for formal joint training.
+rubric:
+  enabled: true
+  version: math_process_v2
+  mode: joint
+  process_protocol: direct_v1
+  semantic_check: false
+  prompt: ../../rubric/prompts/judge_math_process_direct_v1.txt
+  spec: ../../rubric/specs/math_process_direct_v1.yaml
+  process_sampling:
+    max_unique_per_global_minibatch: 16
+    seed: 42
+  judge:
+    enable_thinking: true
+    max_output_tokens: 8192
+    max_retries: 0
+    concurrency: 8
+    request_timeout_seconds: 900
+replay:
+  enabled: false

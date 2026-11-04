@@ -10,7 +10,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from config import compose_config, load_run_config
+from config import add_config_arguments,select_config
 from extension_config import service_identity, ROOT
 from rubric.core.contracts import digest, file_hash
 
@@ -21,13 +21,11 @@ def process_birth(pid):
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--config", default=str(ROOT / "train.yaml"))
-    p.add_argument("--run")
-    p.add_argument("--set", action="append", default=[])
+    add_config_arguments(p)
     p.add_argument("--action", choices=("start", "health", "stop", "logs"), default="health")
     p.add_argument("--dry-run", action="store_true")
     args = p.parse_args()
-    cfg = load_run_config(args.run) if args.run else compose_config(args.config, settings=args.set)
+    cfg = select_config(args)
     options = {key[13:]: value for key, value in cfg.data.items() if key.startswith("rubric.judge.")}
     thinking = options['enable_thinking']
     if type(thinking) is not bool or (thinking and options['reasoning_parser'] != 'deepseek_r1') or (not thinking and options['reasoning_parser'] is not None):

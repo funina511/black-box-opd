@@ -44,6 +44,7 @@ from common import (  # noqa: E402
     git_rev_parse,
     kv_cache_gib,
     log,
+    run_command,
     read_json,
     sha256_text,
     utc_timestamp,
@@ -598,13 +599,19 @@ def check_teacher_pool(cfg: Config, report: Report) -> None:
     for key, split in (("data.train_file", "train"), ("data.val_file", "val")):
         parquet = Path(str(cfg.get(key) or "")).expanduser()
         stats_path = parquet.with_suffix(parquet.suffix + ".stats.json")
-        if not stats_path.exists():
-            continue
         stats = read_json(stats_path, default={}) or {}
+        source_truncated=None
+        if parquet.is_file():
+            import pyarrow.parquet as pq
+            metadata=pq.read_table(parquet,columns=['extra_info']).to_pylist()
+            flags=[r['extra_info'].get('source_truncated') for r in metadata]
+            if all(type(v) is bool for v in flags):source_truncated=sum(flags)
+        if not stats_path.exists():
+            report.warn(f'{split} teacher stats missing: {stats_path}; source_truncated={source_truncated!r} (unknown is not zero)')
         lengths = stats.get("teacher_token_length") or {}
         select = stats.get("select")
-        truncated = int(lengths.get("truncated_before_final_answer") or 0)
-        rate = float(lengths.get("truncated_before_final_answer_rate") or 0.0)
+        truncated = lengths.get("truncated_before_final_answer")
+        rate = lengths.get("truncated_before_final_answer_rate")
         entry[split] = {
             "select": select,
             "rows": stats.get("rows_out"),
@@ -613,15 +620,15 @@ def check_teacher_pool(cfg: Config, report: Report) -> None:
             "truncated_before_final_answer_rate": rate,
             "at_or_over_limit": lengths.get("at_or_over_limit"),
             "max_tokens": lengths.get("max_tokens"),
+            'source_truncated':source_truncated,'stats_missing':not stats_path.exists(),
         }
         if truncated and select not in ("nontruncated", "correct-nontruncated"):
             report.warn(
                 f"{split} pool uses select={select!r} and keeps {truncated} teacher answers that were cut "
                 f"off by the {lengths.get('max_tokens')}-token sampling cap ({rate * 100:.1f}% of "
                 f"{stats.get('rows_out')} rows; they have no final 'Answer:' line). That is a deliberate "
-                "choice, but it weakens both the SFT teacher text and the math scoring for those samples; "
-                "re-run LMOps/sample with gad_data.select='nontruncated'/'correct-nontruncated' (or a larger "
-                "--max-tokens) if that was not intended."
+                "choice: no_answer correctness=0/valid=true means no verifiable final answer within budget; "
+                "process labels remain independent. No filtering or masking is applied automatically."
             )
     report.sections["teacher_pool"] = entry
 
@@ -652,6 +659,7 @@ def main() -> int:
     parser.add_argument("--stage", default=None, help="Also require the inputs for this stage to be ready.")
     parser.add_argument("--allow-no-gpu", action="store_true", help="Downgrade the GPU check to a warning.")
     parser.add_argument("--skip-packages", action="store_true", help="Skip the import checks (fast planning runs).")
+    parser.add_argument("--prepare-backends", action="store_true", help="Prepare the selected pinned backends before checking (no training).")
     parser.add_argument("--sample-rows", type=int, default=2000)
     args = parser.parse_args()
 
@@ -666,6 +674,11 @@ def main() -> int:
     problems += validate_paths(cfg, check_exists=True)
     for problem in problems:
         report.fail(f"config: {problem}")
+
+    if args.prepare_backends and not problems:
+        run_command([str(cfg.require('run.python_bin')), str(Path(__file__).with_name('prepare_backends.py')),
+                     '--repo', str(cfg.require('backends.source_repo')), '--backend-root', str(cfg.require('backends.root')),
+                     '--profile', str(cfg.require('backends.profile')), '--stages', ','.join(stages)], component='backends')
 
     check_output(cfg, report)
     check_backends(cfg, report, stages)

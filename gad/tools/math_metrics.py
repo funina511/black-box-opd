@@ -75,7 +75,14 @@ def score_response(response: str, ground_truth: str, *, scorer_module=None) -> d
                 'error_reason':f'{type(exc).__name__}: {exc}'}
     prediction = result["pred"]
     if result.get("scorer_version") == "math_unified_v1":
-        return {**result, "acc": bool(result["acc"]) if result['acc'] is not None else None,
+        acc = result.get("acc")
+        value = result.get("evaluation_value")
+        if value is None and acc is not None and "evaluation_status" not in result:
+            # Old unified scorer without the evaluation mapping: keep the historical acc mapping.
+            value = int(bool(acc))
+        return {**result, "acc": bool(acc) if acc is not None else None,
+                "evaluation_status": result.get("evaluation_status"),
+                "evaluation_value": value,
                 "answer_parsed": result["parse_status"] == "ok"}
     return {
         "score": float(result["score"]),
@@ -104,36 +111,53 @@ def _quantiles(values: list[int]) -> dict:
     }
 
 
-def aggregate(records: Iterable[dict], *, answer_token_limit: int | None = None) -> dict:
-    """Aggregate scored records.
+def _record_eval_value(record: dict):
+    """Evaluation value of one scored record; falls back to acc for old rows."""
+    if "evaluation_value" in record:
+        value = record.get("evaluation_value")
+    else:
+        acc = record.get("acc")
+        value = None if acc is None else int(bool(acc))
+    return None if value is None else int(value)
 
-    Each record needs ``acc`` (bool) and optionally ``response``, ``finish_reason``,
-    ``truncated``, ``num_tokens``/``response_tokens``, ``ground_truth``.
+
+def aggregate(records: Iterable[dict], *, answer_token_limit: int | None = None) -> dict:
+    """Aggregate scored records with the fixed-denominator evaluation contract.
+
+    The accuracy field is only a determined value when every slot is resolved
+    (evaluation_complete); otherwise use accuracy_lower/accuracy_upper/coverage.
     """
     records = list(records)
     total = len(records)
     if total == 0:
         return {"count": 0}
-
-    correct = sum(1 for r in records if r.get("acc"))
+    values = [_record_eval_value(record) for record in records]
+    correct = sum(1 for value in values if value == 1)
+    wrong = sum(1 for value in values if value == 0)
+    invalid = sum(1 for value in values if value is None)
     parsed = sum(1 for r in records if r.get("answer_parsed"))
-    invalid = sum(r.get('evaluation_valid') is False or r.get('acc') is None for r in records)
     scores = [float(r.get("score", 1.0 if r.get("acc") else -1.0)) for r in records if r.get('acc') is not None]
     no_answer = sum(r.get('parse_status') == 'no_answer' or r.get('pred') == '[INVALID]' for r in records)
     parse_failed = sum(r.get('parse_status') in ('malformed','ambiguous') for r in records)
     errors = sum(r.get('grade_status') in ('error','timeout') for r in records)
     lengths = [int(r["num_tokens"]) for r in records if r.get("num_tokens") is not None]
     truncated = sum(1 for r in records if r.get("truncated") or r.get("finish_reason") == "length")
-
+    complete = invalid == 0
+    lower = correct / total
+    upper = (correct + invalid) / total
+    coverage = (correct + wrong) / total
     report = {
         "count": total,
-        'evaluation_complete':invalid == 0,
-        'scorable_count':total-invalid, 'unscorable_count':invalid,
-        'grader_error_rate':errors/total, 'no_answer_rate':no_answer/total,
-        "accuracy": correct / total,
-        "correct": correct,
-        "incorrect": total - invalid - correct,
-        # Kept for comparison only - NOT an accuracy.
+        'evaluation_complete': complete,
+        'confirmed_correct': correct, 'confirmed_incorrect': wrong,
+        'unresolved_count': invalid,
+        'scorable_count': total - invalid, 'unscorable_count': invalid,
+        'accuracy': lower if complete else None,
+        'accuracy_lower': lower, 'accuracy_upper': upper, 'coverage': coverage,
+        'accuracy_note': ('determined C/N' if complete
+                          else 'unresolved present: accuracy is None; use accuracy_lower/accuracy_upper/coverage'),
+        'grader_error_rate': errors / total, 'no_answer_rate': no_answer / total,
+        "correct": correct, "incorrect": wrong,
         "score_mean_pm1": statistics.fmean(scores) if scores else None,
         "answer_parsed": parsed,
         "answer_parse_failure_rate": parse_failed / total,
@@ -141,7 +165,10 @@ def aggregate(records: Iterable[dict], *, answer_token_limit: int | None = None)
         "truncation_rate": truncated / total,
     }
     if invalid:
-        report['provisional_metrics'] = {'accuracy_lower_bound':report.pop('accuracy')}
+        report['provisional_metrics'] = {'accuracy': lower, 'accuracy_lower_bound': lower,
+                                         'accuracy_upper_bound': upper, 'coverage': coverage}
+        report['provisional_metrics_policy'] = ('Fixed denominator; provisional fields are lower bounds '
+                                                '(unresolved contribute zero).')
         report['scorable_score_mean_pm1'] = report.pop('score_mean_pm1')
     if lengths:
         report["response_tokens"] = _quantiles(lengths)
@@ -177,39 +204,60 @@ def pass_at_n(per_question: Iterable[list[bool]]) -> float:
 
 
 def summarize_sampling(per_question: dict[str, list[dict]], *, answer_token_limit: int | None = None) -> dict:
-    """Per-benchmark report for multi-sample evaluation.
-
-    ``per_question`` maps a benchmark name to a flat list of scored records that
-    still carry their ``uid``; grouping happens here.
-    """
+    """Per-benchmark report with lower/upper/coverage and strict completion."""
     result: dict[str, Any] = {"benchmarks": {}, "overall": {}}
-    all_groups: list[list[bool]] = []
+    all_groups: list[list[int | None]] = []
     all_records: list[dict] = []
     for benchmark, records in sorted(per_question.items()):
         by_uid: dict[str, list[dict]] = {}
         for record in records:
             by_uid.setdefault(str(record.get("uid")), []).append(record)
-        groups = [[bool(r["acc"]) for r in items] for items in by_uid.values()]
-        all_groups.extend(groups)
-        all_records.extend(records)
         entry = aggregate(records, answer_token_limit=answer_token_limit)
         entry["questions"] = len(by_uid)
         entry["samples_per_question"] = (len(records) / len(by_uid)) if by_uid else 0
-        entry["pass_at_1"] = pass_at_1(groups)
-        entry["pass_at_n_any_success"] = pass_at_n(groups)
-        if not entry.get('evaluation_complete',False):
-            entry.setdefault('provisional_metrics',{}).update({k:entry.pop(k) for k in ('pass_at_1','pass_at_n_any_success')})
+        groups = [[_record_eval_value(r) for r in items] for items in by_uid.values()]
+        all_groups.extend(groups)
+        all_records.extend(records)
+        entry.update(_sampling_interval(groups))
+        _apply_provisional(entry)
         result["benchmarks"][benchmark] = entry
     if all_records:
         overall = aggregate(all_records, answer_token_limit=answer_token_limit)
         overall["questions"] = len(all_groups)
-        overall["pass_at_1"] = pass_at_1(all_groups)
-        overall["pass_at_n_any_success"] = pass_at_n(all_groups)
-        if not overall.get('evaluation_complete',False):
-            overall.setdefault('provisional_metrics',{}).update({k:overall.pop(k) for k in ('pass_at_1','pass_at_n_any_success')})
+        overall["pass_at_n_any_success"] = pass_at_n([[value == 1 for value in group] for group in all_groups])
+        overall.update(_sampling_interval(all_groups))
+        _apply_provisional(overall)
         overall["aggregation"] = "question-weighted mean over benchmarks present in the run"
         result["overall"] = overall
     return result
+
+
+def _sampling_interval(groups: list[list[int | None]]) -> dict:
+    """Fixed-denominator pass@1 interval over per-question evaluation values."""
+    clean = [group for group in groups if group]
+    if not clean:
+        return {"pass_at_1": None, "pass_at_1_lower": None, "pass_at_1_upper": None,
+                "pass_at_1_coverage": None, "pass_at_n_any_success": None, "pass_at_n_any_success_upper": None}
+    denominators = [len(group) for group in clean]
+    lower = statistics.fmean(sum(1 for value in group if value == 1) / n for group, n in zip(clean, denominators))
+    upper = statistics.fmean(sum(1 for value in group if value in (1, None)) / n for group, n in zip(clean, denominators))
+    coverage = statistics.fmean(sum(1 for value in group if value is not None) / n for group, n in zip(clean, denominators))
+    any_success = sum(1 for group in clean if any(value == 1 for value in group)) / len(clean)
+    any_success_upper = sum(1 for group in clean if any(value in (1, None) for value in group)) / len(clean)
+    return {"pass_at_1": lower, "pass_at_1_lower": lower, "pass_at_1_upper": upper,
+            "pass_at_1_coverage": coverage, "pass_at_n_any_success": any_success,
+            "pass_at_n_any_success_upper": any_success_upper}
+
+
+def _apply_provisional(entry: dict) -> None:
+    if entry.get('evaluation_complete'):
+        return
+    lower = entry.get('pass_at_1_lower')
+    entry.setdefault('provisional_metrics', {}).update({
+        'pass_at_1': lower, 'pass_at_n_any_success': entry.get('pass_at_n_any_success'),
+        'accuracy': entry.get('accuracy_lower')})
+    entry.pop('pass_at_1', None)
+    entry.pop('pass_at_n_any_success', None)
 
 
 # --------------------------------------------------------------------------- #

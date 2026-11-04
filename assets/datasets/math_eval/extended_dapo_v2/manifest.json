@@ -1,0 +1,66 @@
+{
+  "version": "extended_dapo_v2",
+  "prompt_prefix": "Solve the following math problem step by step. The last line of your response should be of the form Answer: $Answer (without quotes) where $Answer is the answer to the problem.\n\n",
+  "removed_suffix": " Please reason step by step, and put your final answer within \\boxed{}.",
+  "choice_instruction": "The last line must contain only the uppercase letter of the corresponding option in the question, for example: Answer: B",
+  "rule": "DAPO_PREFIX + question.removesuffix(BOXED_SUFFIX).strip() + \"\\n\\n\" + choice_instruction (choice tasks only); ground truth, option order, extra_info.index and row order unchanged; choice tasks add extra_info.options",
+  "tasks": {
+    "Minerva": {
+      "source_file": "Minerva/test.parquet",
+      "source_sha256": "6a83af0cd9e476ee8832200a57158a23978481daa580584645abc52cf3d4b2ed",
+      "rows": 272,
+      "path": "Minerva/test.parquet",
+      "sha256": "f2d9eeba5e29e5533a7d03a725911cc680a55dcea5aff6bf613f8dcb59eb4a74",
+      "scorer": "math_unified_v1",
+      "options_parse": null
+    },
+    "Olympiad-Bench": {
+      "source_file": "Olympiad-Bench/test.parquet",
+      "source_sha256": "803e3b4d196bf495b216d7b52ff26c1d607fc1c906618fd833778f798327a39f",
+      "rows": 675,
+      "path": "Olympiad-Bench/test.parquet",
+      "sha256": "8c2a1097398912307695e9665fe57c10dcffaf799a4546372f8241451ed41fb3",
+      "scorer": "math_unified_v1",
+      "options_parse": null,
+      "oprd_test_data_dapo": {
+        "sha256": "86c8a1318caad72a41a18684ec03325dcdd82c3f7f8fc75c7456ee3860291bbe",
+        "rows": 675,
+        "prompt_equal": 675,
+        "prompt_equal_note": null,
+        "ground_truth_equal": 675
+      }
+    },
+    "GPQA": {
+      "source_file": "GPQA/test.parquet",
+      "source_sha256": "e01133c8b0901d230d4fe26d121d3daff7cd251ca5a88d98f9ba3e22bdc037a6",
+      "rows": 198,
+      "path": "GPQA/test.parquet",
+      "sha256": "1539a740be58b52dcdc213297a12324e5344b803d4057fd0114275b84456e648",
+      "scorer": "choice_exact_v2",
+      "options_parse": {
+        "ok": 198,
+        "lowercase_labels_in_stem": 3
+      },
+      "oprd_test_data_dapo": {
+        "sha256": "9efe0e83f8fc1cd5e3fed9ca9008e7c583b0bd5e44f586a9234bee5c6a93e23d",
+        "rows": 198,
+        "prompt_equal": 198,
+        "prompt_equal_note": "excluding the v2 choice instruction",
+        "ground_truth_equal": 198
+      }
+    },
+    "MMLU-Pro-Math": {
+      "source_file": "MMLU-Pro-Math/test.parquet",
+      "source_sha256": "f6ab777e45500840115524d6a9e7dc25386e107645feadeae12e2c0f0d385c79",
+      "rows": 1351,
+      "path": "MMLU-Pro-Math/test.parquet",
+      "sha256": "8d1ac4b8e6dfc45bc6edc82fa7d9ac77307c5fc9f8d0ff0c2bb453fda53d3779",
+      "scorer": "choice_exact_v2",
+      "options_parse": {
+        "ok": 1350,
+        "lowercase_labels_in_stem": 26,
+        "ambiguous": 1
+      }
+    }
+  }
+}

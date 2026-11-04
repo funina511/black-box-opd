@@ -11,23 +11,29 @@ from .semantic_annotation import finish_review
 
 
 def annotate_chains(client, requests, contexts, deadline, *, semantic=True,
-                    recovered=None, on_result=None, on_state=None, stop=None):
+                    recovered=None, on_result=None, on_state=None, stop=None, process_protocol='events_v27'):
     started=time.monotonic();limit=client.options['concurrency']
     results={};primary=deque();review=deque();inflight={};initial={};queued={}
     metrics={'version':1,'limit':limit,'peak_scheduled_inflight':0,'stages':[],
              'unfinished':[],'future_cancel_is_server_cancel':False}
     recovered=recovered or {};prefer_review=True
+    attempts={rid:recovered.get(rid,{}).get('annotation_attempt',1) for rid in requests}
     def publish(rid,result):
+        result['annotation_attempt']=attempts[rid]
+        for key in ('historical_requests_used','historical_usage','historical_submission_unknown'):
+            if key in recovered.get(rid,{}):result.setdefault(key,recovered[rid][key])
         results[rid]=result
         if on_state:on_state(rid,'final',result)
         if on_result:on_result(rid,result)
     def needs_review(result):
-        return semantic and 'parsed' in result and 'targeted_result' not in result and bool(targets(result['parsed']))
+        return process_protocol!='direct_v1' and semantic and 'parsed' in result and 'targeted_result' not in result and bool(targets(result['parsed']))
     def enqueue_review(rid,result):
         initial[rid]=result;queued[('review',rid)]=time.monotonic();review.append(rid)
     for rid in requests:
         if rid in recovered:
             r=recovered[rid]
+            if r.get('_retry_stage')=='primary':
+                primary.append(rid);queued[('primary',rid)]=started;continue
             if needs_review(r):enqueue_review(rid,r)
             else:publish(rid,r)
         else:primary.append(rid);queued[('primary',rid)]=started
@@ -38,7 +44,8 @@ def annotate_chains(client, requests, contexts, deadline, *, semantic=True,
             else:
                 problem,response=contexts[rid]
                 request=messages(problem,response,initial[rid]['parsed'])
-                r=client.targeted(rid+':targeted',request,deadline)
+                review_id=rid+('' if attempts[rid]==1 else ':attempt:'+str(attempts[rid]))+':targeted'
+                r=client.targeted(review_id,request,deadline)
                 r['_targeted_request']=request
         except Exception as exc:
             r={'request_id':rid,'error':getattr(exc,'code',type(exc).__name__),
@@ -59,7 +66,8 @@ def annotate_chains(client, requests, contexts, deadline, *, semantic=True,
                 rid=(review if stage=='review' else primary).popleft()
                 if on_state:
                     on_state(rid,'review_submitted' if stage=='review' else 'primary_submitted',
-                             initial[rid] if stage=='review' else {'request_id':rid,'attempts':0,'usage':{}})
+                             {**(initial[rid] if stage=='review' else {'request_id':rid,'attempts':0,'usage':{}}),
+                              'annotation_attempt':attempts[rid]})
                 future=pool.submit(invoke,stage,rid,queued[(stage,rid)])
                 inflight[future]=(stage,rid)
                 metrics['peak_scheduled_inflight']=max(metrics['peak_scheduled_inflight'],len(inflight))
@@ -68,6 +76,7 @@ def annotate_chains(client, requests, contexts, deadline, *, semantic=True,
             # Stable publication for simultaneous completions; IDs never depend on completion order.
             for future in sorted(done,key=lambda f:inflight[f][1]):
                 stage,rid=inflight.pop(future);result,timing=future.result();metrics['stages'].append(timing)
+                result['annotation_attempt']=attempts[rid]
                 if stage=='primary':
                     if on_state:on_state(rid,'primary_done',result)
                     if needs_review(result):enqueue_review(rid,result)

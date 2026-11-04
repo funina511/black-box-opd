@@ -12,5 +12,5 @@ for arg in "$@"; do
       selection=(); break ;;
   esac
 done
-exec "${GAD_PYTHON:-/mnt/jinbo/miniconda3/envs/gad/bin/python}" \
+exec "${GAD_PYTHON:-python}" \
   "$ROOT/gad/tools/export_model.py" "${selection[@]}" --stage "$STAGE" --step "$STEP" "$@"

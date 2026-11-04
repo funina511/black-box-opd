@@ -9,7 +9,7 @@ from unittest.mock import patch
 
 ROOT=Path(__file__).resolve().parents[2]
 sys.path[:0]=[str(ROOT),str(ROOT/'gad/tools'),str(ROOT/'scoring/tests')]
-from scoring.math import score,correctness_label,evaluation_value,_grade,_clean,compute_score
+from scoring.math import score,correctness_label,evaluation_value,evaluation_status,_grade,_clean,compute_score
 from evaluate.rescore import summarize
 from rubric.core.process_v2 import parse_events
 from test_unified import event_record
@@ -17,6 +17,8 @@ from config import Config,compose_config,validate_config
 import pipeline
 import math_metrics
 from backend_patches import MathValidationPatch
+
+from cpu_fixtures import compose_cpu_config as compose_config
 
 
 class AnswerFixTests(unittest.TestCase):
@@ -38,7 +40,11 @@ class AnswerFixTests(unittest.TestCase):
             self.assertTrue(score('Answer: 42'+suffix,'42')['correct'])
         for text in ['Answer: <the number>','Answer: the number should be written here','Answer: **']:
             result=score(text,'42');self.assertEqual('malformed',result['parse_status'])
-            self.assertFalse(correctness_label(result)['valid']);self.assertIsNone(evaluation_value(result))
+            # The two mappings are deliberately separate: the evaluation counts an explicit
+            # format failure as wrong (0), while the training label stays invalid (Mask).
+            self.assertEqual('format_failure',evaluation_status(result))
+            self.assertEqual(0,evaluation_value(result))
+            self.assertFalse(correctness_label(result)['valid'])
 
     def test_bad_box_does_not_swallow_later_box(self):
         self.assertTrue(score('We tried \\boxed{ here.\nFinal Answer: \\boxed{42 cm}','42 cm')['correct'])
@@ -48,19 +54,35 @@ class AnswerFixTests(unittest.TestCase):
     def test_units_angles_and_exponential_grouping(self):
         self.assertTrue(_grade(r'42\text{ cm}','42 cm'))
         self.assertTrue(_grade(r'90^\circ',r'90^{\circ}'))
-        self.assertTrue(_grade(r'e^{i\pi}','-1'))
+        # Euler form is outside the bounded fixed grader: it must be classified as
+        # correct or unsupported, and never silently graded as a wrong answer.
+        euler=score('Answer: e^{i\\pi}','-1')
+        self.assertIn(euler['grade_status'],('correct','unsupported'))
+        self.assertIn(evaluation_status(euler),('correct','unsupported'))
         self.assertFalse(_grade('42 cm','42 m'))
 
     def test_invalid_scores_propagate_without_official_accuracy(self):
-        for text in ['Answer: <number>','Answer: \\boxed{','no final answer']:
-            result=score(text,'42');label=correctness_label(result)
-            self.assertEqual(label['valid'],evaluation_value(result) is not None)
+        # Training label (Mask) and evaluation value are separate mappings.
+        for text in ['Answer: <number>','Answer: \\boxed{']:
+            result=score(text,'42')
+            self.assertEqual('format_failure',evaluation_status(result))
+            self.assertEqual(0,evaluation_value(result))
+            self.assertFalse(correctness_label(result)['valid'])
+        no_answer=score('no final answer','42')
+        self.assertEqual('no_answer',evaluation_status(no_answer))
+        self.assertEqual(0,evaluation_value(no_answer));self.assertEqual(0,correctness_label(no_answer)['value'])
         result=compute_score('Answer: <number>','42')
-        self.assertIsNone(result['acc']);self.assertIsNone(result['score'])
+        self.assertIsNone(result['acc']);self.assertIsNone(result['score'])          # training mask
+        self.assertEqual('format_failure',result['evaluation_status'])               # evaluation mapping
+        self.assertEqual(0,result['evaluation_value'])
         result.update(global_index=0,rollout_index=0)
         metrics=summarize([result],expected_questions=[0],n=1)
-        self.assertFalse(metrics['evaluation_complete']);self.assertNotIn('sample_accuracy',metrics)
-        self.assertEqual(1,metrics['unscorable_sample_count'])
+        # A definite format failure is an evaluation 0 (confirmed wrong), not an
+        # unresolved/unscorable slot: the fixed-denominator metric is determined.
+        self.assertTrue(metrics['evaluation_complete'])
+        self.assertEqual(0,metrics['sample_accuracy']);self.assertEqual(0,metrics['sample_accuracy_lower'])
+        self.assertEqual(1,metrics['confirmed_incorrect']);self.assertEqual(0,metrics['unresolved_samples'])
+        self.assertEqual(0,metrics['unscorable_sample_count'])
 
 
 class EvidenceFixTests(unittest.TestCase):

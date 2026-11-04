@@ -1,0 +1,8 @@
+# Opt-in candidate for NEW joint runs; GPU throughput is not yet measured.
+# Keep Thinking, rubric/review policy, output budget and optimizer targets inherited.
+rubric:
+  judge:
+    concurrency: 4
+    # At higher concurrency a long individual request can take longer.
+    request_timeout_seconds: 900
+

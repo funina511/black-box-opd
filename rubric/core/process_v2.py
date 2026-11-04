@@ -88,11 +88,12 @@ def protocol_identity(spec, instruction):
             'parser_hash': file_hash(__file__), 'request_builder_hash': file_hash(contracts.__file__)}
 
 
+EVENT_IDS = [f'e{i}' for i in range(1, 5)]
 LABEL_BASE = {'type': 'object', 'additionalProperties': False,
               'required': ['value', 'valid', 'reason', 'event_ids'],
               'properties': {'value': {'enum': [0, .5, 1, None]}, 'valid': {'type': 'boolean'},
                              'reason': {'type': 'string', 'minLength': 1},
-                             'event_ids': {'type': 'array', 'items': {'type': 'string'}}}}
+                             'event_ids': {'type': 'array', 'items': {'enum': EVENT_IDS}}}}
 # xgrammar ignores siblings of anyOf. Each branch carries the complete object.
 LABEL = {'anyOf': []}
 for valid in (False, True):
@@ -106,7 +107,7 @@ EVENT_BASE = {'type': 'object', 'additionalProperties': False,
                         'supporting_span_ranges': RANGES,
                         'trajectory_claim': {'type': 'string', 'minLength': 1},
                         'judge_verification': {'type': 'string', 'minLength': 1},
-                        'related_event_ids': {'type': 'array', 'items': {'type': 'string'}}}}
+                        'related_event_ids': {'type': 'array', 'items': {'enum': EVENT_IDS}}}}
 REPAIR_EVENT = deepcopy(EVENT_BASE)
 REPAIR_EVENT['required'] = ['type', 'supporting_span_ranges', 'trajectory_claim', 'judge_verification', 'error_event_id']
 REPAIR_EVENT['properties']['type'] = {'const': 'corrected_error'}
@@ -169,11 +170,13 @@ def parse_events(text, response):
                  'start': segments[sid]['start'], 'end': segments[sid]['end']} for sid in ids]}
         except EvidenceError as exc:
             reasons.append(exc.code)
+            if units == {}:reasons.append('event_requires_evidence')
         for field in ('trajectory_claim', 'judge_verification'):
             if not isinstance(event.get(field), str) or not event[field].strip():
                 reasons.append('event_' + field + '_missing')
         links = event.get('related_event_ids')
-        if not isinstance(links, list) or any(not isinstance(x, str) for x in links) or len(set(links)) != len(links):
+        if (not isinstance(links, list) or len(links) > 4 or
+                any(not isinstance(x, str) or x not in EVENT_IDS for x in links) or len(set(links)) != len(links)):
             reasons.append('event_links_malformed')
         validity[eid] = {'valid': not reasons, 'reasons': reasons}
     def invalidate(eid, reason):
@@ -230,7 +233,10 @@ def parse_events(text, response):
             raise ProtocolError('label_schema_error', dimension)
         try:validate_label(item, dimension)
         except ValueError as exc:raise ProtocolError('label_schema_error', str(exc)) from exc
-        if not isinstance(item['reason'], str) or not item['reason'].strip() or not isinstance(item['event_ids'], list) or any(not isinstance(x, str) for x in item['event_ids']):
+        if (not isinstance(item['reason'], str) or not item['reason'].strip() or
+                not isinstance(item['event_ids'], list) or len(item['event_ids']) > 4 or
+                any(not isinstance(x, str) or x not in EVENT_IDS for x in item['event_ids']) or
+                len(set(item['event_ids'])) != len(item['event_ids'])):
             raise ProtocolError('label_schema_error', 'reason/evidence IDs required')
         labels[dimension] = {**deepcopy(item), 'evidence': item['reason']}
     def mask(dimension, reason):
@@ -264,7 +270,9 @@ def parse_events(text, response):
                 if any(eid in uncertain_repair for eid in support):mask(dimension, 'untrusted_repair_affects_unresolved_status')
     uncertain_error = any(events[eid].get('type') in ('explicit_error', 'corrected_error') for eid in invalid)
     unrepaired_error = any(e['type'] == 'explicit_error' and eid not in repaired for eid, e in events.items() if eid not in invalid)
-    unknown_math = any(e['type'] == 'unjudgeable' for eid, e in events.items() if eid not in invalid)
+    # A failed location does not erase an explicit declaration of mathematical uncertainty.
+    unknown_math_events = [eid for eid, e in events.items() if e.get('type') == 'unjudgeable']
+    unknown_math = bool(unknown_math_events)
     if labels['verified_progress']['valid'] and labels['verified_progress']['value'] == 0 and not row['analysis_complete']:
         mask('verified_progress', 'zero_progress_requires_complete_visible_review')
     if labels['verified_progress']['valid'] and labels['verified_progress']['value'] == 1:
@@ -286,6 +294,7 @@ def parse_events(text, response):
     violations = [{'dimension': dimension, 'reason': reason} for dimension, reasons in mask_reasons.items() for reason in reasons]
     return {**labels, '_record': row, '_raw_output': text, '_raw_labels': {d: deepcopy(row[d]) for d in V2_DIMENSIONS[1:]},
             '_event_validity': validity, '_event_issues': [{'event_id': eid, **validity[eid]} for eid in sorted(invalid)],
+            '_unknown_math_events': unknown_math_events,
             '_source_evidence': resolved, '_evidence_audit': {'capacity_conflicts': [eid for eid in validity if 'evidence_capacity_conflict' in validity[eid]['reasons']], 'cross_event_duplicate_spans': sum(len(v['supporting_span_ids']) for v in resolved.values())-len({sid for v in resolved.values() for sid in v['supporting_span_ids']})}, '_discarded_label_event_ids': discarded,
             '_validation_scope': {'structure':True, 'source_presence':True, 'semantic_entailment':'not_checked'},
             '_judge_reported_scope': {'analysis_complete':row['analysis_complete'], 'completion':row['completion']},

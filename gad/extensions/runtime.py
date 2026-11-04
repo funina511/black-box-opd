@@ -35,6 +35,8 @@ class Runtime:
                                                     "finish_reason": record.get("finish_reason"),
                                                     "truncated": record.get("truncated", False)}
         self.pending = None
+        self.pending_reward_monitor = None
+        self.reward_monitor_history = None
         self.calibration_ids = set()
         calibration = self.directory / "rubric_calibration.jsonl"
         if calibration.exists():
@@ -96,6 +98,9 @@ class Runtime:
                             "tokens": len(pair[role]["token_ids"]), "truncated": pair[role]["truncated"],
                             "annotation": pair["labels"][role], "human_review": "pending"})
                         self.calibration_ids.add(rid)
+        if 'rubric_reward_components' in actor_batch.batch:
+            from .actor_reward import monitor_records
+            self.pending_reward_monitor = monitor_records(actor_batch, critic_batch, fresh, step)
         self.pending = (fresh, stage_step, step, stats)
         return critic_batch, stats
 
@@ -108,11 +113,24 @@ class Runtime:
             stats.update({"replay/size_pairs": len(self.replay.entries), "replay/serialized_bytes": self.replay.bytes,
                           "replay/evicted_age": self.replay.evicted_age,
                           "replay/evicted_capacity": self.replay.evicted_capacity})
+        record = {}
+        if self.pending_reward_monitor is not None:
+            from .actor_reward import load_window, summarize
+            if self.reward_monitor_history is None:
+                self.reward_monitor_history = load_window(self.directory, self.committed_step)
+            self.reward_monitor_history.append(self.pending_reward_monitor)
+            self.reward_monitor_history = self.reward_monitor_history[-10:]
+            options = plain(self.trainer.config.trainer.rubric)
+            stats.update(summarize(self.pending_reward_monitor, options))
+            stats.update(summarize([row for batch in self.reward_monitor_history for row in batch], options,
+                                   prefix='actor_reward/window/'))
+            record['actor_reward_monitor'] = self.pending_reward_monitor
         self.stage_step, self.committed_step = stage_step, step
         self.invocation_steps += 1
         stats.update({"training/actor_updated": int(actor_updated), "training/critic_updated": 1,
                       "training/stage_step": stage_step, "training/absolute_global_step": step,
                       "training/rollout_sampling_seed": self.options["sampling_seed"]})
-        append_json(self.directory / "extension_metrics.jsonl", {"step": step, "stage": self.stage, **stats})
+        append_json(self.directory / "extension_metrics.jsonl", {"step": step, "stage": self.stage, **stats, **record})
         self.pending = None
+        self.pending_reward_monitor = None
         return stats

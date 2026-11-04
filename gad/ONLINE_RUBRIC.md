@@ -45,7 +45,7 @@
 
 主方案 rubric 阶段为 `[warmup,gad]`，从 Warmup 首次 critic 更新生效。
 Warmup actor 保留 teacher SFT 和原门槛；GAD actor 保留当前 rollout、adv 奖励、
-GRPO/PPO 与 KL 设置。三个辅助分数不混入 actor reward。
+GRPO/PPO 与 KL 设置。默认三个辅助分数不混入 actor reward；可选的 Actor 混合模式见文末 2026-11-03 接入说明。
 `rubric.stages=[gad]` 是阶段消融；Warmup-only、Warmup replay、动态 critic 批次、
 SP>1、多节点及改变 world size 的恢复暂不支持。
 
@@ -185,8 +185,21 @@ bash evaluate/run_eval.sh --run /绝对路径/实验目录 \
 
 ### v2.4 附录 B 冻结（2026-10-17）
 
-当前新候选使用 wire `rubric.events.v2.7`、input `rubric.input.v2.5`、targeted review v4。证据字段采用可省略的 r1…r8 对象槽，空证据 `{}`；实际 xgrammar 禁止 r9。保留 `process_v25.py`（旧 ID）、`process_v26.py`/`evidence_ranges_v1.py`（旧数组）、`semantic_review_v2.py`/`semantic_review_v3.py` 解释器。旧原始 spec/prompt 与已部署 backend 不变；新路径为 `math_process_v27.yaml`、`judge_math_process_v27.txt`。
+当前新候选使用 wire `rubric.events.v2.7`、input `rubric.input.v2.5`、targeted review v4。证据字段采用可省略的 r1…r8 对象槽，事件证据至少一个区间；复核标签的额外空证据可用 `{}`；实际 xgrammar 禁止 r9。保留 `process_v25.py`（旧 ID）、`process_v26.py`/`evidence_ranges_v1.py`（旧数组）、`semantic_review_v2.py`/`semantic_review_v3.py` 解释器。旧原始 spec/prompt 与已部署 backend 不变；新路径为 `math_process_v27.yaml`、`judge_math_process_v27.txt`。
 
 8B Thinking / TP2 / concurrency2 只做了一次固定4条检查；新协议解决生成期证据容量，不认证数学准确性。已知噪声按探索性训练记录，不再等待全面人工门槛；保留技术失败、未知、连续空 Student 过程监督与数值保护。固定维度分母3、门控tau4、辅助系数0.1、Replay关闭；不能让早期候选的 `legacy_active` 覆盖正式 Loss。正式试验与 Actor 评估由用户运行。
 
 [完整交付与成本](../reports/rubric_v24_bc_20261017/README.md)。当前 full batch 的 Judge 成本可能达数小时/步，延长截止不是提速。
+
+
+## 2026-11-03：direct_v1 与 Actor 混合奖励
+
+成功实验的 direct_v1 差分现已归并主目录；旧事件协议配置仍可使用。新实验请用完整的 `configs/launch_rubric_actor_06b_17k.yaml`，不能仅凭旧 `rubric_joint` 方法名判断已使用 direct_v1。
+
+GAD 可选 `rubric.reward_source=adv_plus_rubric`，奖励为 `adv + β(c+p−e)`，其中 c/p/e 为同一次 Critic 前向的末有效 token logits 在 FP32 下取 sigmoid。首版 β=.05、三个权重均为1；Critic 仍训练 BT + 三维辅助 BCE。所有 Student rollout 使用预测分数；Judge 抽样 mask 只约束标签监督。Warmup 保留原 Teacher SFT，β=0 / adv_only 保留旧值与 dtype。
+
+`configs/launch_rubric_actor_c_only_06b_17k.yaml` 仅将 Actor 的 p/e 权重设为0，β和正确性权重不变；Critic 仍为相同 joint 模式，不能用 `correctness_only` 方法代替这个消融。
+
+新配置内已指定来源 `runs/rubric_direct_06b_17k_20261026/warmup/global_step_271`，目标新增271步到542。从四头 Warmup 正常交接，GAD 优化器/调度器新建；首次保存后再用新 run 的 `--resume-gad` 恢复。
+
+[实现、固定开发样本、短训练与命令](../reports/rubric_actor_20261103/README.md)。监控位于已有 `extension_metrics.jsonl`、console 和 W&B：分量、排序/平局、真实 GRPO 优势，以及与本轮有效 Student 标签的一致性。10步窗口在同阶段恢复时从既有已提交日志重建。

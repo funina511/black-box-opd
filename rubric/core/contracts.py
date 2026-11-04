@@ -16,7 +16,10 @@ def layout_for(version):
     raise ValueError('unsupported rubric version: ' + str(version))
 
 
-def schema_for(version):
+def schema_for(version, process_protocol='events_v27'):
+    if version=='math_process_v2' and process_protocol=='direct_v1':
+        from .process_direct import SCHEMA
+        return SCHEMA
     if version == 'math_v1':return JUDGE_SCHEMA
     if version == 'math_process_v2':
         from .process_v2 import JUDGE_SCHEMA_V2
@@ -48,7 +51,10 @@ def validate_label(item, dimension):
         raise ValueError(f"invalid {dimension} label: {value}")
 
 
-def parse_judge(text, version='math_v1', response=None):
+def parse_judge(text, version='math_v1', response=None, process_protocol='events_v27'):
+    if version=='math_process_v2' and process_protocol=='direct_v1':
+        from .process_direct import parse_direct
+        return parse_direct(text)
     if version == 'math_process_v2':
         from .process_v2 import parse_events
         return parse_events(text, response)
@@ -71,7 +77,10 @@ JUDGE_SCHEMA = {"type": "object", "additionalProperties": False, "required": lis
                                for dim in DIMENSIONS[1:]}}
 
 
-def judge_messages(prompt, response, ground_truth, spec, instruction, version='math_v1', truncation=None):
+def judge_messages(prompt, response, ground_truth, spec, instruction, version='math_v1', truncation=None, process_protocol='events_v27'):
+    if version=='math_process_v2' and process_protocol=='direct_v1':
+        from .process_direct import messages
+        return messages(prompt,response,ground_truth,spec,instruction,truncation)
     if version == 'math_process_v2':
         from .process_v2 import compact_response, render_instructions, MARKER
         return [{'role': 'system', 'content': render_instructions(spec, instruction)},

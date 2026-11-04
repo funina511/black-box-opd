@@ -1,0 +1,192 @@
+{
+  "schema_version": "lmops.assets.v1",
+  "evaluation": {
+    "AMC23": {
+      "path": "assets/datasets/math_eval/AMC23/test.parquet",
+      "sha256": "b903f4338e9867782d091d3c731d763036d559b635f472cb64a31de58f3261aa",
+      "rows": 40,
+      "source": "/mnt/jinbo/RLRM/OPRD/datasets/test_data_dapo/AMC23/test.parquet",
+      "question_ids": "pinned sampler enumerates Parquet rows from 0"
+    },
+    "AIME24": {
+      "path": "assets/datasets/math_eval/AIME24/test.parquet",
+      "sha256": "d0f5aff6d01041b08bc1499b046fdb3409d0ebf9d7efd481fe344da7ebc94cc0",
+      "rows": 30,
+      "source": "/mnt/jinbo/RLRM/OPRD/datasets/test_data_dapo/AIME24/test.parquet",
+      "question_ids": "pinned sampler enumerates Parquet rows from 0"
+    },
+    "AIME25": {
+      "path": "assets/datasets/math_eval/AIME25/test.parquet",
+      "sha256": "24bc56298eab86734f672509f38fb7d63e067489c84a59e19d4037cf52be76d9",
+      "rows": 30,
+      "source": "/mnt/jinbo/RLRM/OPRD/datasets/test_data_dapo/AIME25/test.parquet",
+      "question_ids": "pinned sampler enumerates Parquet rows from 0"
+    },
+    "MATH-500": {
+      "path": "assets/datasets/math_eval/MATH-500/test.parquet",
+      "sha256": "e5965c1448c0ebe90dd36a26c9fdbfd7a4f66da19ac6fee294ddaf3edff39c15",
+      "rows": 500,
+      "source": "/mnt/jinbo/RLRM/OPRD/datasets/test_data_dapo/MATH-500/test.parquet",
+      "question_ids": "pinned sampler enumerates Parquet rows from 0"
+    }
+  },
+  "models": {
+    "student": {
+      "path": "assets/models/Qwen3-0.6B",
+      "methods": [
+        "baseline",
+        "correctness_only",
+        "rubric_joint"
+      ]
+    },
+    "judge": {
+      "path": "assets/models/Qwen3-8B",
+      "methods": [
+        "rubric_joint"
+      ]
+    }
+  },
+  "initialization": {
+    "path": "assets/initialization/qwen3_0.6b_math_v2_adv_seed42",
+    "source": "/mnt/jinbo/RLRM/LMOps/runs/_initialization/qwen3_0.6b_math_v2_adv_seed42",
+    "reinitialized": false
+  },
+  "training_data": "data/dapo_math_17k_gad_v2",
+  "content_hashes": "Per-file SHA256 included here; release manifest also records archives and included method assets.",
+  "roles": {
+    "models.student": {
+      "destination": "assets/models/Qwen3-0.6B",
+      "original_source": "/mnt/jinbo/RLRM/model/Qwen/Qwen3-0.6B",
+      "required_by": [
+        "baseline",
+        "correctness_only",
+        "rubric_joint"
+      ],
+      "files": {
+        ".cache/huggingface/.gitignore": "684888c0ebb17f374298b65ee2807526c066094c701bcc7ebbe1c1095f494fc1",
+        ".cache/huggingface/download/.gitattributes.lock": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        ".cache/huggingface/download/.gitattributes.metadata": "e7789a3fd2b52e0207ca277a0fc4e47f67744c095b28d42d1a7391a1fd6cdce1",
+        ".cache/huggingface/download/LICENSE.lock": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        ".cache/huggingface/download/LICENSE.metadata": "ed2a51aaa9e3bd0fe44943f50cc056c171219e128bbecad10d97594ed2f6a420",
+        ".cache/huggingface/download/README.md.lock": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        ".cache/huggingface/download/README.md.metadata": "c40a2bed5473666050bca016e3cdb25467e31af64988b2c989d94e046bc0819e",
+        ".cache/huggingface/download/config.json.lock": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        ".cache/huggingface/download/config.json.metadata": "2e1fe73735920707e0cbcafe84da62e8914650cac23577857411e7897b8e9dac",
+        ".cache/huggingface/download/generation_config.json.lock": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        ".cache/huggingface/download/generation_config.json.metadata": "55d36c2e9b1237bd0605505265d625fd10715fb4cfa8b363e93ca7b2108e480d",
+        ".cache/huggingface/download/merges.txt.lock": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        ".cache/huggingface/download/merges.txt.metadata": "ef4bc88849af7b6ecba5d547858c9da01eb80bb81e57650f7333fc3fdac3b0aa",
+        ".cache/huggingface/download/model.safetensors.lock": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        ".cache/huggingface/download/model.safetensors.metadata": "83423b6b0f2e55c223f30917c093d3a8ccd42812c3bca5a58ebc39ba427cd00e",
+        ".cache/huggingface/download/tokenizer.json.lock": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        ".cache/huggingface/download/tokenizer.json.metadata": "81a6f2a5b92cdcc429bfbf095cc6f08326f9c143f3d28b5e70902946c53eaf30",
+        ".cache/huggingface/download/tokenizer_config.json.lock": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        ".cache/huggingface/download/tokenizer_config.json.metadata": "cabe3940f9a958c151696300ef461badc1ce02c18d07f0bdb862c1bb6bb14b91",
+        ".cache/huggingface/download/vocab.json.lock": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        ".cache/huggingface/download/vocab.json.metadata": "921b64c6e34f0ab62313bdeca0dd210544c03e52440469cc9b942f4dadb27266",
+        ".gitattributes": "34448b82c17d60fec9b65b1f093c115ddbaadc04beb1b0140b6bfed2e012a930",
+        "LICENSE": "832dd9e00a68dd83b3c3fb9f5588dad7dcf337a0db50f7d9483f310cd292e92e",
+        "README.md": "1ab64a26fcb3b461423b89a433a8c858f1bf8d4086f979cbb3ff878d47cf20e9",
+        "config.json": "660db3b73d788119c04535e48cf9be5f55bc3100841a718637ae695b442f27dd",
+        "generation_config.json": "2325da0f15bb848e018c5ae071b7943332e9f871d6b60e2ed22ca97d4cb993d2",
+        "merges.txt": "8831e4f1a044471340f7c0a83d7bd71306a5b867e95fd870f74d0c5308a904d5",
+        "model.safetensors": "f47f71177f32bcd101b7573ec9171e6a57f4f4d31148d38e382306f42996874b",
+        "tokenizer.json": "aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4",
+        "tokenizer_config.json": "d5d09f07b48c3086c508b30d1c9114bd1189145b74e982a265350c923acd8101",
+        "vocab.json": "ca10d7e9fb3ed18575dd1e277a2579c16d108e32f27439684afa0e10b1440910"
+      },
+      "copied_without_reinitialization": true
+    },
+    "models.discriminator_init": {
+      "destination": "assets/initialization/qwen3_0.6b_math_v2_adv_seed42",
+      "original_source": "/mnt/jinbo/RLRM/LMOps/runs/_initialization/qwen3_0.6b_math_v2_adv_seed42",
+      "required_by": [
+        "baseline",
+        "correctness_only",
+        "rubric_joint"
+      ],
+      "files": {
+        "added_tokens.json": "c0284b582e14987fbd3d5a2cb2bd139084371ed9acbae488829a1c900833c680",
+        "chat_template.jinja": "a55ee1b1660128b7098723e0abcd92caa0788061051c62d51cbe87d9cf1974d8",
+        "config.json": "53d090c381c7ba15db9b12ee6792240514ce181bee31175ccb28d588e059f436",
+        "initialization_manifest.json": "6b1b65acf5ea4dc0edd4d3470db6ab7ee07604dd559e7c23a12cc1f334ff186a",
+        "merges.txt": "8831e4f1a044471340f7c0a83d7bd71306a5b867e95fd870f74d0c5308a904d5",
+        "model.safetensors": "6786ea6fca246c0f2021d074d668e73876e28bb3811f47f4ccac0e20517a0dab",
+        "special_tokens_map.json": "76862e765266b85aa9459767e33cbaf13970f327a0e88d1c65846c2ddd3a1ecd",
+        "tokenizer.json": "aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4",
+        "tokenizer_config.json": "443bfa629eb16387a12edbf92a76f6a6f10b2af3b53d87ba1550adfcf45f7fa0",
+        "vocab.json": "ca10d7e9fb3ed18575dd1e277a2579c16d108e32f27439684afa0e10b1440910"
+      },
+      "copied_without_reinitialization": true
+    },
+    "rubric.judge.tokenizer_path": {
+      "destination": "assets/models/Qwen3-8B",
+      "original_source": "/mnt/jinbo/RLRM/model/Qwen/Qwen3-8B",
+      "required_by": [
+        "rubric_joint"
+      ],
+      "files": {
+        ".cache/huggingface/.gitignore": "684888c0ebb17f374298b65ee2807526c066094c701bcc7ebbe1c1095f494fc1",
+        ".cache/huggingface/download/.gitattributes.lock": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        ".cache/huggingface/download/.gitattributes.metadata": "30723a1708f0fdb16fdfb4cd84dba98bd1f1fe744949679e008bf45a70c09467",
+        ".cache/huggingface/download/LICENSE.lock": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        ".cache/huggingface/download/LICENSE.metadata": "dc9d2700de5bd3caa67bfd1b9f0f5d666a479bcd21d408db2842213700e149b0",
+        ".cache/huggingface/download/README.md.lock": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        ".cache/huggingface/download/README.md.metadata": "5f8822bb77e9df24256b541ee084d047d950697153b6c4344c065cdce43e1ccf",
+        ".cache/huggingface/download/config.json.lock": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        ".cache/huggingface/download/config.json.metadata": "c374d7dedc9bb9ed882183cc623b01bfd837da7faa54a58093f275d759c50e33",
+        ".cache/huggingface/download/generation_config.json.lock": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        ".cache/huggingface/download/generation_config.json.metadata": "edada0b5540785358a2e35f8dbc8835c1bbe0ef52ff92b7dd368863e50ddeb14",
+        ".cache/huggingface/download/merges.txt.lock": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        ".cache/huggingface/download/merges.txt.metadata": "336201898a6f3b4d64a150cf805a5a97e5f1c929a1a2c2cd520e3acc1f9200ac",
+        ".cache/huggingface/download/model-00001-of-00005.safetensors.lock": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        ".cache/huggingface/download/model-00001-of-00005.safetensors.metadata": "394b439f8182c9029dd6fff3bc20125dd01773cdd9e0d87d8831bbb86f4d232d",
+        ".cache/huggingface/download/model-00002-of-00005.safetensors.lock": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        ".cache/huggingface/download/model-00002-of-00005.safetensors.metadata": "d5852d227fdcb47e7f1685587f4151eaaba8d7c4792da474d7f326696af10376",
+        ".cache/huggingface/download/model-00003-of-00005.safetensors.lock": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        ".cache/huggingface/download/model-00003-of-00005.safetensors.metadata": "80859ee2af1bc4f96825b2bb9774ae73172be52fd5f9380be49c27ec4988be20",
+        ".cache/huggingface/download/model-00004-of-00005.safetensors.lock": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        ".cache/huggingface/download/model-00004-of-00005.safetensors.metadata": "d4360d4d9a85c7eab9751593bfb9dd9e05cc218530c042af14df08a93a452ec9",
+        ".cache/huggingface/download/model-00005-of-00005.safetensors.lock": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        ".cache/huggingface/download/model-00005-of-00005.safetensors.metadata": "88e3b17f98b6ba73724693f8dc6262ce12fb9c41ff49b1c2cd201b58cb06907a",
+        ".cache/huggingface/download/model.safetensors.index.json.lock": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        ".cache/huggingface/download/model.safetensors.index.json.metadata": "ec70cc7a3d514c1df6f27ab20605eeb3742038afbef9e40813ebe4141da38c73",
+        ".cache/huggingface/download/tokenizer.json.lock": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        ".cache/huggingface/download/tokenizer.json.metadata": "d518dfdfbb2cdf0987f849c8bbc524cf6307a03bae4f136406549d477465cf19",
+        ".cache/huggingface/download/tokenizer_config.json.lock": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        ".cache/huggingface/download/tokenizer_config.json.metadata": "b81486adac66436345438dbe6b6bef7954ec345000740d608ed02edba3618b38",
+        ".cache/huggingface/download/vocab.json.lock": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        ".cache/huggingface/download/vocab.json.metadata": "817a9f9be611bb99a01ff3f7a41fc86aa50dcac9031afb7dcfc7f1f0c0fb3265",
+        ".gitattributes": "34448b82c17d60fec9b65b1f093c115ddbaadc04beb1b0140b6bfed2e012a930",
+        "LICENSE": "832dd9e00a68dd83b3c3fb9f5588dad7dcf337a0db50f7d9483f310cd292e92e",
+        "README.md": "0f36caaff9c2516411a7738db384606263ba653c1e63e61d72f511606164d5a6",
+        "config.json": "f7c4eadfbbf522470667b797a3c89be2524832d2d599797248dc304fff447c30",
+        "generation_config.json": "2325da0f15bb848e018c5ae071b7943332e9f871d6b60e2ed22ca97d4cb993d2",
+        "merges.txt": "8831e4f1a044471340f7c0a83d7bd71306a5b867e95fd870f74d0c5308a904d5",
+        "model-00001-of-00005.safetensors": "31d6a825ae35f11fb85b195b4c42c146c051e446433125a215336abdf95cbf5f",
+        "model-00002-of-00005.safetensors": "5991236cea6fe21f3d43cab0f0e84448734fbbe0789816202989f2ddc9d18282",
+        "model-00003-of-00005.safetensors": "c5185c4794be2d8a9784d5753c9922db38df478ce11f9ed0b415b7304d896836",
+        "model-00004-of-00005.safetensors": "b5ee7de71fbf17db3d5704e0c8f2bc7d005ca9e1d7ca2aeb19827b0cfcaa917a",
+        "model-00005-of-00005.safetensors": "20c2d6366ab85c90786ccdd829cd2b9e7d30ef3b2ebbb998280e7e4014b542ff",
+        "model.safetensors.index.json": "f9fdbcb91c23971c13ec5d5f2573d2349e8f61f2f049371ec699281748fdb1bc",
+        "tokenizer.json": "aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4",
+        "tokenizer_config.json": "d5d09f07b48c3086c508b30d1c9114bd1189145b74e982a265350c923acd8101",
+        "vocab.json": "ca10d7e9fb3ed18575dd1e277a2579c16d108e32f27439684afa0e10b1440910"
+      },
+      "copied_without_reinitialization": true
+    }
+  },
+  "training_data_files": {
+    "data/dapo_math_17k_gad_v2/gad_dev.metadata.json": "9ce76db7a108efc17358ca850760d0ca7628020a0517f77ce69c795f0ecb50a4",
+    "data/dapo_math_17k_gad_v2/gad_dev.parquet": "e1a593ff823f66ea2f645d9b1e6a4927b7f8fb734604613129a067e6a5a215f2",
+    "data/dapo_math_17k_gad_v2/gad_dev.parquet.stats.json": "7bdf8592b4d1bd1bd40b0bbb2a115ea9e126808cc33c4536db84e6d19fc2d399",
+    "data/dapo_math_17k_gad_v2/gad_train.metadata.json": "965ff05fd1c24da070cea9c687e747223f7e812556f77586a17e5914a57e2e27",
+    "data/dapo_math_17k_gad_v2/gad_train.parquet": "b00d06f8f49cb0ae11c002f1cf08792387b759ee0a6db4e83b77297bf250c023",
+    "data/dapo_math_17k_gad_v2/gad_train.parquet.stats.json": "beb66c48d4a2a3f11ed8e83bdf560eff47450cd716a0393b6ef1eb94cee1998a",
+    "data/dapo_math_17k_gad_v2/manifest.json": "bbd2a89c10ae68f98f738fd2790794c61e54f838fdc265e53de0c052085a831c",
+    "data/dapo_math_17k_gad_v2/quick_dev.manifest.json": "3a2c0212357697a758e89f7a980653786794c7e954138466f510d6561a0ea51f",
+    "data/dapo_math_17k_gad_v2/quick_dev.parquet": "ea99d4244fedf5beac8bb7834c0b1e3b7dd33444521aae130d33090ccd548331",
+    "data/dapo_math_17k_gad_v2/split_manifest.json": "8d517cba6a1f2cbf9afea9c95694df39f419da9953fa3b6634132f0e1ede8fcd",
+    "data/dapo_math_17k_gad_v2/teacher_index.jsonl": "26ec5eacb718be427dfe4933cde2726d542e8c46ab5e02a4859b94302ddd4bfa"
+  }
+}

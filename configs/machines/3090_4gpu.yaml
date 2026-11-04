@@ -1,0 +1,28 @@
+# Local four-GPU settings; retain the selected offload/checkpointing speed knobs.
+run:
+  python_bin: null
+resources:
+  gpus: 1,2,3,4
+  n_gpus_per_node: 4
+  nnodes: 1
+  judge_gpus: 6,7
+models:
+  actor_param_offload: false
+  actor_optimizer_offload: false
+  critic_param_offload: false
+  critic_optimizer_offload: false
+  ref_param_offload: false
+  actor_gradient_checkpointing: True
+  critic_gradient_checkpointing: True
+optim:
+  critic_dynamic_bsz: false
+  critic_micro_batch_size_per_gpu: 2
+rollout:
+  tensor_model_parallel_size: 1
+  gpu_memory_utilization: 0.55
+  enforce_eager: false
+rubric:
+  judge:
+    concurrency: 2
+    tensor_parallel_size: 2
+    base_url: http://127.0.0.1:8031/v1

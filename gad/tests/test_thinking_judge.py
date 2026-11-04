@@ -1,6 +1,7 @@
 """Independent judge mode, output separation, actual v0 reasoner and finite budgets."""
 from copy import deepcopy
 import json
+import os
 from pathlib import Path
 import sys
 import tempfile
@@ -18,12 +19,14 @@ from test_unified import event_record
 from gad.extensions.judge_client import JudgeClient, guidance_schema, guidance_backend
 from validate_thinking_judge import remaining_budget, completion_partition, merge_completion
 
+from cpu_fixtures import compose_cpu_config as compose_config
+
 
 class ThinkingTests(unittest.TestCase):
     def frozen_completion(self):
-        source = ROOT / 'reports/rubric_v2/thinking_judge_20261015'
-        canonical = [json.loads(s) for s in (source / 'selected24.jsonl').read_text().splitlines()]
-        previous = [json.loads(s) for s in (source / '14b_compat_retry/samples.jsonl').read_text().splitlines()]
+        source = ROOT / 'gad/tests/fixtures'
+        canonical = [json.loads(s) for s in (source / 'completion24.jsonl').read_text().splitlines()]
+        previous = [json.loads(s) for s in (source / 'completion_previous.jsonl').read_text().splitlines()]
         return canonical, previous
 
     def test_completion_reuses_all_six_even_masked_and_preserves_order(self):
@@ -113,9 +116,14 @@ class ThinkingTests(unittest.TestCase):
         self.assertTrue(lengths['split_counts_are_not_additive'])
 
     def candidate(self):
-        return compose_config(model='qwen3_0.6b', dataset='dapo_math_5k', overrides=[
+        cfg = compose_config(model='qwen3_0.6b', dataset='dapo_math_5k', overrides=[
             str(ROOT / 'configs/overrides/rubric_v2_joint.yaml'),
             str(ROOT / 'configs/overrides/rubric_thinking_14b_candidate.yaml')])
+        directory = tempfile.TemporaryDirectory(); self.addCleanup(directory.cleanup)
+        path=Path(directory.name);(path/'model.safetensors').write_bytes(b'identity-fixture');(path/'tokenizer.json').write_text('{}')
+        cfg.data['rubric.judge.tokenizer_path']=str(path)
+        cfg.data['validation.quick_enabled']=False
+        return cfg
 
     def test_config_identity_and_actor_independence(self):
         cfg = self.candidate()
@@ -176,7 +184,7 @@ class ThinkingTests(unittest.TestCase):
             config = Path(d) / 'config.yaml';config.write_text(yaml.safe_dump(cfg.to_dict()))
             output = Path(d) / 'output'
             argv = ['calibrate_rubric_judge.py', '--config', str(config), '--output', str(output),
-                '--samples', str(ROOT / 'reports/rubric_v2/thinking_judge_20261015/selected24.jsonl'), '--wall-seconds', '30']
+                '--samples', str(ROOT / 'gad/tests/fixtures/completion24.jsonl'), '--wall-seconds', '30']
             with patch.object(sys, 'argv', argv), patch('calibrate_rubric_judge.subprocess.run', side_effect=fail_start):
                 with self.assertRaises(subprocess.TimeoutExpired):calibrate_rubric_judge.main()
             summary = json.loads((output / 'summary.partial.json').read_text())
@@ -184,6 +192,7 @@ class ThinkingTests(unittest.TestCase):
             self.assertEqual(8, summary['boundary_not_evaluable_count'])
             self.assertEqual('failed', json.loads((output / 'budget.json').read_text())['status'])
 
+    @unittest.skipUnless(os.environ.get("GAD_TEST_QWEN_TOKENIZER"), "optional real Qwen tokenizer: set GAD_TEST_QWEN_TOKENIZER")
     def test_compat_guidance_keeps_full_parser_and_compiles(self):
         import xgrammar as xgr
         from transformers import AutoConfig, AutoTokenizer
@@ -198,7 +207,7 @@ class ThinkingTests(unittest.TestCase):
         self.assertFalse(parse_events(json.dumps(row), '2x=4')['verified_progress']['valid'])
         row = event_record();row['verified_progress']['reason'] = ''
         with self.assertRaises(ProtocolError):parse_events(json.dumps(row), '2x=4')
-        path = ROOT.parent / 'model/Qwen/Qwen3-14B'
+        path = Path(os.environ['GAD_TEST_QWEN_TOKENIZER'])
         tokenizer = AutoTokenizer.from_pretrained(path, local_files_only=True)
         info = xgr.TokenizerInfo.from_huggingface(tokenizer, vocab_size=AutoConfig.from_pretrained(path).vocab_size)
         compiled = xgr.GrammarCompiler(info, max_threads=2).compile_json_schema(json.dumps(hint), any_whitespace=True)
@@ -208,13 +217,14 @@ class ThinkingTests(unittest.TestCase):
         self.assertFalse(has_xgrammar_unsupported_json_features(targeted))
         self.assertIsNotNone(xgr.GrammarCompiler(info,max_threads=2).compile_json_schema(json.dumps(targeted),any_whitespace=True))
 
+    @unittest.skipUnless(os.environ.get("GAD_TEST_QWEN_TOKENIZER"), "optional real Qwen tokenizer: set GAD_TEST_QWEN_TOKENIZER")
     def test_actual_installed_parser_and_grammar_gate(self):
         # CPU only: exercise the installed v0 parser/logits gate, not a copied implementation.
         import torch
         from transformers import AutoTokenizer
         from vllm.reasoning.deepseek_r1_reasoning_parser import DeepSeekR1ReasoningParser
         from vllm.model_executor.guided_decoding.xgrammar_decoding import XGrammarLogitsProcessor
-        tokenizer = AutoTokenizer.from_pretrained(ROOT.parent / 'model/Qwen/Qwen3-14B', local_files_only=True)
+        tokenizer = AutoTokenizer.from_pretrained(Path(os.environ['GAD_TEST_QWEN_TOKENIZER']), local_files_only=True)
         parser = DeepSeekR1ReasoningParser(tokenizer)
         reasoning, final = parser.extract_reasoning_content('check original constraints</think>{"ok":true}', None)
         self.assertEqual('check original constraints', reasoning);self.assertEqual('{"ok":true}', final)

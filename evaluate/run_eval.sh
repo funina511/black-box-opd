@@ -2,9 +2,9 @@
 # Select an existing RUN; model/dataset/sampling settings are configured below.
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-PYTHON="${GAD_PYTHON:-/mnt/jinbo/miniconda3/envs/gad/bin/python}"
-RUN="runs/gad_qwen3_0.6b_17k/qwen3-0.6b-17k-n2"
-PROFILE="math_unified_v1_n8_math500n2_8k"
+PYTHON="${GAD_PYTHON:-python}"
+RUN="" # Required: pass --run NAME or set a saved run directory here.
+PROFILE="math_unified_v1_n8_math500n2_16k"
 
 # Select stage models by name. "base" comes from train.yaml;
 # SeqKD/Warmup/GAD final checkpoints are located using the training run ID.
@@ -19,14 +19,14 @@ MODEL_PATHS=()
 CHECKPOINT_STEPS=()
 
 # Select datasets and their exact Parquet files.
-DATA_ROOT="/mnt/jinbo/RLRM/OPRD/datasets/test_data_dapo"
+DATA_ROOT="$ROOT/assets/datasets/math_eval"
 DATASETS=(
   "AMC23=$DATA_ROOT/AMC23/test.parquet"
   "AIME24=$DATA_ROOT/AIME24/test.parquet"
   "AIME25=$DATA_ROOT/AIME25/test.parquet"
   "MATH-500=$DATA_ROOT/MATH-500/test.parquet"
 )
-OPRD_ROOT="/mnt/jinbo/RLRM/OPRD"
+OPRD_ROOT="${OPRD_ROOT:-$ROOT/third_party/oprd}"
 
 GPU_IDS="1,2,3,4"
 N=8
@@ -35,8 +35,8 @@ TEMPERATURE=1.0
 TOP_P=0.95
 TOP_K=-1
 REPETITION_PENALTY=1.0
-MAX_TOKENS=8192
-MAX_MODEL_LEN=10240
+MAX_TOKENS=16384
+MAX_MODEL_LEN=18432
 GPU_MEMORY_UTILIZATION=0.85
 SEED=42
 MAX_PROMPTS=0  # 0 = full dataset; e.g. 2 for a small smoke run
@@ -49,7 +49,8 @@ join_csv() {
 }
 
 eval_args=("$@")
-selection=(--run "$ROOT/$RUN")
+selection=()
+[[ -z "$RUN" ]] || selection=(--run "$ROOT/$RUN")
 for arg in "$@"; do
   case "$arg" in
     --run|--run=*|--config|--config=*|--train-config|--train-config=*|--experiment|--experiment=*|--model-name|--model-name=*)

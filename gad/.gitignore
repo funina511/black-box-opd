@@ -200,3 +200,6 @@ logs/
 _guard/
 __pycache__/
 .pytest_cache/
+
+# The extension source uses the same canonical rubric core as deployment.
+!/extensions/core

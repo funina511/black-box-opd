@@ -34,6 +34,8 @@ never need it installed.
 from __future__ import annotations
 
 import os
+import hashlib
+import importlib.metadata
 import random
 import sys
 import threading
@@ -112,20 +114,21 @@ class OpenAIEngine(TeacherEngine):
         }
 
     def fingerprint_fields(self) -> dict:
-        # The HTTP payload already records base_url/extra_body, and concurrency is
-        # irrelevant to the result: keeping this empty means indexes produced by
-        # earlier versions of this sampler stay resumable.
-        return {}
+        # A chat API does not expose a trustworthy weight/template digest.
+        return {'backend':self.provider,'remote_model_content':'unverified_by_chat_api',
+                'vllm_version':'unverified_remote','template_control':'requested_only_unverified_remote'}
 
     def _sample_one(self, client, row: Row) -> dict:
         request = {
             "model": self.teacher_model,
             "messages": row["prompt"],
-            "n": self.m,
             "temperature": self.temperature,
             "top_p": self.top_p,
             "max_tokens": self.max_tokens,
         }
+        # Single-answer providers need no OpenAI-specific multi-choice option.
+        if self.m > 1:
+            request["n"] = self.m
         if self.extra_body:
             request["extra_body"] = self.extra_body
         last_error = None
@@ -188,11 +191,8 @@ def render_prompt(tokenizer, messages, chat_template_kwargs: Mapping[str, Any]) 
                 list(messages), add_generation_prompt=True, tokenize=False, **kwargs
             )
             return text, True
-        except Exception as exc:  # noqa: BLE001 - fall back, but say so
-            sys.stderr.write(
-                f"[sample_teacher] WARNING: chat template rejected {sorted(kwargs)} ({type(exc).__name__}: {exc}); "
-                "rendering without it\n"
-            )
+        except TypeError as exc:
+            raise ValueError('requested chat-template parameters are unsupported: '+str(sorted(kwargs))) from exc
     text = tokenizer.apply_chat_template(list(messages), add_generation_prompt=True, tokenize=False)
     return text, False
 
@@ -314,8 +314,27 @@ class VllmOfflineEngine(TeacherEngine):
         }
 
     def fingerprint_fields(self) -> dict:
-        # Anything that can change the generated text. batch_size/concurrency and
-        # the memory knobs are deliberately absent: they only change throughput.
+        if not hasattr(self,'_content_identity'):
+            from transformers import AutoTokenizer
+            self.vllm_version=importlib.metadata.version('vllm')
+            files=sorted(p for p in Path(self.model_path).iterdir() if p.is_file() and
+                (p.suffix in ('.json','.jinja','.safetensors','.bin') or p.name in ('tokenizer.model','merges.txt','vocab.txt')))
+            if not any(p.suffix in ('.safetensors','.bin') for p in files):raise ValueError('sampling model weights missing')
+            hashes={}
+            for p in files:
+                h=hashlib.sha256()
+                with p.open('rb') as stream:
+                    for chunk in iter(lambda:stream.read(1024*1024),b''):h.update(chunk)
+                hashes[p.name]=h.hexdigest()
+            tokenizer=AutoTokenizer.from_pretrained(self.model_path,local_files_only=True,trust_remote_code=self.trust_remote_code)
+            probe,applied=render_prompt(tokenizer,[{'role':'user','content':'ping'}],self.chat_template_kwargs)
+            if not probe:raise ValueError('empty chat-template CPU probe')
+            if 'enable_thinking' in self.chat_template_kwargs:
+                opposite={**self.chat_template_kwargs,'enable_thinking':not self.chat_template_kwargs['enable_thinking']}
+                if render_prompt(tokenizer,[{'role':'user','content':'ping'}],opposite)[0]==probe:
+                    raise ValueError('thinking switch has no observable effect in CPU template probe')
+            self._content_identity={'files':hashes,'template_probe_sha256':hashlib.sha256(probe.encode()).hexdigest(),
+                'chat_template_kwargs_applied':applied,'identity_version':'teacher.sampling.content.v1'}
         return {
             "backend": self.provider,
             "model_path": self.model_path,
@@ -324,6 +343,8 @@ class VllmOfflineEngine(TeacherEngine):
             "tensor_parallel_size": self.tensor_parallel_size,
             "max_model_len": self.max_model_len,
             "chat_template_kwargs": self.chat_template_kwargs or None,
+            'content':self._content_identity,'seed':self.seed,'batch_size':self.batch_size,
+            'enforce_eager':self.enforce_eager,'gpu_memory_utilization':self.gpu_memory_utilization,
         }
 
     def sample(self, rows: Sequence[Row], on_result: ResultFn) -> None:
