@@ -90,6 +90,30 @@ def ensure_commit(repo: Path, branch: str, commit: str, *, allow_fetch: bool) ->
     return True
 
 
+def ensure_source_repo(repo: Path) -> None:
+    """Rebuild only an absent source; never overwrite a populated flat checkout."""
+    root = Path(__file__).resolve().parents[2]
+    source = root/'third_party/verl'
+    metadata = __import__('json').loads((source/'SOURCE.json').read_text())
+    bundle = source/'verl.bundle'
+    if sha256_file(bundle) != metadata['bundle_sha256']:
+        raise PipelineError('vendored verl bundle hash mismatch')
+    if not repo.exists():
+        ensure_dir(repo.parent)
+        if sha256_file(source/'template/shallow') != metadata['template_sha256']:
+            raise PipelineError('vendored shallow boundary template hash mismatch')
+        run_command(['git','clone','--template='+str(source/'template'),'--branch','pinned/gad',str(bundle),str(repo)], component='source-rebuild')
+        # The three upstream snapshots came from a shallow checkout, not full history.
+        if metadata.get('shallow_boundaries'):
+            (repo/'.git/shallow').write_text('\n'.join(metadata['shallow_boundaries'])+'\n')
+    code, top, _ = capture_command(['git','-C',str(repo),'rev-parse','--show-toplevel'])
+    if code or Path(top).resolve() != repo.resolve() or not (repo/'.git').exists():
+        raise PipelineError(f'{repo} is not its own source Git repository; preserve a nonempty flat directory and rebuild at a fresh path')
+    for pin in PINNED_BACKENDS.values():
+        if not commit_exists(repo,pin['commit']):
+            raise PipelineError('fixed backend object missing from source: '+pin['commit'])
+
+
 def worktree_state(path: Path) -> dict:
     if not (path / ".git").exists():
         return {"exists": path.exists(), "is_worktree": False}
@@ -178,8 +202,7 @@ def main() -> int:
         print(backend_root / stage)
         return 0
 
-    if not repo.exists():
-        raise PipelineError(f"source repo not found: {repo}")
+    ensure_source_repo(repo)
     if not (repo / "verl").is_dir():
         raise PipelineError(f"{repo} does not look like a verl checkout (no verl/ directory)")
 

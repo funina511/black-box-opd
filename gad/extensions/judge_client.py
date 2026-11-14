@@ -11,14 +11,15 @@ from .core.contracts import schema_for, parse_judge, V2_INPUT_VERSION, V2_SCHEMA
 
 
 class ServiceUnavailable(RuntimeError):
-    pass
+    def __init__(self,message, *, submission_unknown=False):
+        super().__init__(message);self.submission_unknown=submission_unknown
 
 
 class JudgeRequestRejected(ValueError):
     code = 'judge_request_rejected'
 
 
-def guidance_schema(version, schema_override=None):
+def guidance_schema(version, schema_override=None, process_protocol='events_v27'):
     """Decoder hints only. The unchanged full wire/parser remains authoritative.
 
     v0 falls back to an impractical Outlines FSM on string minLength. Its
@@ -26,7 +27,7 @@ def guidance_schema(version, schema_override=None):
     parse_events still rejects missing/empty evidence and reasons.
     """
     from copy import deepcopy
-    schema = deepcopy(schema_override if schema_override is not None else schema_for(version))
+    schema = deepcopy(schema_override if schema_override is not None else schema_for(version,process_protocol))
     if version == 'math_process_v2':
         def visit(value):
             if isinstance(value, dict):
@@ -44,10 +45,34 @@ def guidance_backend(version):
 
 class RequestBudget:
     """A shared ledger across benchmark arms; only actual send attempts reserve."""
-    def __init__(self,limit):
+    def __init__(self,limit, state_path=None, wall_seconds=None):
         self.limit=limit;self.count=0;self.lock=threading.Lock()
+        self.state_path=state_path
+        self.wall_seconds=wall_seconds
+        if state_path:
+            from pathlib import Path
+            path=Path(state_path);path.parent.mkdir(parents=True,exist_ok=True)
+            self._persistent(False)
+    def _persistent(self, reserve):
+        import fcntl
+        from pathlib import Path
+        from .common import atomic_json
+        path=Path(self.state_path)
+        with path.with_suffix(path.suffix+'.lock').open('a') as lock:
+            fcntl.flock(lock,fcntl.LOCK_EX)
+            row=json.loads(path.read_text()) if path.exists() else {
+                'limit':self.limit,'count':0,'started_epoch':time.time(),
+                'wall_seconds':self.wall_seconds}
+            if row['limit']!=self.limit:raise ValueError('persistent generation budget limit changed')
+            self.count=row['count']
+            allowed=(self.limit is None or self.count<self.limit)
+            allowed &= row.get('wall_seconds') is None or time.time()-row['started_epoch']<row['wall_seconds']
+            if reserve and allowed:row['count']+=1;self.count=row['count']
+            atomic_json(path,row)
+            return allowed
     def reserve(self):
         with self.lock:
+            if self.state_path:return self._persistent(True)
             if self.limit is not None and self.count>=self.limit:return False
             self.count+=1;return True
 
@@ -64,10 +89,13 @@ class JudgeClient:
         self.request_count = 0
         self.targeted_ids = set()
         self.shared_budget = request_budget
+        if request_budget is None and options.get('budget_state_path'):
+            self.shared_budget=RequestBudget(options.get('request_budget'),options['budget_state_path'])
         self.api_permits = threading.BoundedSemaphore(options.get('concurrency',1))
         self.api_active = 0
         self.api_peak = 0
         self.api_ledger = []
+        self.health_get_count = 0
 
     def reserve_request(self):
         with self.budget_lock:
@@ -116,10 +144,11 @@ class JudgeClient:
                 raise JudgeRequestRejected(f'judge request rejected: HTTP {exc.code}') from exc
             raise ServiceUnavailable(f'judge HTTP service failure: {exc.code}') from exc
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
-            raise ServiceUnavailable(f"judge transport failed: {type(exc).__name__}") from exc
+            raise ServiceUnavailable(f"judge transport failed: {type(exc).__name__}",submission_unknown=True) from exc
 
     def health(self, deadline=None):
         def get(suffix):
+            self.health_get_count += 1
             if deadline is None:
                 return self.request(suffix)
             remaining = deadline - time.monotonic()
@@ -138,12 +167,13 @@ class JudgeClient:
         started = time.monotonic()
         version = self.options.get('rubric_version', 'math_v1')
         thinking = self.options.get('enable_thinking', False)
+        process_protocol=self.options.get('process_protocol','events_v27')
         tokens = self.tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=True,
                                                     enable_thinking=thinking)
         capacity = {'input_tokens': len(tokens), 'reserved_output_tokens': self.options['max_output_tokens'],
                     'max_context_tokens': self.options['max_context_tokens']}
-        metadata = {'request_id': request_id, **capacity, 'input_protocol': V2_INPUT_VERSION if version == 'math_process_v2' else None,
-                    'schema_version': V2_SCHEMA_VERSION if version == 'math_process_v2' else None,
+        metadata = {'request_id': request_id, **capacity, 'input_protocol': ('rubric.direct.input.v1' if process_protocol=='direct_v1' else V2_INPUT_VERSION) if version == 'math_process_v2' else None,
+                    'schema_version': ('rubric.direct.v1' if process_protocol=='direct_v1' else V2_SCHEMA_VERSION) if version == 'math_process_v2' else None,
                     'enable_thinking': thinking, 'reasoning_parser': self.options.get('reasoning_parser')}
         if len(tokens) + self.options['max_output_tokens'] > self.options['max_context_tokens']:
             return request_id, {**metadata, 'error': 'judge_context_exceeded', 'error_detail': capacity,
@@ -151,6 +181,7 @@ class JudgeClient:
                                 'elapsed_seconds': time.monotonic() - started, 'api_attempts': []}
         failure, detail, usage, api_attempts, raw = None, None, {}, [], None
         output_diagnostics = {}
+        submission_unknown=False
         retries = (min(self.options['max_retries'], 1) if version == 'math_process_v2' else self.options['max_retries']) if max_retries is None else max_retries
         attempts = 0
         for attempt in range(retries + 1):
@@ -162,7 +193,7 @@ class JudgeClient:
                        'temperature': self.options['temperature'], 'seed': self.options.get('seed', 42),
                        'top_p': self.options.get('top_p', 1.), 'top_k': self.options.get('top_k', -1),
                        'min_p': self.options.get('min_p', 0.), 'max_tokens': self.options['max_output_tokens'],
-                       'guided_json': guidance_schema(version, schema_override), 'guided_decoding_backend': guidance_backend(version),
+                       'guided_json': guidance_schema(version, schema_override, process_protocol), 'guided_decoding_backend': guidance_backend(version),
                        'chat_template_kwargs': {'enable_thinking': thinking}}
             # The same client-wide permit bounds primary, review and retry sends.
             permit_started=time.monotonic()
@@ -189,6 +220,7 @@ class JudgeClient:
                 try:
                     result = self.request('/chat/completions', payload, min(remaining, self.options['request_timeout_seconds']))
                     send_state['state']='response_received'
+                    send_state['usage']=result.get('usage',{})
                 except Exception:
                     send_state['state']='client_failed_server_state_unknown'
                     raise
@@ -211,23 +243,26 @@ class JudgeClient:
                 if not isinstance(raw, str) or not raw.strip():
                     raise ValueError('judge_final_content_missing')
                 response = None
-                if version == 'math_process_v2' and parse_override is None:
+                if version == 'math_process_v2' and process_protocol!='direct_v1' and parse_override is None:
                     from .core.process_v2 import response_from_messages
                     response = response_from_messages(messages)
-                parsed = parse_override(raw) if parse_override is not None else parse_judge(raw, version, response)
+                parsed = parse_override(raw) if parse_override is not None else parse_judge(raw, version, response, process_protocol)
                 return request_id, {**metadata, **output_diagnostics, 'parsed': parsed, 'raw_output': raw, 'api_attempts': api_attempts,
                                     'cacheable': True, 'attempts': attempts, 'usage': usage,
                                     'elapsed_seconds': time.monotonic() - started}
             except ServiceUnavailable as exc:
                 failure, detail = 'judge_transport_error', str(exc)
+                submission_unknown=bool(getattr(exc,'submission_unknown',False))
                 api_attempts.append({'attempt': attempts, 'seconds': time.monotonic() - before, 'transport_error': str(exc)})
+                if submission_unknown:break  # A timeout is not evidence that remote generation stopped.
             except (ValueError, KeyError, TypeError) as exc:
                 failure = getattr(exc, 'code', str(exc))
                 detail = str(exc)
                 if version == 'math_process_v2':break  # No unchanged format/evidence retries.
         return request_id, {**metadata, **output_diagnostics, 'error': failure, 'error_detail': detail, 'failure_kind': 'technical',
                             'raw_output': raw, 'api_attempts': api_attempts, 'cacheable': False,
-                            'attempts': attempts, 'usage': usage, 'elapsed_seconds': time.monotonic() - started}
+                            'attempts': attempts, 'usage': usage, 'elapsed_seconds': time.monotonic() - started,
+                            'submission_unknown':submission_unknown}
 
     def targeted(self, request_id, messages, deadline):
         from .core.semantic_v24 import SCHEMA, parse_review

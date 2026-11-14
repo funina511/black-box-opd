@@ -1,0 +1,50 @@
+{
+  "review/CT": {
+    "right_wrong_pairs": 3312,
+    "corrected": 149,
+    "damaged": 3,
+    "net": 146
+  },
+  "review/CW": {
+    "right_wrong_pairs": 3940,
+    "corrected": 70,
+    "damaged": 48,
+    "net": 22
+  },
+  "selection/CT": {
+    "right_wrong_pairs": 3388,
+    "corrected": 135,
+    "damaged": 6,
+    "net": 129
+  },
+  "selection/CW": {
+    "right_wrong_pairs": 3981,
+    "corrected": 69,
+    "damaged": 44,
+    "net": 25
+  },
+  "selection/TT": {
+    "right_wrong_pairs": 60,
+    "corrected": 0,
+    "damaged": 0,
+    "net": 0
+  },
+  "review/TT": {
+    "right_wrong_pairs": 82,
+    "corrected": 1,
+    "damaged": 2,
+    "net": -1
+  },
+  "selection/TW": {
+    "right_wrong_pairs": 21,
+    "corrected": 0,
+    "damaged": 1,
+    "net": -1
+  },
+  "review/TW": {
+    "right_wrong_pairs": 19,
+    "corrected": 0,
+    "damaged": 2,
+    "net": -2
+  }
+}

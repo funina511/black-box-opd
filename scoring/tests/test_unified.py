@@ -56,12 +56,32 @@ class MetricTests(unittest.TestCase):
                 for q,r,answer in [(0,0,'2'),(0,1,'3'),(1,0,'2'),(1,1,'2')]]
     def test_denominators(self):
         result=summarize(self.rows(),expected_questions=[0,1],n=2)
-        self.assertTrue(result['evaluation_complete']);self.assertEqual(.75,result['pass_at_1']);self.assertEqual(.75,result['sample_accuracy'])
+        self.assertTrue(result['evaluation_complete']);self.assertTrue(result['sample_index_complete'])
+        self.assertEqual(.75,result['pass_at_1']);self.assertEqual(.75,result['sample_accuracy'])
+        self.assertEqual(.75,result['sample_accuracy_lower']);self.assertEqual(.75,result['sample_accuracy_upper'])
+        self.assertEqual(1.0,result['coverage'])
+        self.assertEqual(3,result['confirmed_correct']);self.assertEqual(1,result['confirmed_incorrect'])
         self.assertEqual(1,result['first_rollout_accuracy']);self.assertEqual(1,result['any_success_at_n'])
-        for rows in (self.rows()[:-1],self.rows()+[self.rows()[0]]):
-            result=summarize(rows,expected_questions=[0,1],n=2);self.assertFalse(result['evaluation_complete']);self.assertNotIn('pass_at_1',result)
+        # A missing sample slot keeps the fixed denominator and turns into a lower/upper interval.
+        result=summarize(self.rows()[:-1],expected_questions=[0,1],n=2)
+        self.assertFalse(result['evaluation_complete']);self.assertFalse(result['sample_index_complete'])
+        self.assertEqual(4,result['expected_samples']);self.assertIsNone(result['sample_accuracy'])
+        self.assertEqual(.5,result['pass_at_1']);self.assertEqual(.5,result['sample_accuracy_lower'])
+        self.assertEqual(.75,result['sample_accuracy_upper']);self.assertEqual(.75,result['coverage'])
+        self.assertEqual(1,result['unresolved_samples'])
+        self.assertEqual(result['sample_accuracy_lower'],result['provisional_metrics']['sample_accuracy'])
+        self.assertEqual(result['sample_accuracy_lower'],result['provisional_metrics']['pass_at_1'])
+        # An identical duplicate is not scored twice and cannot be declared complete.
+        result=summarize(self.rows()+[self.rows()[0]],expected_questions=[0,1],n=2)
+        self.assertFalse(result['evaluation_complete']);self.assertFalse(result['sample_index_complete'])
+        self.assertIsNone(result['sample_accuracy']);self.assertEqual(4,result['expected_samples'])
+        self.assertGreaterEqual(result['duplicate_samples'],1)
+        # An unresolved (timeout) slot is never silently counted as a confirmed wrong answer.
         rows=self.rows();rows[0].update(grade_status='timeout',correct=None)
-        self.assertFalse(summarize(rows,expected_questions=[0,1],n=2)['evaluation_complete'])
+        result=summarize(rows,expected_questions=[0,1],n=2)
+        self.assertFalse(result['evaluation_complete']);self.assertIsNone(result['sample_accuracy'])
+        self.assertEqual(1,result['unresolved_samples'])
+        self.assertEqual(result['sample_accuracy_lower'],result['provisional_metrics']['first_rollout_accuracy'])
 
 
 class EventTests(unittest.TestCase):

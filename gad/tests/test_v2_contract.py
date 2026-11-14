@@ -16,6 +16,8 @@ from scoring.math import score,identity
 sys.path.insert(0,str(ROOT/'scoring/tests'))
 from test_unified import event_record
 
+from cpu_fixtures import compose_cpu_config as compose_config
+
 
 class V2ContractTests(unittest.TestCase):
     def test_selected_teacher_duplicates(self):

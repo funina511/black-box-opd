@@ -30,7 +30,7 @@ run_suite() {
     failures=$((failures + 1))
   fi
 }
-for test in "${LMOPS_ROOT}/sample/tests/"test_*.py "${LMOPS_ROOT}/gad/tests/"test_*.py "${LMOPS_ROOT}/scoring/tests/"test_*.py; do
+for test in "${LMOPS_ROOT}/sample/tests/"test_*.py "${LMOPS_ROOT}/gad/tests/"test_*.py "${LMOPS_ROOT}/scoring/tests/"test_*.py "${LMOPS_ROOT}/rubric/tests/"test_*.py; do
   run_suite "${test#${LMOPS_ROOT}/}" "${PYTHON_BIN}" "${test}"
 done
 run_suite "unified scorer self-test" "${PYTHON_BIN}" "${LMOPS_ROOT}/gad/tools/math_metrics.py" --self-test

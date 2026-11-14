@@ -45,7 +45,7 @@
 
 主方案 rubric 阶段为 `[warmup,gad]`，从 Warmup 首次 critic 更新生效。
 Warmup actor 保留 teacher SFT 和原门槛；GAD actor 保留当前 rollout、adv 奖励、
-GRPO/PPO 与 KL 设置。三个辅助分数不混入 actor reward。
+GRPO/PPO 与 KL 设置。默认三个辅助分数不混入 actor reward；可选的 Actor 混合模式见文末 2026-11-03 接入说明。
 `rubric.stages=[gad]` 是阶段消融；Warmup-only、Warmup replay、动态 critic 批次、
 SP>1、多节点及改变 world size 的恢复暂不支持。
 
@@ -185,8 +185,39 @@ bash evaluate/run_eval.sh --run /绝对路径/实验目录 \
 
 ### v2.4 附录 B 冻结（2026-10-17）
 
-当前新候选使用 wire `rubric.events.v2.7`、input `rubric.input.v2.5`、targeted review v4。证据字段采用可省略的 r1…r8 对象槽，空证据 `{}`；实际 xgrammar 禁止 r9。保留 `process_v25.py`（旧 ID）、`process_v26.py`/`evidence_ranges_v1.py`（旧数组）、`semantic_review_v2.py`/`semantic_review_v3.py` 解释器。旧原始 spec/prompt 与已部署 backend 不变；新路径为 `math_process_v27.yaml`、`judge_math_process_v27.txt`。
+当前新候选使用 wire `rubric.events.v2.7`、input `rubric.input.v2.5`、targeted review v4。证据字段采用可省略的 r1…r8 对象槽，事件证据至少一个区间；复核标签的额外空证据可用 `{}`；实际 xgrammar 禁止 r9。保留 `process_v25.py`（旧 ID）、`process_v26.py`/`evidence_ranges_v1.py`（旧数组）、`semantic_review_v2.py`/`semantic_review_v3.py` 解释器。旧原始 spec/prompt 与已部署 backend 不变；新路径为 `math_process_v27.yaml`、`judge_math_process_v27.txt`。
 
 8B Thinking / TP2 / concurrency2 只做了一次固定4条检查；新协议解决生成期证据容量，不认证数学准确性。已知噪声按探索性训练记录，不再等待全面人工门槛；保留技术失败、未知、连续空 Student 过程监督与数值保护。固定维度分母3、门控tau4、辅助系数0.1、Replay关闭；不能让早期候选的 `legacy_active` 覆盖正式 Loss。正式试验与 Actor 评估由用户运行。
 
 [完整交付与成本](../reports/rubric_v24_bc_20261017/README.md)。当前 full batch 的 Judge 成本可能达数小时/步，延长截止不是提速。
+
+
+## 2026-11-03：direct_v1 与 Actor 混合奖励
+
+成功实验的 direct_v1 差分现已归并主目录；旧事件协议配置仍可使用。新实验请用完整的 `configs/launch_rubric_actor_06b_17k.yaml`，不能仅凭旧 `rubric_joint` 方法名判断已使用 direct_v1。
+
+GAD 可选 `rubric.reward_source=adv_plus_rubric`，奖励为 `adv + β(c+p−e)`，其中 c/p/e 为同一次 Critic 前向的末有效 token logits 在 FP32 下取 sigmoid。首版 β=.05、三个权重均为1；Critic 仍训练 BT + 三维辅助 BCE。所有 Student rollout 使用预测分数；Judge 抽样 mask 只约束标签监督。Warmup 保留原 Teacher SFT；默认关闭公共 `actor_reward.fp32` 时，β=0 / adv_only 保留旧值与 dtype。
+
+`configs/launch_rubric_actor_c_only_06b_17k.yaml` 仅将 Actor 的 p/e 权重设为0，β和正确性权重不变；Critic 仍为相同 joint 模式，不能用 `correctness_only` 方法代替这个消融。
+
+新配置内已指定来源 `runs/rubric_direct_06b_17k_20261026/warmup/global_step_271`，目标新增271步到542。从四头 Warmup 正常交接，GAD 优化器/调度器新建；首次保存后再用新 run 的 `--resume-gad` 恢复。
+
+[实现、固定开发样本、短训练与命令](../reports/rubric_actor_20261103/README.md)。监控位于已有 `extension_metrics.jsonl`、console 和 W&B：分量、排序/平局、真实 GRPO 优势，以及与本轮有效 Student 标签的一致性。10步窗口在同阶段恢复时从既有已提交日志重建。
+
+## 2026-11-07：n=4 三组对照
+
+新增三个 `configs/launch_*_n4_06b_17k.yaml`，只跑 GAD，复用各自 Warmup271，新增271步到542；保留原提速参数。三组开启公共 `actor_reward.fp32`，消除历史纯 adv BF16 / 混合 FP32 的精度差别。该开关默认 false，不改变旧 run 身份或默认行为。
+
+naive 用 `adv_only` + `rubric.actor_reward_shadow=true`，记录四头及稳定 question_id；baseline 的 `actor_reward.scorer_monitor=true` 只记录 Student 正确性和截断。新奖励 `adv_plus_rubric_groupnorm` 在 driver 汇总完整 uid 后分别归一化 adv/rubric、加权混合，原 GRPO 再标准化；零贡献逐组直通，rubric 分母下限由离线选择确定。worker 不做组内计算。数学边界和10步窗口诊断见 [实施报告](../reports/gad_n4_20261105/README.md)。
+
+正式第三组须等 naive542 完成后，用 `gad/tools/select_actor_reward.py --run runs/rubric_naive_n4_06b_17k_v2` 在影子日志选参并由用户确认。配置中的 w=1、τ=.05、full 仅供工程短测；`rubric.actor_reward_selection_confirmed=false` 会阻止正式启动，不能直接把占位参数当作已选定参数。
+
+## 2026-11-10：n=4 执行提速与精确续训
+
+naive、Actor-rubric 两个 n=4 配置开启 `execution.teacher_prefetch` 和 `execution.early_annotation`：rollout 前预取当前批 Teacher，rollout 后提前提交 Student，计算 log-prob/ref/reward/优势期间等待 Judge。Correctness 仍在主线程使用原 scorer；所有标注结果在 Critic、Actor 更新前汇合。仍按 Critic→Actor 更新，replay 默认关闭且保留完整实现。
+
+预取与主流程共用标签构造、缓存键及标注账本；失败重试计入既有 `max_annotation_attempts`，不改变 Judge 协议身份。`teacher_prefetch.jsonl` 记录预取身份与命中，`training_phases.jsonl` 记录原生计时区间，供外部显存采样对齐。
+
+新扩展后端会在 `data.pt` 保存 epoch 起点的 sampler RNG。同阶段精确续训拒绝缺少该状态的旧检查点；旧 Warmup271 仅允许作为显式阶段交接，保留原交接题序并从新 run 保存完整状态。原 naive v1 保留为中止探索，不在其上续训。
+
+KV/offload 和 Judge 并发对照未达到计划门槛，保留原 offload、KV 0.55、梯度检查点及并发 8。正式 naive v2 由用户启动；三组方法、完整 17k 数据、n=4、长度和选参规则不变。验证与命令见 [本轮报告](../reports/gad_speed_20261110/README.md)。

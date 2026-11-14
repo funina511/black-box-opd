@@ -56,21 +56,32 @@ def apply(worktree, stage):
         apply_patches(worktree)
     paths = ["verl/workers/critic/dp_critic.py", "verl/workers/fsdp_workers.py",
              "verl/trainer/ppo/ray_trainer.py", "verl/utils/dataset/rl_dataset.py",
-             "verl/workers/rollout/vllm_rollout/vllm_rollout_spmd.py", "verl/trainer/config/ppo_trainer.yaml"]
+             "verl/workers/rollout/vllm_rollout/vllm_rollout_spmd.py", "verl/trainer/config/ppo_trainer.yaml",
+             "verl/trainer/main_ppo.py"]
     texts = {name: (worktree / name).read_text() for name in paths}
     key = paths[0]
     texts[key] = replace(texts[key], "    def _forward_micro_batch(self, micro_batch, compute_teacher):\n",
         "    def _forward_micro_batch(self, micro_batch, compute_teacher):\n"
-        "        # ALGORITHM(gad_extensions_v1): adv-only external reward contract.\n"
+        "        # ALGORITHM(gad_extensions_v1): original adv reward or opt-in mixture.\n"
         "        if self.config.get('rubric', {}).get('enabled', False):\n"
         "            from verl.experimental.gad_extensions.worker import reward_forward\n"
         "            return reward_forward(self, micro_batch, compute_teacher)\n", "critic reward")
+    texts[key] = replace(texts[key], "    def compute_values(self, data: DataProto) -> torch.Tensor:\n",
+        "    def compute_values(self, data: DataProto) -> torch.Tensor:\n"
+        "        from verl.experimental.gad_extensions.actor_reward import components_enabled\n"
+        "        if self.config.get('rubric', {}).get('enabled', False) and components_enabled(self.config.rubric):\n"
+        "            from verl.experimental.gad_extensions.worker import compute_mixed_values\n"
+        "            return compute_mixed_values(self, data)\n", "mixed sequence components")
     texts[key] = replace(texts[key], "    def update_critic(self, data: DataProto):\n",
         "    def update_critic(self, data: DataProto):\n"
         "        if self.config.get('rubric', {}).get('enabled', False):\n"
         "            from verl.experimental.gad_extensions.worker import update_joint\n"
         "            return update_joint(self, data)\n", "critic update")
     key = paths[1]
+    # Warmup wraps this line in a teacher/student branch (one deeper indent).
+    texts[key] = replace(texts[key], 'output = DataProto.from_dict(tensors={"values": values})',
+        'output = DataProto.from_dict(tensors=values if isinstance(values, dict) else {"values": values})',
+        'mixed worker payload')
     texts[key] = replace(texts[key], "        critic_model_config.num_labels = 1\n",
         "        # ALGORITHM(gad_extensions_v1): structure prepared before FSDP/meta construction.\n"
         "        if config.get('rubric', {}).get('enabled', False):\n"
@@ -85,6 +96,24 @@ def apply(worktree, stage):
         "                from verl.experimental.gad_extensions.worker import record_worker_source\n"
         "                record_worker_source(config)\n", "worker model")
     key = paths[2]
+    texts[key] = replace(texts[key], '                with marked_timer("step", timing_raw):\n',
+        '                with marked_timer("step", timing_raw):\n'
+        '                    if self.gad_extensions is not None:\n'
+        '                        self.gad_extensions.prefetch_teachers(gen_batch, batch, self.global_steps)\n',
+        'teacher prefetch before rollout')
+    texts[key] = replace(texts[key], '                    # recompute old_log_probs\n',
+        '                    if self.gad_extensions is not None and self.gad_extensions.execution.get("early_annotation"):\n'
+        '                        self.gad_extensions.begin_prepare(batch, self.global_steps)\n'
+        '                    # recompute old_log_probs\n', 'student annotation after rollout')
+    texts[key] = replace(texts[key], '            self.train_dataloader.load_state_dict(dataloader_state_dict)\n',
+        '            from verl.experimental.gad_extensions.sampler_state import prepare_state\n'
+        '            dataloader_state_dict = prepare_state(self.train_dataloader, dataloader_state_dict, global_step_folder)\n'
+        '            self.train_dataloader.load_state_dict(dataloader_state_dict)\n', 'exact sampler restore')
+    texts[key] = replace(texts[key], '                    progress_bar.close()\n                    return\n',
+        '                    progress_bar.close()\n'
+        '                    if self.gad_extensions is not None:\n'
+        '                        self.gad_extensions.close()\n'
+        '                    return\n', 'annotation pool close')
     texts[key] = replace(texts[key], '    def _validate(self):\n',
         '    def _validate(self):\n'
         "        if self.config.trainer.get('disable_validation', False):\n"
@@ -99,10 +128,16 @@ def apply(worktree, stage):
     texts[key] = replace(texts[key], "        # load checkpoint before doing anything\n        self._load_checkpoint()",
         "        # ALGORITHM(gad_extensions_v1): lazy driver state; disabled is inert.\n"
         "        self.gad_extensions = None\n"
-        "        if self.config.trainer.get('rubric', {}).get('enabled', False) or self.config.trainer.get('critic_replay', {}).get('enabled', False):\n"
+        "        if self.config.trainer.get('gad_extensions', {}).get('enabled', False):\n"
         "            from verl.experimental.gad_extensions.runtime import Runtime\n"
         "            self.gad_extensions = Runtime(self)\n"
-        "        # load checkpoint before doing anything\n        self._load_checkpoint()", "driver init")
+        "        # load checkpoint before doing anything\n        self._load_checkpoint()\n"
+        "        _gad_invocation_start_step = self.global_steps\n", "driver init")
+    texts[key] = replace(texts[key], '                        batch.batch["token_level_scores"] = reward_tensor\n',
+        "                        # All uid rows are gathered here, before the unchanged GRPO.\n"
+        "                        from verl.experimental.gad_extensions.actor_reward import driver_reward\n"
+        "                        reward_tensor = driver_reward(batch, reward_tensor, self.config.trainer, self.config.algorithm)\n"
+        '                        batch.batch["token_level_scores"] = reward_tensor\n', 'driver group reward')
     texts[key] = replace(texts[key], "                            critic_output = self.critic_wg.update_critic(batch)",
         "                            critic_batch = batch\n"
         "                            if self.gad_extensions is not None:\n"
@@ -115,7 +150,8 @@ def apply(worktree, stage):
         "                    # Log rollout generations if enabled\n", "driver commit")
     texts[key] = replace(texts[key], "                is_last_step = self.global_steps >= self.total_training_steps\n",
         "                is_last_step = self.global_steps >= self.total_training_steps\n"
-        "                extension_stop = bool(self.gad_extensions is not None and self.gad_extensions.options.get('max_invocation_steps') and self.gad_extensions.invocation_steps + 1 >= self.gad_extensions.options['max_invocation_steps'])\n", "invocation limit")
+        "                _gad_invocation_limit = self.config.trainer.get('gad_extensions', {}).get('max_invocation_steps')\n"
+        "                extension_stop = bool(_gad_invocation_limit and self.global_steps - _gad_invocation_start_step >= _gad_invocation_limit)\n", "invocation limit")
     texts[key] = replace(texts[key], "                    if self.config.trainer.save_freq > 0 and (is_last_step or self.global_steps % self.config.trainer.save_freq == 0):\n",
         "                    if is_last_step or extension_stop or (self.config.trainer.save_freq > 0 and self.global_steps % self.config.trainer.save_freq == 0):\n", "limit checkpoint")
     texts[key] = replace(texts[key], "                if is_last_step:\n                    pprint(f\"Final validation metrics: {last_val_metrics}\")",
@@ -145,6 +181,17 @@ def apply(worktree, stage):
         "            else:\n"
         "                raise ValueError('missing same-stage extension state')\n"
         "        actor_path = os.path.join(global_step_folder, \"actor\")\n", "load state")
+    # A wall-time trace aligns the external three-second physical GPU samples
+    # with rollout, optimizer updates and checkpoint saving; native timers stay.
+    import re
+    before_fit, fit = texts[key].split('    def fit(self):', 1)
+    def trace_phase(match):
+        indent, arguments = match.group(1), match.group(2)
+        return (indent + 'with (self.gad_extensions.timed_phase(marked_timer, ' + arguments + ') '
+                'if self.gad_extensions is not None else marked_timer(' + arguments + ')):')
+    fit = re.sub(r'^(\s*)with marked_timer\(("(?:step|gen|old_log_prob|ref|reward|adv|update_critic|update_actor|save_checkpoint)"[^\n]*)\):',
+                 trace_phase, fit, flags=re.M)
+    texts[key] = before_fit + '    def fit(self):' + fit
     key = paths[3]
     texts[key] = replace(texts[key], "        self.max_prompt_length = config.get(\"max_prompt_length\", 1024)\n",
         "        self.max_prompt_length = config.get(\"max_prompt_length\", 1024)\n"
@@ -199,17 +246,29 @@ def apply(worktree, stage):
     def block(value):
         return "".join("  " + line + "\n" for line in yaml.safe_dump(value, sort_keys=False).splitlines())
     driver = nested("rubric")
-    driver.update({"spec_hash": None, "scorer_path": None, "judge_fingerprint": None, 'scoring_math': None})
+    driver.update({"spec_hash": None, "prompt_hash": None, "protocol_identity": None,
+                   "scorer_path": None, "judge_fingerprint": None, 'scoring_math': None})
     worker = {"enabled": False, "gradient_diagnostics_dir": None, "mode": "joint", "loss_coef": .1,
-              **{key: EXTENSION_DEFAULTS["rubric." + key] for key in ("loss_mode", "count_gate_tau", "gradient_diagnostics_interval", "gradient_diagnostics_max_pairs")},
+              **{key: EXTENSION_DEFAULTS["rubric." + key] for key in ("loss_mode", "count_gate_tau", "gradient_diagnostics_interval", "gradient_diagnostics_max_pairs", "reward_source", "actor_reward_coef", "actor_reward_shadow", "actor_reward_group_weight", "actor_reward_rubric_std_floor")},
+              'actor_reward_weights': driver['actor_reward_weights'],
               'version': 'math_v1',
               "head_layout": driver["head_layout"], "spec_hash": None}
     texts[key] = replace(texts[key], "critic:\n", "critic:\n" + block({"rubric": worker, "extensions_code_hash": None, "extensions_enabled": False}), "critic yaml")
     state = {"enabled": False, "identity": None, "stage": None, "start_step": 0,
+             "execution": {"teacher_prefetch": False, "early_annotation": False},
              'scorer_identity': None,
-             "token_identity": None, "teacher_index": None, "sampling_seed": None, "max_invocation_steps": None}
+             "token_identity": None, "teacher_index": None, "sampling_seed": None, "max_invocation_steps": None,
+             "actor_reward_fp32": False, "student_scorer_monitor": False}
     texts[key] = replace(texts[key], "trainer:\n", "trainer:\n" + block(
         {"rubric": driver, "critic_replay": nested("replay"), "gad_extensions": state}), "trainer yaml")
+    key = paths[6]
+    texts[key] = replace(texts[key], '        sampler = RandomSampler(data_source=dataset, generator=train_dataloader_generator)\n',
+        '        if data_config.get("gad_extensions", {}).get("enabled", False):\n'
+        '            from verl.experimental.gad_extensions.sampler_state import ExactRandomSampler\n'
+        '            sampler = ExactRandomSampler(data_source=dataset, generator=train_dataloader_generator)\n'
+        '        else:\n'
+        '            sampler = RandomSampler(data_source=dataset, generator=train_dataloader_generator)\n',
+        'exact random sampler')
     # Validate all anchors and compile in memory before writing any file.
     for name, text in texts.items():
         if name.endswith(".py"):

@@ -44,7 +44,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from teacher_index import TeacherIndex, TeacherIndexError  # noqa: E402
 from task_template import extract_final_answer, normalize_raw_prompt, sha256_file  # noqa: E402
-from math_scorer import compute_score  # noqa: E402
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from gad.extensions.teacher_provenance import bind_selected
 from scoring.math import compute_score
@@ -73,6 +72,12 @@ SELECT_CHOICES = ("all", "first", "correct", "nontruncated", "correct-nontruncat
 MISSING_REASONS = ("not_in_teacher_index", "no_teacher_answer")
 
 
+class UnresolvedCandidates(ValueError):
+    def __init__(self,details):
+        self.details=details
+        super().__init__('teacher correctness filtering unresolved: '+json.dumps(details,ensure_ascii=False))
+
+
 def pick_teacher_candidate(answers: list[str], *, select: str, ground_truth: str,
                         truncated: list[bool] | None = None) -> tuple[str | None, str]:
     """Return (answer, reason). ``answer is None`` means the prompt must be dropped.
@@ -91,15 +96,19 @@ def pick_teacher_candidate(answers: list[str], *, select: str, ground_truth: str
     flags = list(truncated or [])
     flags += [False] * (len(answers) - len(flags))
 
-    def first_ok(require_correct: bool, require_complete: bool) -> str | None:
+    unresolved=[]
+    def first_ok(require_correct: bool, require_complete: bool, *, track_unknown=True) -> str | None:
         for i, (answer, was_truncated) in enumerate(zip(answers, flags)):
             if require_complete and was_truncated:
                 continue
             if require_correct:
                 graded = compute_score(answer, ground_truth)
-                if graded.get('grade_status') in ('error', 'timeout'):
-                    raise ValueError('teacher correctness filtering has unresolved grader error: ' + str(graded.get('error_reason')))
-                if float(graded['score']) <= .5:continue
+                value=graded.get('score')
+                if value is None or graded.get('grade_status') in ('error','timeout'):
+                    if track_unknown:unresolved.append({'candidate_index':i,'parse_status':graded.get('parse_status'),
+                        'grade_status':graded.get('grade_status'),'reason':graded.get('error_reason')})
+                    continue
+                if float(value) <= .5:continue
             return (answer, i)
         return None
 
@@ -113,9 +122,11 @@ def pick_teacher_candidate(answers: list[str], *, select: str, ground_truth: str
         return answer[0], "first_correct_nontruncated" if select == "correct-nontruncated" else "first_correct", answer[1]
     if select == "correct-nontruncated":
         # Distinguish "wrong" from "right but cut off" so the report is actionable.
-        if first_ok(require_correct=True, require_complete=False) is not None:
+        if unresolved:raise UnresolvedCandidates(unresolved)
+        if first_ok(require_correct=True, require_complete=False,track_unknown=False) is not None:
             return None, "correct_but_truncated", None
         return None, "no_correct_answer", None
+    if unresolved:raise UnresolvedCandidates(unresolved)
     return None, "no_correct_answer", None
 
 
@@ -181,6 +192,7 @@ def main() -> int:
     reasons: dict[str, int] = {}
     selected_answers: list[str] = []
     truncated_selected = 0
+    unresolved_rows=[]
 
     for row in rows:
         uid = str(row["extra_info"]["index"])
@@ -193,12 +205,11 @@ def main() -> int:
             continue
 
         truncation_flags = list((record.sampling or {}).get("truncated") or [])
-        answer, reason, selected_index = pick_teacher_candidate(
-            record.teacher_answers,
-            select=args.select,
-            ground_truth=ground_truth,
-            truncated=truncation_flags,
-        )
+        try:
+            answer, reason, selected_index = pick_teacher_candidate(record.teacher_answers,
+                select=args.select,ground_truth=ground_truth,truncated=truncation_flags)
+        except UnresolvedCandidates as exc:
+            unresolved_rows.append({'uid':uid,'candidates':exc.details});continue
         reasons[reason] = reasons.get(reason, 0) + 1
         if answer is None:
             dropped.append({"uid": uid, "reason": reason, "num_answers": len(record.teacher_answers)})
@@ -231,6 +242,10 @@ def main() -> int:
             }
         )
 
+    if unresolved_rows:
+        report=Path(str(args.out)+'.unresolved.json');report.parent.mkdir(parents=True,exist_ok=True)
+        report.write_text(json.dumps({'select':args.select,'unresolved_questions':len(unresolved_rows),'rows':unresolved_rows},ensure_ascii=False,indent=2))
+        raise SystemExit(f'[build_gad_data] unresolved correctness for {len(unresolved_rows)} questions; no dataset written; see {report}')
     missing = [row for row in dropped if row.get("reason") in MISSING_REASONS]
     if missing and not args.allow_missing:
         # A deliberate filter (wrong answer / truncated / no correct answer) is a

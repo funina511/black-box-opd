@@ -5,8 +5,15 @@ import json
 from pathlib import Path
 import sys
 ROOT=Path(__file__).resolve().parents[2];sys.path.insert(0,str(ROOT))
-from scoring.math import score, identity, evaluation_value
+from scoring.math import score, identity, evaluation_value, evaluation_status
 from rubric.core.contracts import file_hash
+
+
+def _value(row):
+    value = evaluation_value(row)
+    if value is None:
+        return None
+    return int(value)
 
 
 def run(rows_path,output,expected_count,step,scope):
@@ -19,7 +26,9 @@ def run(rows_path,output,expected_count,step,scope):
         if 'output' not in row or 'ground_truth' not in row:raise ValueError(f'row {i+1}: missing saved output/reference; regeneration or explicit source recovery is required')
         scored.append({**row,**score(row['output'],row['ground_truth']), 'original_source_file':str(source.resolve()),'original_source_line':i+1})
     ids=[r.get('response_id',str(i)) for i,r in enumerate(scored)]
-    duplicate=len(ids)-len(set(ids));valid_count=sum(evaluation_value(r) is not None for r in scored)
+    duplicate=len(ids)-len(set(ids))
+    values=[_value(row) for row in scored]
+    valid_count=sum(value is not None for value in values)
     complete=len(scored)==expected_count and not duplicate and valid_count==len(scored)
     unique={};unexpected=0
     for i,row in enumerate(scored):
@@ -28,13 +37,29 @@ def run(rows_path,output,expected_count,step,scope):
             unexpected+=1;continue
         unique.setdefault(row.get('response_id',str(index)),row)
     complete=complete and not unexpected and len(unique)==expected_count
-    provisional=sum(evaluation_value(r) or 0 for r in unique.values())/expected_count
+    confirmed_correct=sum(1 for value in values if value==1)
+    confirmed_incorrect=sum(1 for value in values if value==0)
+    unresolved=expected_count-confirmed_correct-confirmed_incorrect
+    lower=confirmed_correct/expected_count
+    upper=(confirmed_correct+unresolved)/expected_count
+    coverage=(confirmed_correct+confirmed_incorrect)/expected_count
     metrics={'schema_version':'gad.validation_rescore.v1','global_step':step,'validation_scope':scope,
         'expected_count':expected_count,'actual_count':len(scored),'duplicate_count':duplicate,'unexpected_count':unexpected,
-        'evaluation_complete':complete,'acc':provisional if complete else None,'provisional_acc':provisional,
+        'evaluation_complete':complete,'acc':lower if complete else None,
+        'sample_accuracy':lower if complete else None,
+        'sample_accuracy_lower':lower,'sample_accuracy_upper':upper,'coverage':coverage,
+        'confirmed_correct':confirmed_correct,'confirmed_incorrect':confirmed_incorrect,
+        'unresolved_samples':unresolved,
+        'provisional_acc':lower,
         'provisional_denominator':expected_count,'unknown_contribution':'zero_in_provisional_only',
+        'provisional_metrics_policy':('Fixed expected slots; provisional_acc/sample_accuracy_lower are lower bounds '
+                                      '(unresolved contribute zero).'),
+        'aggregation_protocol':{'revision':'eval-fix.2','denominator':'expected_count',
+            'complete':'count/duplicate/unexpected/unique checks and U == 0',
+            'interval':'lower=C/N, upper=(C+U)/N, coverage=(C+W)/N'},
         'source':str(source.resolve()),'source_sha256':file_hash(source),'scorer_identity':identity(),
         'generation_reused':True,'failures':[{'source_line':i+1,'response_id':r.get('response_id'),
+            'evaluation_status':evaluation_status(r),
             'parse_status':r['parse_status'],'grade_status':r['grade_status'],'error_reason':r.get('error_reason')}
             for i,r in enumerate(scored) if evaluation_value(r) is None]}
     # Validate every input before creating the output; never overwrite any old pass.

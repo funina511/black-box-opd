@@ -328,6 +328,12 @@ class ResumeWorkerStatePatch(BackendPatch):
                 "                )\n"
                 "\n"
             )
+            original_load = '\n        self.actor_rollout_wg.load_checkpoint(actor_path,'
+            if original_load in text[text.index('    def _load_checkpoint('):]:
+                # SeqKD/Warmup already restore every worker unconditionally. Keep
+                # that path intact; adding the GAD hook would load them twice.
+                insertion = ('        # '+self.MARKER+' upstream worker restore already runs once;\n'
+                             '        # resume_load_worker_state needs no additional load on this branch.\n')
             text = replace_once(text, anchor, insertion + anchor, what="ray_trainer._load_checkpoint resume hook")
             _write(trainer_path, text)
             changed = True
@@ -1213,6 +1219,44 @@ class TeacherAwareMicroBatchPatch(BackendPatch):
         return not problems, problems
 
 
+class ReferenceOffloadPatch(BackendPatch):
+    name = 'gad-reference-offload'
+    description = 'honor reference param_offload in FSDP1 and FSDP2'
+    FILE = 'verl/workers/fsdp_workers.py'
+    MARKER = MARKER_PREFIX + 'reference-offload)'
+
+    def apply(self, worktree):
+        path=worktree/self.FILE;text=_read(path);changed=False
+        if self.MARKER not in text:
+            text=replace_once(text,'cpu_offload = None if role == "actor" else CPUOffload(offload_params=True)',
+                '# '+self.MARKER+' actor keeps its manual offload path.\n'
+                '        cpu_offload = CPUOffload(offload_params=True) if role == "ref" and fsdp_config.get("param_offload", True) else None',what=self.name)
+            text=replace_once(text,'cpu_offload = None if role == "actor" else CPUOffloadPolicy(pin_memory=True)',
+                'cpu_offload = CPUOffloadPolicy(pin_memory=True) if role == "ref" and fsdp_config.get("param_offload", True) else None',what=self.name+' fsdp2')
+            text=text.replace('# We force reference policy to use CPUOffload to save memory.',
+                              '# Reference CPUOffload follows its role configuration.')
+            _write(path,text);_assert_compiles(path,what=self.name);changed=True
+        return PatchResult(self.name,changed,[self.FILE])
+
+    def verify(self,worktree):
+        text=_read(worktree/self.FILE)
+        ok=self.MARKER in text and text.count('role == "ref" and fsdp_config.get("param_offload", True)')==2
+        return ok, [] if ok else [self.FILE+': reference FSDP offload switch missing']
+
+
+class LearningRateLoggingPatch(BackendPatch):
+    name='gad-learning-rate-logging'
+    FILE='verl/utils/logger/aggregate_logger.py'
+    def apply(self,worktree):
+        path=worktree/self.FILE;text=_read(path);new=text.replace('output.append(f"{k}:{v:.3f}")',
+            'output.append(f"{k}:{v:.8g}" if "lr" in k.lower() else f"{k}:{v:.3f}")')
+        _write(path,new)
+        return PatchResult(self.name,text!=new,[self.FILE])
+    def verify(self,worktree):
+        ok='{v:.8g}' in _read(worktree/self.FILE)
+        return ok,[] if ok else ['learning rate console precision missing']
+
+
 class VllmEngineLimitsPatch(BackendPatch):
     """Forward ``rollout.max_num_seqs`` to the vLLM engine."""
 
@@ -1273,6 +1317,8 @@ ALL_PATCHES: tuple[BackendPatch, ...] = (
     ValidationDiagnosticsPatch(),
     TeacherAwareMicroBatchPatch(),
     VllmEngineLimitsPatch(),
+    ReferenceOffloadPatch(),
+    LearningRateLoggingPatch(),
 )
 
 

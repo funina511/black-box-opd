@@ -1,0 +1,35 @@
+# Fill every CHANGE_ME. Same-topology fresh runs only; resharding is unsupported.
+run:
+  python_bin: /CHANGE_ME/envs/gad/bin/python
+resources:
+  gpus: 1,2,3,4
+  n_gpus_per_node: 4
+  nnodes: 1
+  judge_gpus: 6,7
+models:
+  actor_param_offload: true
+  actor_optimizer_offload: true
+  critic_param_offload: true
+  critic_optimizer_offload: true
+  ref_param_offload: true
+  actor_gradient_checkpointing: true
+  critic_gradient_checkpointing: true
+  student: /CHANGE_ME/models/Qwen3-0.6B
+  discriminator_init: /CHANGE_ME/assets/qwen3_0.6b_math_v2_adv_seed42
+rollout:
+  tensor_model_parallel_size: 1
+  gpu_memory_utilization: 0.55
+  enforce_eager: true
+rubric:
+  judge:
+    concurrency: 2
+    tensor_parallel_size: 2
+    base_url: http://127.0.0.1:8031/v1
+    tokenizer_path: /CHANGE_ME/models/Qwen3-8B
+data:
+  train_file: /CHANGE_ME/data/dapo_math_17k_gad_v2/gad_train.parquet
+  val_file: /CHANGE_ME/data/dapo_math_17k_gad_v2/gad_dev.parquet
+  teacher_index: /CHANGE_ME/data/dapo_math_17k_gad_v2/teacher_index.jsonl
+  manifest: /CHANGE_ME/data/dapo_math_17k_gad_v2/manifest.json
+validation:
+  quick_file: /CHANGE_ME/data/dapo_math_17k_gad_v2/quick_dev.parquet

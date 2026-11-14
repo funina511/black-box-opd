@@ -1,5 +1,10 @@
 # 通用外部评测入口
 
+外部评测脚本默认回答上限为 **16384 tokens**，总上下文上限为 **18432 tokens**
+（为提示词预留 2048）。`scripts/eval.sh` 和 `run_extended_eval.sh` 均继承此设置，
+默认 profile 名称也改为 `16k`。可用 `--max-tokens`、`--max-model-len` 临时覆盖；
+训练 rollout 的长度与已保存的实验配置不受影响。
+
 在 [run_eval.sh](run_eval.sh) 顶部设置 `RUN`、`MODELS`、`MODEL_PATHS`、`DATASETS`、GPU 和采样参数，然后运行：
 
 ```bash
@@ -29,9 +34,11 @@ bash evaluate/run_eval.sh --run qwen3_1.7b \
 
 评测固定使用与当前 GAD 训练一致的 **non-thinking** 提示，并核对实验配置及运行快照中的模型和训练数据。已完成的训练阶段若只有分片 checkpoint，正式运行时会先在 CPU 上合并为 Hugging Face 模型并核对权重；`--dry-run` 会显示 `needs_export`。若一个阶段有意停在配置目标之前，可在脚本顶部设置 `CHECKPOINT_STEPS=("gad=542")`，或运行时传入 `--checkpoint-step gad=542`；脚本会核对指定步数的完整 checkpoint 分片并导出对应模型，在计划里标记为显式选择的 checkpoint。未显式指定时，未完成阶段不会被当成最终模型评测，报错会列出最新 checkpoint 步数和配置目标步数。改变评测步数时请更换 `PROFILE`。各数据集默认每题生成 `N=8` 次；MATH-500 使用 `MATH500_N=2`。输出位于该实验 run 目录下的 `evaluation/<PROFILE>/`。更换模型、数据或采样设置时更新 `PROFILE`；脚本会拒绝把不同设置写进已经存在的同名结果目录。设置 `MAX_PROMPTS=2` 时会自动使用单独的 `_smoke2` 目录。
 
-生成与原始评分复用 OPRD 的 `sft.sample_teacher` 和 `sft.score_math`，同一批结果再用 LMOps 训练时的 CARD 评分器复算，汇总时分别列出两种口径。评测在训练进程占用同一 run 时拒绝启动；`--dry-run` 和 `--summary` 不占用 GPU。完整评测结束后脚本会自动打印汇总表。
+生成复用 OPRD 的 `sft.sample_teacher`；数学题统一使用 `math_unified_v1`，不再同时输出 OPRD/CARD 两套竞争口径。选择题使用评估专用的 `choice_exact_v2`，按明确的最终选项精确匹配，记录任务自己的评分器身份；Minerva 另有评估侧单位规则 `minerva_units_v1`。`--task-n TASK=N` 可按任务设置每题采样次数。评测在训练进程占用同一 run 时拒绝启动；`--dry-run` 和 `--summary` 不占用 GPU。完整评测结束后脚本会自动打印汇总表。
 
-`evaluate.py` 和 `summarize_eval.py` 是通用实现，日常只需使用和编辑 `run_eval.sh`。
+新增的 Minerva、Olympiad-Bench、GPQA Diamond 和 MMLU-Pro 数学子集通过 [run_extended_eval.sh](run_extended_eval.sh) 选择，默认使用与训练相同 DAPO 提示词的 `extended_dapo_v2` 数据（选择题另要求只输出选项字母）；原 `run_eval.sh` 的四任务默认设置保留。数据范围、评分限制及命令见 [扩展评测说明](EXTENDED_EVALUATION.md)。
+
+`evaluate.py` 和 `summarize_eval.py` 是通用实现，日常只需使用和编辑 `run_eval.sh`。跨 run、跨 profile 的各任务准确率及均值表用 `python evaluate/summarize_runs.py RUN [RUN ...]`（或 `--all`），说明见 [扩展评测说明](EXTENDED_EVALUATION.md#运行)。
 
 ## 单独导出模型
 

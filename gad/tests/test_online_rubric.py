@@ -32,12 +32,15 @@ def pair(index, teacher="T", student=None, step=1):
             "student": {"response_id": student, "token_ids": [5, 6], "response": "Answer: 3",
                         "truncated": False, "finish_reason": "stop"}}
 
+from cpu_fixtures import compose_cpu_config as compose_config
+
 
 class ConfigTests(unittest.TestCase):
     def test_default_disabled_and_new_budget(self):
         cfg = compose_config()
         self.assertFalse(cfg.get("rubric.enabled"))
         self.assertFalse(cfg.get("replay.enabled"))
+        cfg.data['models.student']=str(ROOT/'gad/tests/fixtures/identity_model')
         overrides = hydra_overrides(cfg, "warmup", Path("/tmp"), 0)
         self.assertTrue(any(arg == 'trainer.rubric={enabled:false}' for arg in overrides))
         self.assertTrue(any(arg == 'critic.rubric={enabled:false}' for arg in overrides))
@@ -62,7 +65,9 @@ class ConfigTests(unittest.TestCase):
         cfg = compose_config(settings=["rubric.enabled=true", "rubric.mode=correctness_only", "rubric.stages=[gad]"])
         self.assertEqual(['gad'], cfg.get('rubric.stages'))
         self.assertEqual([], validate_config(cfg))
+        cfg.data['models.student']=str(ROOT/'gad/tests/fixtures/identity_model')
         self.assertTrue(any("enabled:false" in arg for arg in hydra_overrides(cfg, "warmup", Path("/tmp"), 0)))
+        cfg.data['models.student']=str(ROOT/'gad/tests/fixtures/identity_model')
         self.assertEqual([], hydra_overrides(cfg, "seqkd", Path("/tmp"), 0))
 
 

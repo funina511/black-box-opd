@@ -89,7 +89,7 @@ def parse_review(raw):
                 except EvidenceError as exc:raise ProtocolError(exc.code,'invalid finite evidence slots') from exc
             if kind=='labels':
                 ids=item['event_ids']
-                if not isinstance(ids,list) or any(e not in ('e1','e2','e3','e4') for e in ids) or len(set(ids))!=len(ids):raise ProtocolError('semantic_schema_error','invalid event refs')
+                if not isinstance(ids,list) or len(ids)>4 or any(not isinstance(e,str) or e not in ('e1','e2','e3','e4') for e in ids) or len(set(ids))!=len(ids):raise ProtocolError('semantic_schema_error','invalid event refs')
     return r
 
 
@@ -116,6 +116,11 @@ def apply_review(parsed, response, review=None, failure=None):
             ok=decision['verdict']=='supported' and bool(ids) and located and not refutes and eid in row['events']
             event_ok[eid]=ok
             if ok and eid in row['events']:row['events'][eid]['supporting_span_ranges']=decision['supporting_span_ranges']
+        for d in dims:
+            decision=review['labels'][d]
+            if decision['verdict']=='supported':
+                # References are part of the one allowed evidence relocation.
+                row[d]['event_ids']=deepcopy(decision['event_ids'])
         result=parse_events(json.dumps(row,ensure_ascii=False),response)
         event_ok={e:ok and result['_event_validity'].get(e,{}).get('valid',False) for e,ok in event_ok.items()}
         result['_initial_record']=deepcopy(parsed['_record'])
@@ -128,7 +133,7 @@ def apply_review(parsed, response, review=None, failure=None):
         refs=decision['event_ids'] if decision else []
         # Own explicit supported decision plus located evidence OR explicitly reviewed events.
         ok=bool(decision and decision['verdict']=='supported' and located and not refutes and (ids or refs) and all(event_ok.get(e,False) for e in refs))
-        dependencies=set(row[d]['event_ids'])
+        dependencies=set(result[d]['event_ids'])
         dependencies.update(e for e,v in row['events'].items() if v['type'] in ('explicit_error','corrected_error'))
         # Independent partial progress need not establish all unrelated errors.
         if d=='verified_progress' and row[d]['value']==.5:

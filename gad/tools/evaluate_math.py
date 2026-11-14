@@ -307,9 +307,22 @@ def main() -> int:
         report = {'benchmarks': {}, 'overall': {}}
         for benchmark in expected:
             report['benchmarks'][benchmark] = summarize(grouped.get(benchmark, []), expected_questions=expected[benchmark], n=sample_counts[benchmark])
-        complete = all(item['evaluation_complete'] for item in report['benchmarks'].values())
+        entries = list(report['benchmarks'].values())
+        complete = all(bool(item.get('evaluation_complete')) for item in entries)
+
+        def macro(field):
+            values = [item.get(field) for item in entries]
+            return (sum(values) / len(values)) if values and all(value is not None for value in values) else None
+
         report['overall'] = {'evaluation_complete': complete, 'aggregation': 'benchmark macro mean',
-            'pass_at_1': sum(item['pass_at_1'] for item in report['benchmarks'].values()) / len(expected) if complete else None}
+            'pass_at_1': macro('sample_accuracy') if complete else None,
+            'sample_accuracy': macro('sample_accuracy') if complete else None,
+            'sample_accuracy_lower': macro('sample_accuracy_lower'),
+            'sample_accuracy_upper': macro('sample_accuracy_upper'),
+            'coverage': macro('coverage'),
+            'confirmed_correct': sum(item.get('confirmed_correct') or 0 for item in entries),
+            'confirmed_incorrect': sum(item.get('confirmed_incorrect') or 0 for item in entries),
+            'unresolved_samples': sum(item.get('unresolved_samples') or 0 for item in entries)}
     else:
         report = summarize_sampling(grouped, answer_token_limit=args.max_tokens)
     report["label"] = args.label or model_path.name
@@ -335,7 +348,16 @@ def main() -> int:
     log(f"predictions -> {predictions_path}")
     log(f"report      -> {out_dir / 'metrics.json'}")
     for benchmark, entry in report['benchmarks'].items():
-        log(f"  {benchmark}: pass_at_1={entry.get('pass_at_1')}, evaluation_complete={entry.get('evaluation_complete', True)}")
+        if entry.get('evaluation_complete', True):
+            log(f"  {benchmark}: sample_accuracy={entry.get('sample_accuracy')}, evaluation_complete=True")
+        else:
+            log(f"  {benchmark}: lower={entry.get('sample_accuracy_lower')}, "
+                f"upper={entry.get('sample_accuracy_upper')}, coverage={entry.get('coverage')}, "
+                f"unresolved={entry.get('unresolved_samples')}, evaluation_complete=False")
+    overall = report.get('overall') or {}
+    if overall:
+        log(f"  overall: lower={overall.get('sample_accuracy_lower')}, upper={overall.get('sample_accuracy_upper')}, "
+            f"coverage={overall.get('coverage')}, evaluation_complete={overall.get('evaluation_complete')}")
     return 0
 
 

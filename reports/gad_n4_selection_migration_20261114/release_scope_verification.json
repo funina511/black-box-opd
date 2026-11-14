@@ -1,0 +1,14 @@
+{
+  "scanned_git_files": 656,
+  "credential_pattern_findings": [],
+  "large_git_files_over_10mib": [],
+  "git_asset_overlap": [],
+  "fixed_exporter_required_files_verified": [
+    "gad/deepscaler/rewards/math_reward.py",
+    "gad/setup.py",
+    "gad/LICENSE",
+    "rubric/README.md",
+    "archive/README.md",
+    "gad/extensions/core"
+  ]
+}

@@ -1,0 +1,27 @@
+{
+  "full_initial": {
+    "tests": 455,
+    "skipped_optional": 5,
+    "failed_tests": 2,
+    "failed_suites": [
+      "gad/tests/test_n4_reward.py"
+    ]
+  },
+  "fix": "Only CPU fixture binding: load the real launch parameters, replace model/tokenizer/data paths with existing test fixtures; no assertions removed.",
+  "targeted_after_fix": {
+    "n4": 12,
+    "run_config": 15,
+    "performance_tools": 4,
+    "all_passed": true
+  },
+  "final_applicable_cpu_tests_passed": 450,
+  "optional_skipped": 5,
+  "extended_evaluate": {
+    "tests": 23,
+    "passed": 23
+  },
+  "scorer_self_tests": 2,
+  "gpu_tests_run": false,
+  "protected_source_files_unchanged": 46,
+  "note": "Full suite once; only affected suites rerun after fixture fix. No claim that the first full log was all green."
+}

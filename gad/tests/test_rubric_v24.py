@@ -40,7 +40,9 @@ def event_decision(**kwargs):
 
 
 def review():
-    return {'version':VERSION,'labels':{d:decision() for d in ('verified_progress','unresolved_error_severity')},'events':{'e1':event_decision()}}
+    return {'version':VERSION,'labels':{d:{**decision(),'event_ids':['e1']} for d in ('verified_progress','unresolved_error_severity')},'events':{'e1':event_decision()}}
+
+from cpu_fixtures import compose_cpu_config as compose_config
 
 
 class ProtocolTests(unittest.TestCase):
@@ -84,6 +86,7 @@ class ProtocolTests(unittest.TestCase):
         self.assertFalse(result['_semantic_review']['human_verified'])
         row=event_record(error=1);row['events']['e2']={**deepcopy(row['events']['e1']),'type':'explicit_error','supporting_span_ranges':{'r1': {'start': 's2', 'end': 's2'}}};row['unresolved_error_severity']['event_ids']=['e2']
         r=review();r['labels']['verified_progress']=decision('refuted');r['events']['e2']=event_decision(spans=['s2'])
+        r['labels']['unresolved_error_severity']['event_ids']=['e2']
         result=apply_review(parsed(row),'2x=4\nx=3',r)
         self.assertFalse(result['verified_progress']['valid']);self.assertTrue(result['unresolved_error_severity']['valid'])
 
@@ -247,11 +250,13 @@ class LossTests(unittest.TestCase):
         torch.testing.assert_close(auxiliary_loss(x,y,m,'fixed_dimension_gated',4),auxiliary_loss(x,y,m,'legacy_active')/12)
 
     def test_modes_are_validated_and_transferred_to_worker(self):
-        from config import compose_config,validate_config
+        from config import validate_config
+        from cpu_fixtures import compose_cpu_config as compose_config
         from extension_config import hydra_overrides
         for mode in LOSS_MODES:
             cfg=compose_config(overrides=[str(ROOT/'configs/overrides/rubric_v2_correctness.yaml')],settings=['rubric.loss_mode='+mode])
             self.assertEqual([],validate_config(cfg))
+            cfg.data['models.student']=str(ROOT/'gad/tests/fixtures/identity_model')
             args=hydra_overrides(cfg,'warmup',Path('/tmp/v24'),0)
             self.assertIn('"'+mode+'"',next(a for a in args if a.startswith('critic.rubric=')))
         cfg.data['rubric.loss_mode']='oops';self.assertTrue(any('loss_mode' in e for e in validate_config(cfg)))

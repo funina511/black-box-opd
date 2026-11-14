@@ -1,0 +1,10 @@
+# Review-only settings, not a complete launch config.
+# Apply with --overrides to the existing Actor n=4 launch; keep unconfirmed until reviewed.
+# Critic remains joint c/p/e; this changes the Actor reward components only.
+rubric.reward_source: adv_plus_rubric_groupnorm
+rubric.actor_reward_weights.answer_correctness: 1.0
+rubric.actor_reward_weights.verified_progress: 0.0
+rubric.actor_reward_weights.unresolved_error_severity: 0.0
+rubric.actor_reward_group_weight: 0.25
+rubric.actor_reward_rubric_std_floor: 0.045992180705070496
+rubric.actor_reward_selection_confirmed: false

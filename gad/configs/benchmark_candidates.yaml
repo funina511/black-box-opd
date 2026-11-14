@@ -11,3 +11,22 @@ kv50_micro2:
   optim.critic_micro_batch_size_per_gpu: 2
 kv55:
   rollout.gpu_memory_utilization: 0.55
+
+resident:
+  models.actor_param_offload: false
+  models.actor_optimizer_offload: false
+  models.critic_param_offload: false
+  models.critic_optimizer_offload: false
+resident_micro2:
+  models.actor_param_offload: false
+  models.actor_optimizer_offload: false
+  models.critic_param_offload: false
+  models.critic_optimizer_offload: false
+  optim.critic_micro_batch_size_per_gpu: 2
+
+# Appendix B: each candidate starts from the same conservative source.
+b0_control: {}
+b1_cuda_graph:
+  rollout.enforce_eager: false
+b2_micro2:
+  optim.critic_micro_batch_size_per_gpu: 2

@@ -31,7 +31,8 @@ def extract_pairs(batch, tokenizer, token_identity, step, stage):
             mask = batch.batch[attention_key][i, -values.shape[-1]:].bool()
             ids = values[mask].cpu().tolist()
             if not ids:
-                raise ValueError("empty response cannot enter an extension critic update")
+                raise ValueError(f'empty response tokens before optimizer update: stage={stage} step={step} '
+                                 f'role={role} sample={prompt_id} source_index={index}; all-zero response mask')
             text = tokenizer.decode(ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)
             rid = digest({"prompt": prompt_hash, "tokens": ids, "text": text, "template": token_identity})
             if role == "student":
@@ -91,6 +92,15 @@ def pack_pairs(pairs, template):
     return result
 
 
+def supervision_identity(pair, role):
+    """Same visible supervision deduplicates across roles; different visibility does not."""
+    response = pair[role]
+    return digest({'response': response['response_id'], 'ground_truth': pair.get('ground_truth'),
+                   'prompt_truncated': bool(pair.get('prompt_truncated',False)),
+                   'source_truncated': bool(response.get('source_truncated', response.get('truncated',False))),
+                   'training_token_truncated': bool(response.get('training_token_truncated', False))})
+
+
 def auxiliary_weights(pairs, targets, masks, global_mini_size, dp_size):
     """Mirror contiguous DP dispatch and each rank's local minibatch slicing."""
     import torch
@@ -102,11 +112,11 @@ def auxiliary_weights(pairs, targets, masks, global_mini_size, dp_size):
     counts = torch.zeros(size, 3)
     for offset in range(0, per_rank, local_mini):
         rows = [rank * per_rank + index for rank in range(dp_size) for index in range(offset, offset + local_mini)]
-        multiplicity = Counter(pairs[i][role]["response_id"] for i in rows for role in weights)
+        multiplicity = Counter(supervision_identity(pairs[i],role) for i in rows for role in weights)
         by_response = {}
         for i in rows:
             for role in weights:
-                rid = pairs[i][role]["response_id"]
+                rid = supervision_identity(pairs[i],role)
                 labels = (targets[role][i].tolist(), masks[role][i].tolist())
                 if rid in by_response and by_response[rid] != labels:
                     raise ValueError("same response has inconsistent labels")

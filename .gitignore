@@ -130,9 +130,22 @@ dmypy.json
 
 # Local Qwen3 experiment artifacts and shared resource links
 /runs/
-/assets/
+/assets/models/
+/assets/initialization/
+/assets/datasets/math_eval/
+/third_party/verl/verl.bundle
 /reports/
 /data/
 /gad/outputs/
 /gad/.backends_gad_extensions*/
 /GAD修改计划.md
+
+# Rebuilt from the vendored bundle; never track the generated nested repository.
+/gad/verl/
+/gad/.backends*/
+*.local.yaml
+
+# Local historical candidates; current implementations live in evaluate/scoring/gad/rubric.
+/judge_fix/
+/archive/*
+!/archive/README.md

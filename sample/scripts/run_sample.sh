@@ -67,6 +67,7 @@ CONFIG="$(realpath "${CONFIG}")"
 
 cfg() {
   "${PYTHON_BIN}" - "$CONFIG" "$1" <<'PY'
+import json
 import sys
 from pathlib import Path
 import yaml
@@ -87,6 +88,8 @@ path_keys = {
 }
 if dotted in path_keys and node:
     node = str((config_path.parent / Path(str(node)).expanduser()).resolve())
+elif isinstance(node, (dict, list)):
+    node = json.dumps(node, ensure_ascii=False)
 print("" if node is None else node)
 PY
 }
@@ -271,18 +274,24 @@ case "${TEACHER_ENGINE}" in
       --retries "$(cfg teacher.retries)"
     )
     API_KEY_ENV="$(cfg teacher.api_key_env)"
-    if [[ -n "${API_KEY_ENV}" && -n "${!API_KEY_ENV:-}" ]]; then
-      sample_args+=(--api-key "${!API_KEY_ENV}")
+    # sample_teacher.py reads this variable itself; never put the key in argv
+    # (which would also expose it in --dry-run output).
+    if [[ -n "${API_KEY_ENV}" ]]; then
+      export GAD_TEACHER_API_KEY="${!API_KEY_ENV:-EMPTY}"
     else
-      sample_args+=(--api-key EMPTY)
+      export GAD_TEACHER_API_KEY=EMPTY
     fi
-    echo "[run_sample] teacher engine: openai (endpoint $(cfg teacher.base_url); start it with scripts/serve_teacher.sh)"
+    TEACHER_EXTRA_BODY="$(cfg teacher.extra_body)"
+    [[ -z "${TEACHER_EXTRA_BODY}" ]] || sample_args+=(--extra-body-json "${TEACHER_EXTRA_BODY}")
+    echo "[run_sample] teacher engine: openai (endpoint $(cfg teacher.base_url))"
     ;;
   *)
     echo "ERROR: unknown teacher.engine '${TEACHER_ENGINE}' (expected openai or vllm_offline)" >&2
     exit 2
     ;;
 esac
+TEACHER_SEED="$(cfg teacher.seed)"
+[[ -z "${TEACHER_SEED}" ]] || sample_args+=(--seed "${TEACHER_SEED}")
 [[ -n "${STUDENT_TOKENIZER}" ]] && sample_args+=(--student-tokenizer "${STUDENT_TOKENIZER}" --tokenizer-limit 500)
 echo "[run_sample] sample log: ${TEACHER_LOG_FILE}"
 

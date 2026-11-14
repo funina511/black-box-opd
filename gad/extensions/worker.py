@@ -36,8 +36,37 @@ def reward_forward(critic, data, teacher):
     last = last_response_logits(logits, mask)
     positions = torch.arange(mask.shape[-1], device=mask.device)
     indices = torch.where(mask.bool(), positions, -1).max(-1).values
+    from .actor_reward import mixed_enabled, combine_last
+    options = critic.config.get('rubric', {})
+    if mixed_enabled(options):
+        scores, _ = combine_last(last, options)
+        return torch.zeros_like(mask, dtype=torch.float32).scatter(1, indices[:, None], scores[:, None])
     reward = torch.zeros_like(mask, dtype=logits.dtype)
     return reward.scatter(1, indices[:, None], last[:, :1])
+
+
+@torch.no_grad()
+def compute_mixed_values(critic, data):
+    """Same forward, static microbatch/DP order; only B x 4 extra communication."""
+    from .actor_reward import combine_last, mixed_enabled
+    if data.meta_info['use_dynamic_bsz'] or critic.ulysses_sequence_parallel_size != 1:
+        raise ValueError('mixed rubric reward requires static batching and SP=1')
+    critic.critic_module.eval()
+    batch = data.select(batch_keys=['responses', 'input_ids', 'attention_mask', 'position_ids']).batch
+    rewards, components = [], []
+    for micro in batch.split(data.meta_info['micro_batch_size']):
+        logits, mask = forward_channels(critic, micro, False)
+        last = last_response_logits(logits, mask)
+        if mixed_enabled(critic.config.rubric):
+            scores, parts = combine_last(last, critic.config.rubric)
+        else:
+            # Shadow and groupnorm only extract components. No uid math on workers.
+            parts = torch.cat((last[:, :1].float(), last[:, 1:].float().sigmoid()), dim=-1)
+            scores = last[:, 0]
+        indices = torch.where(mask.bool(), torch.arange(mask.shape[-1], device=mask.device), -1).max(-1).values
+        rewards.append(torch.zeros_like(mask, dtype=scores.dtype).scatter(1, indices[:, None], scores[:, None]))
+        components.append(parts)
+    return {'values': torch.cat(rewards), 'rubric_reward_components': torch.cat(components)}
 
 
 def update_joint(critic, proto):

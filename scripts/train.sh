@@ -20,5 +20,5 @@ done
 if [[ ${#selection[@]} -gt 0 ]]; then
   for value in "${OVERRIDES[@]}"; do selection+=(--set "$value"); done
 fi
-exec "${GAD_PYTHON:-/mnt/jinbo/miniconda3/envs/gad/bin/python}" "$ROOT/gad/tools/pipeline.py" \
+exec "${GAD_PYTHON:-python}" "$ROOT/gad/tools/pipeline.py" \
   --stages "$STAGES" "${selection[@]}" "$@"

@@ -48,6 +48,26 @@ def sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def sampler_question_ids(oprd_root, path, max_prompts):
+    """Use the pinned sampler's actual ID assignment, including its subset rule."""
+    import importlib.util
+    import importlib
+    name='_lmops_oprd_sft_'+hashlib.sha256(str(oprd_root).encode()).hexdigest()[:12]
+    if name not in sys.modules:
+        spec=importlib.util.spec_from_file_location(name,oprd_root/'sft/__init__.py',submodule_search_locations=[str(oprd_root/'sft')])
+        module=importlib.util.module_from_spec(spec);sys.modules[name]=module;spec.loader.exec_module(module)
+    samples=importlib.import_module(name+'.sample_teacher').load_source_samples(path)
+    if max_prompts:samples=samples[:max_prompts]
+    ids=[sample['global_index'] for sample in samples]
+    if len(set(map(str,ids)))!=len(ids):raise ValueError('sampler has duplicate question IDs')
+    return ids
+
+
+def model_content(path, *, recursive=True):
+    return {str(p.relative_to(path)):sha256(p) for p in sorted(path.rglob('*') if recursive else path.iterdir()) if p.is_file() and
+            p.suffix in ('.json','.safetensors','.bin','.pt','.jinja','.model','.txt','.tiktoken','.bpe')}
+
+
 def select(value: str | None, defaults: list[str]) -> list[str]:
     return [s.strip() for s in value.split(",") if s.strip()] if value else list(defaults)
 
@@ -138,16 +158,31 @@ def latest_checkpoint_step(stage_dir: Path) -> int | None:
 
 def training_active(run_dir: Path) -> bool:
     # Only inspect process command lines; no signals or GPU queries are issued.
+    run_dir = run_dir.resolve()
     proc = Path("/proc")
     for item in proc.iterdir():
         if not item.name.isdigit():
             continue
         try:
-            argv = (item / "cmdline").read_bytes().replace(b"\x00", b" ").decode(errors="ignore")
+            argv = (item / "cmdline").read_bytes().decode(errors="ignore").split("\x00")
         except (OSError, PermissionError):
             continue
-        if "verl.trainer.main_ppo" in argv and str(run_dir) in argv:
-            return True
+        if not any(flag == "-m" and module == "verl.trainer.main_ppo"
+                   for flag, module in zip(argv, argv[1:])):
+            continue
+        local_dir = next((arg.split("=", 1)[1] for arg in reversed(argv)
+                          if arg.startswith("trainer.default_local_dir=")), None)
+        if not local_dir:
+            continue
+        try:
+            stage_dir = Path(local_dir)
+            if not stage_dir.is_absolute():
+                stage_dir = item / "cwd" / stage_dir
+            # The launcher writes to RUN/{seqkd,warmup,gad}; model inputs may belong to other runs.
+            if stage_dir.resolve().parent == run_dir:
+                return True
+        except OSError:
+            continue  # The process may exit while its working directory is being resolved.
     return False
 
 
@@ -157,12 +192,45 @@ def build_plan(train_path: Path, *, methods: list[str], tasks: list[str],
                enforce_eager: bool, model_overrides: dict[str, Path] | None = None,
                dataset_overrides: dict[str, Path] | None = None,
                checkpoint_steps: dict[str, int] | None = None,
-               protocol_overrides: dict | None = None, resolved_config=None) -> dict:
+               protocol_overrides: dict | None = None, allow_new_eval_scorer: bool = False,
+               reuse_generation_from: str | None = None, generate_missing: bool = False,
+               task_n: dict[str, int] | None = None, resolved_config=None) -> dict:
+    task_n = dict(task_n or {})
+    if any(type(v) is not int or v < 1 for v in task_n.values()):
+        raise ValueError(f'--task-n needs positive sample counts: {task_n}')
+    if set(task_n) - set(tasks):
+        # Entry-point defaults may name tasks the caller did not select.
+        print(f'[eval] --task-n ignored for unselected tasks: {sorted(set(task_n) - set(tasks))}', flush=True)
+        task_n = {task: count for task, count in task_n.items() if task in tasks}
+    if generate_missing and not allow_new_eval_scorer:
+        raise ValueError('--generate-missing requires --allow-new-eval-scorer')
+    if generate_missing and reuse_generation_from:
+        raise ValueError('--generate-missing cannot be combined with --reuse-generation-from; '
+                         'reuse is read-only rescoring, use a separate PROFILE for new generation')
     cfg = resolved_config or load_config(train_path)
+    training_scorer = {key[13:]: value for key, value in cfg.data.items() if key.startswith('scoring.math.')}
+    evaluation_scorer = None
+    evaluation_scoring_config = None
     if cfg.get('scoring.math.version') == 'math_unified_v1':
+        from scoring.math import VERSION as MATH_VERSION
         from scoring.math import identity
-        if cfg.get('scoring.math.fingerprint') != identity(cfg.get('scoring.math.timeout_seconds'))['fingerprint']:
-            raise ValueError('evaluation scorer differs from frozen run/dependency identity')
+        evaluation_identity_info = identity(cfg.get('scoring.math.timeout_seconds'))
+        evaluation_scorer = {'version': MATH_VERSION,
+                             'fingerprint': evaluation_identity_info['fingerprint'],
+                             'protocol_revision': evaluation_identity_info.get('protocol', {}).get('protocol_revision')}
+        if cfg.get('scoring.math.fingerprint') != evaluation_identity_info['fingerprint']:
+            if not allow_new_eval_scorer:
+                raise ValueError('evaluation scorer differs from frozen run/dependency identity; '
+                                 'use a new PROFILE with --allow-new-eval-scorer; '
+                                 'add --generate-missing for first-time evaluation, or '
+                                 '--reuse-generation-from PROFILE to rescore saved raw samples')
+            print('[eval] using a NEW evaluation scorer for a model trained with the OLD scorer; '
+                  'the frozen training identity is preserved; missing-answer generation is '
+                  + ('enabled' if generate_missing else 'disabled'), flush=True)
+            evaluation_scoring_config = {'version': MATH_VERSION,
+                                         'entrypoint': str(LMOPS_ROOT / 'scoring/math.py'),
+                                         'timeout_seconds': float(cfg.get('scoring.math.timeout_seconds', 2.0)),
+                                         'fingerprint': evaluation_identity_info['fingerprint']}
     train_path = cfg.path
     train = nested_config(cfg.data)
     if train["rollout"].get("enable_thinking") is not False:
@@ -172,6 +240,15 @@ def build_plan(train_path: Path, *, methods: list[str], tasks: list[str],
 
     run_cfg, data_cfg = train["run"], train["data"]
     run_dir = resolve_from(train_path, run_cfg["output_root"]) / run_cfg["run_id"]
+    reuse_root = None
+    if reuse_generation_from:
+        if not allow_new_eval_scorer:
+            raise ValueError('--reuse-generation-from requires --allow-new-eval-scorer')
+        candidate_dir = Path(reuse_generation_from).expanduser()
+        reuse_root = candidate_dir if candidate_dir.is_absolute() else run_dir / 'evaluation' / candidate_dir
+        reuse_root = reuse_root.resolve()
+        if not reuse_root.is_dir():
+            raise ValueError(f'reuse generation directory not found: {reuse_root}')
     data_path = resolve_from(train_path, data_cfg["train_file"])
     rows = pq.ParquetFile(data_path).metadata.num_rows
     per_epoch = rows // int(data_cfg["train_batch_size"])
@@ -238,14 +315,14 @@ def build_plan(train_path: Path, *, methods: list[str], tasks: list[str],
             "checkpoint_ready": checkpoint_ready,
             "latest_checkpoint_step": latest,
             "needs_export": bool(checkpoint_ready and not ready),
+            'content': model_content(run_dir/method/f'global_step_{step}'/'actor' if is_stage else path, recursive=not is_stage)
+                if (run_dir/method/f'global_step_{step}'/'actor' if is_stage else path).is_dir() else None,
         }
 
     oprd_root = oprd_root.expanduser().resolve()
     dataset_root = dataset_root.expanduser().resolve()
     if not (oprd_root / "sft" / "sample_teacher.py").is_file():
         raise FileNotFoundError(f"OPRD sampler missing under {oprd_root}")
-    if not (oprd_root / "sft" / "score_math.py").is_file():
-        raise FileNotFoundError(f"OPRD scorer missing under {oprd_root}")
     data_plan = {}
     for task in tasks:
         path = dataset_overrides.get(task, dataset_root / task / "test.parquet")
@@ -255,7 +332,15 @@ def build_plan(train_path: Path, *, methods: list[str], tasks: list[str],
         if not {"prompt", "reward_model", "extra_info"}.issubset(parquet.schema_arrow.names):
             raise ValueError(f"test set lacks evaluation columns: {path}")
         data_plan[task] = {"path": str(path), "rows": parquet.metadata.num_rows,
-                           "sha256": sha256(path)}
+                           "sha256": sha256(path),
+                           'expected_question_ids':sampler_question_ids(oprd_root,path,max_prompts)}
+        from evaluate import answer_forms, choice, minerva
+        if task in choice.TASKS:
+            data_plan[task]['evaluation_scorer'] = choice.identity()
+        if task in minerva.TASKS:
+            data_plan[task]['evaluation_postprocess'] = minerva.identity()
+        if task in answer_forms.TASKS:
+            data_plan[task]['evaluation_answer_forms'] = answer_forms.identity()
 
     protocol = {**train["eval"], **(protocol_overrides or {})}
     if protocol.get("backend") != "vllm" or int(protocol.get("tensor_parallel_size", 0)) != 1:
@@ -297,9 +382,17 @@ def build_plan(train_path: Path, *, methods: list[str], tasks: list[str],
                      "max_tokens": max_tokens, "max_model_len": max_model_len,
                      "gpu_memory_utilization": float(protocol["gpu_memory_utilization"]),
                      "enforce_eager": bool(enforce_eager),
-                     "enable_thinking": False, "seed": int(seed)},
-        "scoring_math": {key[13:]: value for key, value in cfg.data.items() if key.startswith('scoring.math.')}
-            if cfg.get('scoring.math.version') == 'math_unified_v1' else __import__('scoring.math', fromlist=['DEFAULT_CONFIG']).DEFAULT_CONFIG,
+                     "enable_thinking": False, "seed": int(seed),
+                     # Only present when used, so existing profiles keep their identity.
+                     **({"task_n": dict(sorted(task_n.items()))} if task_n else {})},
+        "scoring_math": evaluation_scoring_config or (
+            {key[13:]: value for key, value in cfg.data.items() if key.startswith('scoring.math.')}
+            if cfg.get('scoring.math.version') == 'math_unified_v1' else __import__('scoring.math', fromlist=['DEFAULT_CONFIG']).DEFAULT_CONFIG),
+        "training_scorer": training_scorer,
+        "evaluation_scorer": evaluation_scorer,
+        "allow_new_eval_scorer": bool(allow_new_eval_scorer),
+        "generate_missing": bool(generate_missing),
+        "reuse_generation_from": str(reuse_root) if reuse_root else None,
         "scorer_identity": __import__('scoring.math', fromlist=['identity']).identity(cfg.get('scoring.math.timeout_seconds')),
     }
 
@@ -325,6 +418,28 @@ def export_stage(plan: dict, stage: str, model: dict) -> None:
     model["export_manifest"] = str(manifest)
 
 
+def evaluation_identity(plan):
+    identity = {**{k:plan[k] for k in ('tasks','protocol','max_prompts','scoring_math','scorer_identity')},
+                'models':{name:{k:model.get(k) for k in ('path','target_step','selection','content')}
+                          for name,model in plan['models'].items()}}
+    if plan.get('allow_new_eval_scorer'):
+        # Record the model's training scorer separately from its evaluation scorer.
+        # generate_missing controls execution, not the sampling/scoring identity.
+        identity['training_scorer'] = plan.get('training_scorer')
+        identity['reuse_generation_from'] = plan.get('reuse_generation_from')
+    return identity
+
+
+def raw_complete(path, expected, n):
+    if not path.is_file():return False
+    # JSONL records end at "\n" only; str.splitlines() would also split on U+2028 inside responses.
+    try:rows=[json.loads(line) for line in path.read_text(encoding='utf-8').split('\n') if line.strip()]
+    except (OSError,ValueError):return False
+    keys=[(str(r.get('global_index')),r.get('rollout_index')) for r in rows]
+    return (all(type(k[1]) is int for k in keys) and len(keys)==len(set(keys)) and
+            set(keys)=={(str(q),r) for q in expected for r in range(n)})
+
+
 def execute(plan: dict) -> None:
     run_dir = Path(plan["run_dir"])
     if training_active(run_dir):
@@ -348,27 +463,72 @@ def execute(plan: dict) -> None:
             unavailable.append(f"{name}: no loadable Hugging Face weights at {model['path']}")
     if unavailable:
         raise RuntimeError("selected models unavailable:\n  " + "\n  ".join(unavailable))
-    for name, model in plan["models"].items():
-        if model["needs_export"]:
-            export_stage(plan, name, model)
     out_root = Path(plan["output_root"])
     saved_plan = out_root / "plan.json"
     if saved_plan.is_file():
         previous = json.loads(saved_plan.read_text(encoding="utf-8"))
-        keys = ("models", "tasks", "protocol", "gpu_ids", "max_prompts", 'scoring_math', 'scorer_identity')
-        if any(previous.get(key) != plan.get(key) for key in keys):
+        if evaluation_identity(previous) != evaluation_identity(plan):
             raise RuntimeError(f"evaluation settings changed in {out_root}; choose a new PROFILE")
+    for name, model in plan["models"].items():
+        if model["needs_export"]:
+            export_stage(plan, name, model)
+        actual = model_content(Path(model['path']))
+        if not actual:
+            raise RuntimeError(f'no actual HF content after export: {model["path"]}')
+        prior_model = previous['models'].get(name, {}) if saved_plan.is_file() else {}
+        prior_hf = prior_model.get('hf_content')
+        if saved_plan.is_file() and prior_hf is None:
+            raise RuntimeError('old evaluation lacks actual HF identity; preserve it and use a new PROFILE')
+        if prior_hf is not None and prior_hf != actual:
+            raise RuntimeError(f'actual HF content changed for {name}; choose a new PROFILE')
+        model['hf_content'] = actual
     out_root.mkdir(parents=True, exist_ok=True)
-    saved_plan.write_text(json.dumps(plan, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    from gad.extensions.common import atomic_json
+    atomic_json(saved_plan,plan)
+    if plan.get('allow_new_eval_scorer'):
+        atomic_json(out_root / 'scoring_manifest.json', {
+            'allow_new_eval_scorer': True,
+            'generate_missing': plan.get('generate_missing', False),
+            'training_scorer': plan.get('training_scorer'),
+            'evaluation_scorer': plan.get('evaluation_scorer'),
+            'scoring_math': plan.get('scoring_math'),
+            'reuse_generation_from': plan.get('reuse_generation_from'),
+            'aggregation_protocol': 'eval-fix.2 (fixed denominator, strict complete, lower/upper/coverage)',
+        })
     protocol = plan["protocol"]
     python_bin = plan["python_bin"]
     oprd_root = Path(plan["oprd_root"])
     for method, model in plan["models"].items():
         for task, dataset in plan["tasks"].items():
+            task_scorer = dataset.get('evaluation_scorer', plan.get('evaluation_scorer'))
+            scoring_config = dict(plan['scoring_math'])
+            if dataset.get('evaluation_scorer'):
+                scoring_config['choice_fingerprint'] = task_scorer['fingerprint']
+            if dataset.get('evaluation_postprocess'):
+                scoring_config['minerva_fingerprint'] = dataset['evaluation_postprocess']['fingerprint']
+            if dataset.get('evaluation_answer_forms'):
+                scoring_config['answer_forms_fingerprint'] = dataset['evaluation_answer_forms']['fingerprint']
             task_dir = out_root / method / task
             generation = task_dir / "generation"
             scores = task_dir / "scores"
-            samples = protocol["math500_n"] if task == "MATH-500" else protocol["n"]
+            samples = protocol.get("task_n", {}).get(task) or (protocol["math500_n"] if task == "MATH-500" else protocol["n"])
+            expected=dataset['expected_question_ids']
+            expected_path=task_dir/'expected_question_ids.json'
+            atomic_json(expected_path,expected)
+            raw=generation/'raw_samples.jsonl'
+            reuse_raw = Path(plan['reuse_generation_from'])/method/task/'generation/raw_samples.jsonl' if plan.get('reuse_generation_from') else None
+            if reuse_raw is not None and raw_complete(reuse_raw, expected, samples):
+                raw = reuse_raw
+            state_path=task_dir/'state.json'
+            state=json.loads(state_path.read_text()) if state_path.is_file() else {}
+            current_identity=hashlib.sha256(json.dumps({'evaluation':evaluation_identity(plan),'hf_content':model['hf_content'],'method':method,'task':task},sort_keys=True).encode()).hexdigest()
+            metric_path=Path(state.get('metrics_path',scores/'metrics.json'))
+            if (state.get('identity')==current_identity and state.get('status')=='complete' and raw.is_file() and
+                    metric_path.is_file() and state.get('raw_sha256')==sha256(raw) and
+                    state.get('metrics_sha256')==sha256(metric_path)):
+                metrics=json.loads(metric_path.read_text())
+                if metrics.get('evaluation_complete') and raw_complete(raw,expected,samples):
+                    print(f'[eval] {method}/{task}: complete, skipped',flush=True);continue
             sampler = [python_bin, "-m", "sft.sample_teacher",
                        "--input-parquet", dataset["path"], "--model-path", model["path"],
                        "--output-dir", str(generation), "--gpu-ids", plan["gpu_ids"],
@@ -385,20 +545,45 @@ def execute(plan: dict) -> None:
             if protocol["enforce_eager"]:
                 sampler.append("--enforce-eager")
             print(f"[eval] {method}/{task}: {samples} samples/question", flush=True)
-            subprocess.run(sampler, cwd=oprd_root, check=True)
-            raw = generation / "raw_samples.jsonl"
-            expected = min(dataset['rows'], plan['max_prompts']) if plan['max_prompts'] else dataset['rows']
+            if not raw_complete(raw,expected,samples):
+                if plan.get('allow_new_eval_scorer') and not plan.get('generate_missing'):
+                    raise RuntimeError(f'{method}/{task}: saved raw samples are incomplete; '
+                                       'rescoring does not generate answers. For first-time evaluation '
+                                       'add --generate-missing with a new PROFILE; for existing raw '
+                                       'use --reuse-generation-from PROFILE')
+                atomic_json(state_path,{'identity':current_identity,'status':'generating',
+                                        'training_scorer':plan.get('training_scorer'),
+                                        'evaluation_scorer':task_scorer})
+                subprocess.run(sampler, cwd=oprd_root, check=True)
+            if (scores/'metrics.json').exists():
+                # Preserve old/incomplete/corrupt scores. Each replacement has its own directory.
+                from datetime import datetime,timezone
+                scores=task_dir/('scores_'+datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ'))
+            atomic_json(state_path,{'identity':current_identity,'status':'scoring','raw_sha256':sha256(raw),
+                                    'raw_path':str(raw),
+                                    'training_scorer':plan.get('training_scorer'),
+                'evaluation_scorer':task_scorer})
             subprocess.run([python_bin, str(LMOPS_ROOT / 'evaluate/rescore.py'), '--raw-jsonl', str(raw),
-                '--output-dir', str(scores), '--task', task, '--n', str(samples), '--expected-prompts', str(expected),
-                '--config-json', json.dumps(plan['scoring_math'])], cwd=LMOPS_ROOT, check=True)
+                '--output-dir', str(scores), '--task', task, '--n', str(samples), '--expected-ids', str(expected_path),
+                '--config-json', json.dumps(scoring_config)], cwd=LMOPS_ROOT, check=True)
+            metrics=json.loads((scores/'metrics.json').read_text())
+            atomic_json(state_path,{'identity':current_identity,'status':'complete' if metrics.get('evaluation_complete') else 'incomplete',
+                'raw_sha256':sha256(raw),'raw_path':str(raw),'metrics_path':str(scores/'metrics.json'), 'metrics_sha256':sha256(scores/'metrics.json'),
+                'counter_correct':metrics.get('confirmed_correct'),'counter_incorrect':metrics.get('confirmed_incorrect'),
+                'unresolved_samples':metrics.get('unresolved_samples'),
+                'sample_accuracy_lower':metrics.get('sample_accuracy_lower'),
+                'sample_accuracy_upper':metrics.get('sample_accuracy_upper'),
+                'coverage_ratio':metrics.get('coverage'),
+                'training_scorer':plan.get('training_scorer'),
+                'evaluation_scorer':task_scorer})
     print(f"[eval] results -> {out_root}")
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     add_config_arguments(parser, config_alias="--train-config")
-    parser.add_argument("--oprd-root", type=Path, required=True)
-    parser.add_argument("--dataset-root", type=Path, required=True)
+    parser.add_argument("--oprd-root", type=Path, default=LMOPS_ROOT/"third_party/oprd")
+    parser.add_argument("--dataset-root", type=Path, default=LMOPS_ROOT/"assets/datasets/math_eval")
     parser.add_argument("--methods", required=True, help="Comma-separated model names")
     parser.add_argument("--tasks", required=True, help="Comma-separated dataset names")
     parser.add_argument("--gpu-ids", required=True, help="Comma-separated GPU IDs")
@@ -409,12 +594,20 @@ def main() -> None:
     parser.add_argument("--checkpoint-step", action="append", default=[], metavar="STAGE=STEP",
                         help="Evaluate an explicitly selected saved stage checkpoint")
     parser.add_argument("--profile", required=True, help="Output profile; change it when evaluation settings change")
+    parser.add_argument("--allow-new-eval-scorer", action="store_true",
+                        help="Use the current scorer with an old training identity (requires a NEW profile; rescore-only unless --generate-missing)")
+    parser.add_argument("--generate-missing", action="store_true",
+                        help="Allow first-time/missing-answer generation with --allow-new-eval-scorer; cannot combine with --reuse-generation-from")
+    parser.add_argument("--reuse-generation-from", default=None, metavar="PROFILE",
+                        help="Old evaluation PROFILE whose complete raw_samples.jsonl are scored read-only")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--top-k", type=int, default=-1)
     parser.add_argument("--repetition-penalty", type=float, default=1.0)
     parser.add_argument("--enforce-eager", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--n", type=int)
     parser.add_argument("--math500-n", type=int)
+    parser.add_argument("--task-n", action="append", default=[], metavar="TASK=N",
+                        help="Samples per question for one task (overrides --n/--math500-n); may be repeated")
     parser.add_argument("--temperature", type=float)
     parser.add_argument("--top-p", type=float)
     parser.add_argument("--max-tokens", type=int)
@@ -441,7 +634,13 @@ def main() -> None:
                       model_overrides=named_paths(args.model_path),
                       dataset_overrides=named_paths(args.dataset_path),
                       checkpoint_steps=named_steps(args.checkpoint_step),
-                      protocol_overrides=protocol_overrides, resolved_config=cfg)
+                      protocol_overrides=protocol_overrides,
+                      allow_new_eval_scorer=args.allow_new_eval_scorer,
+                      reuse_generation_from=args.reuse_generation_from,
+                      generate_missing=args.generate_missing,
+                      # Later TASK=N wins, so entry-point defaults can be overridden.
+                      task_n={name: int(count) for name, _, count in (v.partition('=') for v in args.task_n)},
+                      resolved_config=cfg)
     if args.summary:
         subprocess.run([plan["python_bin"], str(EVALUATE_DIR / "summarize_eval.py"),
                         "--root", plan["output_root"]], check=True)

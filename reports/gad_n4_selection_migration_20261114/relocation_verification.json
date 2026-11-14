@@ -1,0 +1,16 @@
+{
+  "configs": [
+    "launch_baseline_n4_06b_17k.yaml",
+    "launch_rubric_actor_06b_17k.yaml",
+    "launch_rubric_actor_c_only_06b_17k.yaml",
+    "launch_rubric_actor_n4_06b_17k.yaml",
+    "launch_rubric_naive_n4_06b_17k.yaml"
+  ],
+  "source_release_resolved_configs_match_except_root": true,
+  "caller_cwd": "/tmp",
+  "symlinks": {
+    "gad/extensions/core": "../../rubric/core"
+  },
+  "model_checkpoints_not_present": true,
+  "note": "This checks path resolution, not target-machine readiness. Old launch configs intentionally retain old Warmup references."
+}

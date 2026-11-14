@@ -26,8 +26,13 @@ from config import compose_config
 from pipeline import plan_stage,steps_per_epoch
 root=Path(sys.argv[2]);backend=Path(sys.argv[1]);stage=backend.name
 cfg=compose_config(model='qwen3_0.6b',dataset='dapo_math_17k',overrides=[str(root/'configs/overrides/rubric_v2_baseline.yaml')])
+from unittest.mock import patch
+cfg.data['models.student']=str(root/'gad/tests/fixtures/identity_model')
+cfg.data['data.train_file']=str(root/'gad/tests/fixtures/quick.parquet')
+cfg.data['data.val_file']=str(root/'gad/tests/fixtures/quick.parquet')
+cfg.data['validation.quick_file']=str(root/'gad/tests/fixtures/quick.parquet')
 cfg.data['backends.root']=str(backend.parent)
-plan=plan_stage(cfg,Path('/tmp/seqkd-config-fixture'),stage,steps_per_epoch_value=steps_per_epoch(cfg),
+plan=plan_stage(cfg,Path('/tmp/seqkd-config-fixture'),stage,steps_per_epoch_value=271,
     handoff={'actor_hf':'/tmp/actor','critic_hf':'/tmp/critic','step':271} if stage=='gad' else None,install_guard=False)
 with initialize_config_dir(config_dir=str(backend/'verl/trainer/config'),version_base=None):
     actual=compose(config_name='ppo_trainer',overrides=plan['argv'][3:])
@@ -106,9 +111,11 @@ class SeqKDBaselineTests(unittest.TestCase):
     def exercise_pipeline(self,mode='incomplete',resume=False):
         with tempfile.TemporaryDirectory() as tmp:
             output=Path(tmp);run=output/'audit';calls=[]
+            from test_pipeline_cpu import make_gad_parquet
+            make_gad_parquet(output/'train.parquet',17405);make_gad_parquet(output/'dev.parquet',512,prefix='dev')
             argv=['pipeline.py','--model','qwen3_0.6b','--dataset','dapo_math_17k','--run-id','audit',
                 '--stages','seqkd,warmup','--overrides',str(ROOT/'configs/overrides/rubric_v2_baseline.yaml'),
-                '--set',f'backends.root={BACKENDS}','--set',f'run.output_root={output}']
+                '--set',f'backends.root={BACKENDS}','--set',f'run.output_root={output}','--set',f'data.train_file={output}/train.parquet','--set',f'data.val_file={output}/dev.parquet','--set','validation.quick_enabled=false','--set',f'models.student={ROOT}/gad/tests/fixtures/identity_model','--skip-data-check']
             if mode=='strict':argv+=['--set','validation.block_training_on_incomplete=true']
             def command(command,**kwargs):
                 stage=kwargs.get('component')
@@ -142,10 +149,10 @@ class SeqKDBaselineTests(unittest.TestCase):
                     self.assertTrue(record['training_completed']);self.assertEqual('incomplete' if mode=='incomplete' else 'missing' if mode=='missing_metrics' else 'failed',record['evaluation_status'])
                     self.assertFalse((run/'seqkd/global_step_542/critic').exists())
                     warmup=json.loads((run/'stage_warmup.json').read_text())['plan']
-                    self.assertEqual(str(ROOT.parent/'model/Qwen/Qwen3-0.6B'),warmup['model_path'])
+                    self.assertEqual(str(ROOT/'gad/tests/fixtures/identity_model'),warmup['model_path'])
                     self.assertEqual(0,warmup['start_step'])
                     if resume:
-                        calls.clear();sys.argv=['pipeline.py','--run',str(run),'--resume','--stages','seqkd,warmup']
+                        calls.clear();sys.argv=['pipeline.py','--run',str(run),'--resume','--stages','seqkd,warmup','--skip-data-check']
                         self.assertEqual(0,pipeline.main());self.assertEqual([],calls)
 
     def test_incomplete_seqkd_allows_warmup_and_resume_skips_both(self):self.exercise_pipeline(resume=True)

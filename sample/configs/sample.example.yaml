@@ -26,6 +26,7 @@ prompts:
 
 # --- Teacher sampling -------------------------------------------------------
 teacher:
+  seed: 42
   # openai       : talk to an OpenAI-compatible server (scripts/serve_teacher.sh).
   # vllm_offline : load the teacher inside the sampler - one process, no port and
   #                no server to keep alive (recommended when the weights live on

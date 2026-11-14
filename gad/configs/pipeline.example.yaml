@@ -22,6 +22,7 @@ run:
   python_bin: /abs/path/envs/gad/bin/python   # interpreter with torch/ray/vllm/verl deps
   log_backend: console                   # console | console,wandb
   wandb_project: ""                      # only used when wandb is in log_backend; credentials come from the env
+  wandb_mode: offline                    # offline -> <run_dir>/wandb/, upload with tools/wandb_sync.py | online
   eval_after_train: false                # run tools/evaluate_math.py on the final actor when the pipeline ends
   skip_completed_stages: true            # skip a stage only when config + input signatures still match
   val_before_train: true

@@ -36,7 +36,7 @@ class RangeTests(unittest.TestCase):
         with self.assertRaisesRegex(EvidenceError,'evidence_capacity_conflict'):expand({f'r{i}':{'start':'s1','end':'s20'} for i in range(1,10)},spans)
 
     def test_saved_eight_primary_records_lossless_masks_and_dependencies(self):
-        rows=[json.loads(l) for l in (ROOT/'reports/rubric_v24_appendix_a_20261016/development8.jsonl').read_text().splitlines()]
+        rows=[json.loads(l) for l in (ROOT/'gad/tests/fixtures/ranges_development8.jsonl').read_text().splitlines()]
         checked=0;conflicts=[]
         for r in rows:
             result=r['result'].get('initial_parsed',r['result'].get('parsed',{}))
@@ -60,8 +60,8 @@ class RangeTests(unittest.TestCase):
 
     def test_frozen_array_input_protocol_restores_saved_requests(self):
         from rubric.core.process_v26 import response_from_messages
-        requests=json.loads((ROOT/'reports/rubric_v24_appendix_a_20261016/corrected_gpu/requests.json').read_text())
-        rows=[json.loads(l) for l in (ROOT/'reports/rubric_v24_appendix_a_20261016/fixed4.jsonl').read_text().splitlines()]
+        requests=json.loads((ROOT/'gad/tests/fixtures/range_requests.json').read_text())
+        rows=[json.loads(l) for l in (ROOT/'gad/tests/fixtures/fixed4.jsonl').read_text().splitlines()]
         for row in rows:
             self.assertEqual(row['response'],response_from_messages(requests[row['id']]))
 

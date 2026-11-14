@@ -154,12 +154,15 @@ class Contracts(unittest.TestCase):
     def test_dry_run_any_cwd_no_gpu_import_or_artifact(self):
         script = ROOT/"rubric/pipeline.py"
         with TemporaryDirectory() as directory:
-            code=("import runpy,sys; sys.argv="+repr([str(script),"--dry-run"])+"; "
+            from config import compose_config
+            import yaml
+            source=Path(directory)/'source.yaml';source.write_text(yaml.safe_dump(compose_config().to_dict()))
+            code=("import runpy,sys; sys.argv="+repr([str(script),"--dry-run","--set","source.run_config="+str(source)])+"; "
                   "runpy.run_path("+repr(str(script))+",run_name='__main__'); "
                   "assert 'torch' not in sys.modules and 'vllm' not in sys.modules")
             process=subprocess.run([sys.executable,"-c",code],cwd=directory,capture_output=True,text=True)
             self.assertEqual(process.returncode,0,process.stderr)
-            self.assertEqual(list(Path(directory).iterdir()),[])
+            self.assertEqual(list(Path(directory).iterdir()),[source])
 
     def test_weight_hash_cache_detects_same_size_content_replacement(self):
         import os

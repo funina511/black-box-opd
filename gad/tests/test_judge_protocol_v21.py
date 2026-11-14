@@ -33,6 +33,8 @@ def event(eid, kind, line, quote, links=None):
 
 def parse(row, text):return parse_events(json.dumps(row), text)
 
+from cpu_fixtures import compose_cpu_config as compose_config
+
 
 class ProtocolTests(unittest.TestCase):
     def test_lossless_newlines_and_spoofed_prefixes(self):
@@ -223,6 +225,7 @@ class OnlineTests(unittest.TestCase):
             self.assertNotEqual(key,owner.cache_key(p,'student'))
             self.assertTrue((old/'old.json').exists())
             cfg=compose_config(settings=['rubric.enabled=true'])
+            cfg.data['rubric.judge.tokenizer_path']=str(ROOT/'gad/tests/fixtures/identity_model')
             one=service_identity(cfg);cfg.data['rubric.judge.max_output_tokens']+=1
             self.assertNotEqual(digest(one),digest(service_identity(cfg)))
     def test_all_failure_exception_persisted_before_exit(self):

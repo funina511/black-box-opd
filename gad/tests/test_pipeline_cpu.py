@@ -343,6 +343,43 @@ class ConfigTests(unittest.TestCase):
                                    log_backend="console"),
             )
 
+    def test_wandb_logs_offline_into_the_run_dir_without_touching_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            cfg_path = tmp_path / "run.yaml"
+            payload = base_config(tmp_path)
+            payload["run"].update(log_backend="console,wandb", wandb_project="proj")
+            write_yaml(cfg_path, payload)
+            cfg = gad_config.load_config(cfg_path)
+            self.assertEqual(gad_config.validate_config(cfg), [])
+            run_dir = tmp_path / "runs" / "r1"
+            env = pipeline.stage_env(cfg, run_dir, "gad", BACKEND_ROOT / "gad",
+                                     log_backend="console,wandb", install_guard=False)
+            self.assertEqual({k: env[k] for k in ("WANDB_MODE", "WANDB_DIR", "WANDB_RUN_GROUP",
+                                                  "WANDB_JOB_TYPE", "WANDB_PROJECT")},
+                             {"WANDB_MODE": "offline", "WANDB_DIR": str(run_dir), "WANDB_RUN_GROUP": "r1",
+                              "WANDB_JOB_TYPE": "gad", "WANDB_PROJECT": "proj"})
+            self.assertNotIn("WANDB_MODE", pipeline.stage_env(cfg, run_dir, "gad", BACKEND_ROOT / "gad",
+                                                              log_backend="console", install_guard=False))
+            signature = pipeline.stage_signature(cfg, "warmup")["signature"]
+            cfg.data["run.wandb_mode"] = "online"
+            self.assertEqual(pipeline.stage_signature(cfg, "warmup")["signature"], signature)
+            cfg.data["run.wandb_mode"] = "cloud"
+            self.assertIn("run.wandb_mode must be offline or online", " ".join(gad_config.validate_config(cfg)))
+
+    def test_console_log_backfill_parses_steps_and_validation(self) -> None:
+        import wandb_sync
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "gad.log"
+            log.write_text("\x1b[36m(TaskRunner pid=1)\x1b[0m step:213 - critic/d_acc:0.5 - quick/val-core/x/acc/mean@1:0.25\n"
+                           "noise step:x\n(TaskRunner) step:213 - critic/d_acc:0.75\n"
+                           "step:214 - actor/pg_loss:-1e-3 - note:abc\n", encoding="utf-8")
+            self.assertEqual(wandb_sync.parse_console_log(log),
+                             {213: {"critic/d_acc": 0.75}, 214: {"actor/pg_loss": -0.001}})
+            (Path(tmp) / "validation_math_metrics.jsonl").write_text(json.dumps(
+                {"global_step": 214, "validation_scope": "quick", "acc": 0.5, "evaluation_complete": True}) + "\n")
+            self.assertEqual(wandb_sync.validation_records(Path(tmp)), {214: {"val_math/quick/acc": 0.5}})
+
     def test_cli_overrides_coerce_booleans(self) -> None:
         """`--set x=false` must not be a truthy string: bool("false") is True."""
         parsed = parse_key_values(["run.val_before_train=false", "models.param_offload=TRUE",
@@ -830,6 +867,7 @@ class StageSelectionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             cfg = gad_config.load_config(self._write_cfg(tmp_path))
+            cfg.data['budget.seqkd_steps']=10
             run_dir = tmp_path / "runs/r1"
             snapshot = run_dir / "reports/resolved_configs/before_performance.yaml"
             write_yaml(snapshot, cfg.to_dict())
@@ -1130,6 +1168,8 @@ class GadResumeTests(unittest.TestCase):
             "ok": True,
         }
         write_json(run_dir / "handoff_manifest.json", manifest)
+        for role in ('actor','critic'):make_model_dir(Path(manifest[role+'_hf']))
+        write_json(run_dir/'runtime/gad_handoff_identity.json',pipeline.handoff_identity(None,run_dir))
         return manifest
 
     def _gad_checkpoint(self, gad_dir: Path, step: int) -> None:
@@ -1184,7 +1224,7 @@ class GadResumeTests(unittest.TestCase):
             self.assertEqual(decision["mode"], "resume")
             self.assertEqual(decision["from_step"], 14)
 
-    def test_resume_falls_back_to_the_stage_manifest(self) -> None:
+    def test_legacy_resume_without_handoff_identity_is_explicitly_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             cfg, run_dir, gad_dir = self._run_dir(tmp_path)
@@ -1195,10 +1235,8 @@ class GadResumeTests(unittest.TestCase):
                           "critic_path": str(gad_dir / "global_step_12" / "critic" / "huggingface"),
                           "start_step": 12}},
             )
-            decision = pipeline.resolve_gad_resume(cfg, run_dir, added_steps=6, resume_requested=True)
-            self.assertEqual(decision["mode"], "resume")
-            self.assertEqual(decision["from_step"], 13)
-            self.assertIn("stage_gad.json", decision["handoff"]["source"])
+            with self.assertRaisesRegex(PipelineError,'provenance'):
+                pipeline.resolve_gad_resume(cfg, run_dir, added_steps=6, resume_requested=True)
 
     def test_resume_without_any_recorded_handoff_is_a_hard_error(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1206,7 +1244,7 @@ class GadResumeTests(unittest.TestCase):
             self._gad_checkpoint(gad_dir, 14)
             with self.assertRaises(PipelineError) as ctx:
                 pipeline.resolve_gad_resume(cfg, run_dir, added_steps=6, resume_requested=True)
-            self.assertIn("cannot be resumed", str(ctx.exception))
+            self.assertIn('provenance',str(ctx.exception))
 
     def test_resume_after_the_target_step_skips_the_trainer(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1566,13 +1604,14 @@ class VllmKvBudgetTests(unittest.TestCase):
             self.assertFalse(report.sections["vllm_kv_budget"]["checked"])
             self.assertIn("not vllm", report.sections["vllm_kv_budget"]["reason"])
 
+    @unittest.skipUnless(os.environ.get("GAD_TEST_STUDENT_MODEL"), "optional real model footprint: set GAD_TEST_STUDENT_MODEL")
     def test_shipped_config_passes_its_own_gate(self) -> None:
         """The committed run config must survive the gate on a 24GB card."""
         config_path = GAD_DIR.parent / "train.yaml"
         if not config_path.exists():
             self.skipTest("shipped run config not found")
         cfg = gad_config.load_config(config_path)
-        model_dir = Path(str(cfg.get("models.student")))
+        model_dir = Path(os.environ["GAD_TEST_STUDENT_MODEL"])
         model_config_path = model_dir / "config.json"
         if not model_config_path.exists():
             self.skipTest("student weights not present")

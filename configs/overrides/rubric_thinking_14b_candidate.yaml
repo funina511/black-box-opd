@@ -2,7 +2,7 @@
 rubric:
   judge:
     model: Qwen3-14B
-    tokenizer_path: /mnt/jinbo/RLRM/model/Qwen/Qwen3-14B
+    tokenizer_path: ../../assets/models/Qwen3-14B
     base_url: http://127.0.0.1:8019/v1
     enable_thinking: true
     reasoning_parser: deepseek_r1

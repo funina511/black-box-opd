@@ -61,14 +61,25 @@ class StateTests(unittest.TestCase):
         from rescore_validation import run
         with tempfile.TemporaryDirectory() as tmp:
             source=Path(tmp)/'saved.jsonl'
-            source.write_text(''.join(json.dumps({'response_id':str(i),'output':text,'ground_truth':'2'})+'\n' for i,text in enumerate(['Answer: 2','Answer: \\boxed{'])))
+            source.write_text(''.join(json.dumps(row)+chr(10) for row in [
+                {'response_id':'0','output':'Answer: 2','ground_truth':'2'},
+                {'response_id':'1','output':r'Answer: oxed{','ground_truth':'2'},
+                {'response_id':'2','output':'Answer: 2','ground_truth':'nan'}]))
             before=source.read_bytes();target=Path(tmp)/'rescored'
-            result=run(source,target,2,78,'full')
-            self.assertFalse(result['evaluation_complete']);self.assertIsNone(result['acc']);self.assertEqual(.5,result['provisional_acc'])
-            self.assertEqual(2,result['failures'][0]['source_line']);self.assertEqual(before,source.read_bytes())
-            with self.assertRaises(FileExistsError):run(source,target,2,78,'full')
-            with self.assertRaisesRegex(ValueError,'regeneration'):run(Path(tmp)/'missing',Path(tmp)/'new',2,78,'full')
-
+            result=run(source,target,3,78,'full')
+            # A definite format failure is an evaluation 0 (confirmed wrong), not an
+            # unscorable slot; an invalid GT remains unresolved and keeps the result open.
+            self.assertFalse(result['evaluation_complete']);self.assertIsNone(result['acc'])
+            self.assertEqual(1/3,result['provisional_acc'])
+            self.assertEqual(1,result['confirmed_correct']);self.assertEqual(1,result['confirmed_incorrect'])
+            self.assertEqual(1,result['unresolved_samples'])
+            self.assertEqual(1/3,result['sample_accuracy_lower']);self.assertEqual(2/3,result['sample_accuracy_upper'])
+            self.assertEqual(2/3,result['coverage'])
+            self.assertEqual([3],[failure['source_line'] for failure in result['failures']])
+            self.assertEqual('gt_unparseable',result['failures'][0]['evaluation_status'])
+            self.assertEqual(before,source.read_bytes())
+            with self.assertRaises(FileExistsError):run(source,target,3,78,'full')
+            with self.assertRaisesRegex(ValueError,'regeneration'):run(Path(tmp)/'missing',Path(tmp)/'new',3,78,'full')
     def test_used_backend_preparation_never_mutates_sources(self):
         import subprocess
         backend=Path(os.environ['GAD_TEST_EXTENSION_ROOT'])/'warmup'
@@ -112,6 +123,7 @@ class StateTests(unittest.TestCase):
 
 
 class GrammarTests(unittest.TestCase):
+    @unittest.skipUnless(os.environ.get("GAD_TEST_QWEN_TOKENIZER"), "optional real Qwen tokenizer: set GAD_TEST_QWEN_TOKENIZER")
     def test_installed_qwen8b_grammar_cannot_generate_ninth_or_duplicate_slot(self):
         import xgrammar as xgr
         from transformers import AutoTokenizer,AutoConfig
@@ -119,7 +131,7 @@ class GrammarTests(unittest.TestCase):
         from rubric.core.process_v2 import JUDGE_SCHEMA_V2,source_spans
         from rubric.core.semantic_v24 import SCHEMA
         from gad.extensions.judge_client import guidance_schema
-        path=ROOT.parent/'model/Qwen/Qwen3-8B'
+        path=Path(os.environ['GAD_TEST_QWEN_TOKENIZER'])
         tokenizer=AutoTokenizer.from_pretrained(path,local_files_only=True)
         info=xgr.TokenizerInfo.from_huggingface(tokenizer,vocab_size=AutoConfig.from_pretrained(path).vocab_size)
         compiler=xgr.GrammarCompiler(info,max_threads=2)

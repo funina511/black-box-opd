@@ -75,7 +75,8 @@ class TrainingHookTests(unittest.TestCase):
             events.append(('commit', updated))
             return {}
         trainer = SimpleNamespace(use_critic=True, global_steps=step,
-            gad_extensions=SimpleNamespace(prepare=prepare, commit=commit),
+            gad_extensions=SimpleNamespace(prepare=prepare, commit=commit,
+                timed_phase=lambda timer, *args, **kwargs: timer(*args, **kwargs)),
             critic_wg=SimpleNamespace(update_critic=critic), actor_rollout_wg=SimpleNamespace(update_actor=actor),
             config=SimpleNamespace(trainer=SimpleNamespace(critic_warmup=2),
                 actor_rollout_ref=SimpleNamespace(rollout=SimpleNamespace(multi_turn=SimpleNamespace(enable=False)))))

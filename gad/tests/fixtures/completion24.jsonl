@@ -1,0 +1,24 @@
+{"id": "0", "kind": "boundary", "category": "fixture", "prompt": "Solve x+1=3", "response": "x=2", "ground_truth": "2", "expected_allowed": {"verified_progress": [0.5], "unresolved_error_severity": [1]}}
+{"id": "1", "kind": "boundary", "category": "fixture", "prompt": "Solve x+1=3", "response": "x=2", "ground_truth": "2", "expected_allowed": {"verified_progress": [0.5], "unresolved_error_severity": [1]}}
+{"id": "2", "kind": "boundary", "category": "fixture", "prompt": "Solve x+1=3", "response": "x=2", "ground_truth": "2", "expected_allowed": {"verified_progress": [0.5], "unresolved_error_severity": [1]}}
+{"id": "3", "kind": "boundary", "category": "fixture", "prompt": "Solve x+1=3", "response": "x=2", "ground_truth": "2", "expected_allowed": {"verified_progress": [0.5], "unresolved_error_severity": [1]}}
+{"id": "4", "kind": "boundary", "category": "fixture", "prompt": "Solve x+1=3", "response": "x=2", "ground_truth": "2", "expected_allowed": {"verified_progress": [0.5], "unresolved_error_severity": [1]}}
+{"id": "5", "kind": "boundary", "category": "fixture", "prompt": "Solve x+1=3", "response": "x=2", "ground_truth": "2", "expected_allowed": {"verified_progress": [0.5], "unresolved_error_severity": [1]}}
+{"id": "6", "kind": "boundary", "category": "fixture", "prompt": "Solve x+1=3", "response": "x=2", "ground_truth": "2", "expected_allowed": {"verified_progress": [0.5], "unresolved_error_severity": [1]}}
+{"id": "7", "kind": "boundary", "category": "fixture", "prompt": "Solve x+1=3", "response": "x=2", "ground_truth": "2", "expected_allowed": {"verified_progress": [0.5], "unresolved_error_severity": [1]}}
+{"id": "8", "kind": "trajectory", "category": "fixture", "prompt": "Solve x+1=3", "response": "x=2", "ground_truth": "2"}
+{"id": "9", "kind": "trajectory", "category": "fixture", "prompt": "Solve x+1=3", "response": "x=2", "ground_truth": "2"}
+{"id": "10", "kind": "trajectory", "category": "fixture", "prompt": "Solve x+1=3", "response": "x=2", "ground_truth": "2"}
+{"id": "11", "kind": "trajectory", "category": "fixture", "prompt": "Solve x+1=3", "response": "x=2", "ground_truth": "2"}
+{"id": "12", "kind": "trajectory", "category": "fixture", "prompt": "Solve x+1=3", "response": "x=2", "ground_truth": "2"}
+{"id": "13", "kind": "trajectory", "category": "fixture", "prompt": "Solve x+1=3", "response": "x=2", "ground_truth": "2"}
+{"id": "14", "kind": "trajectory", "category": "fixture", "prompt": "Solve x+1=3", "response": "x=2", "ground_truth": "2"}
+{"id": "15", "kind": "trajectory", "category": "fixture", "prompt": "Solve x+1=3", "response": "x=2", "ground_truth": "2"}
+{"id": "16", "kind": "trajectory", "category": "fixture", "prompt": "Solve x+1=3", "response": "x=2", "ground_truth": "2"}
+{"id": "17", "kind": "trajectory", "category": "fixture", "prompt": "Solve x+1=3", "response": "x=2", "ground_truth": "2"}
+{"id": "18", "kind": "trajectory", "category": "fixture", "prompt": "Solve x+1=3", "response": "x=2", "ground_truth": "2"}
+{"id": "19", "kind": "trajectory", "category": "fixture", "prompt": "Solve x+1=3", "response": "x=2", "ground_truth": "2"}
+{"id": "20", "kind": "trajectory", "category": "fixture", "prompt": "Solve x+1=3", "response": "x=2", "ground_truth": "2"}
+{"id": "21", "kind": "trajectory", "category": "fixture", "prompt": "Solve x+1=3", "response": "x=2", "ground_truth": "2"}
+{"id": "22", "kind": "trajectory", "category": "fixture", "prompt": "Solve x+1=3", "response": "x=2", "ground_truth": "2"}
+{"id": "23", "kind": "trajectory", "category": "fixture", "prompt": "Solve x+1=3", "response": "x=2", "ground_truth": "2"}

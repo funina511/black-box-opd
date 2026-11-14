@@ -3,7 +3,7 @@ rubric:
   max_empty_student_process_steps: 3
   judge:
     model: Qwen3-14B
-    tokenizer_path: /mnt/jinbo/RLRM/model/Qwen/Qwen3-14B
+    tokenizer_path: ../../assets/models/Qwen3-14B
     base_url: http://127.0.0.1:8018/v1
     dtype: bfloat16
     tensor_parallel_size: 2

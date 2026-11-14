@@ -1,0 +1,53 @@
+{
+  "start": "2026-11-10T10:16:49Z",
+  "finish": "2026-11-13T17:48:00Z",
+  "hours": 79.51972222222223,
+  "completed": true,
+  "checkpoint": 542,
+  "backend": "/mnt/jinbo/RLRM/LMOps/gad/.backends_gad_extensions_v1_f0ce22a97d40/gad",
+  "steps": 271,
+  "rows": 69376,
+  "distinct_questions": 16844,
+  "categories": {
+    "T": 39512,
+    "W": 21098,
+    "C": 8711,
+    "U": 55
+  },
+  "duplicate_step_records": {},
+  "max_naive_grpo_error": 0.0,
+  "final_validation": {
+    "count": 512,
+    "provisional_acc": 0.13671875,
+    "acc": null,
+    "unscorable_rate": 0.001953125,
+    "truncated_rate": 0.640625,
+    "response_len_mean": 5852.47265625
+  },
+  "judge_requests": 8685,
+  "labels": {
+    "c": {
+      "valid": 69152,
+      "values": {
+        "0.0": 60360,
+        "1.0": 8792
+      }
+    },
+    "p": {
+      "valid": 5453,
+      "values": {
+        "1.0": 1185,
+        "0.5": 4072,
+        "0.0": 196
+      }
+    },
+    "e": {
+      "valid": 5447,
+      "values": {
+        "0.0": 1687,
+        "1.0": 2771,
+        "0.5": 989
+      }
+    }
+  }
+}
