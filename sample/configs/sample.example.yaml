@@ -1,8 +1,7 @@
 # Sample / data-preparation configuration (example).
 #
-# Copy to a real path and fill in the local paths. Every path is required unless
-# marked optional; the pipeline preflight reports missing values instead of
-# silently falling back to a default.
+# Copy within sample/configs/ and adjust model/API and GPU settings for the target.
+# Paths resolve from this YAML's directory. Adjust them if you move the YAML.
 
 # --- DAPO prompt source -----------------------------------------------------
 prompts:
@@ -18,7 +17,7 @@ prompts:
   on_conflict: error           # error | keep-first | drop
   seed: 42
   dev_size: 512                # held out as the dev monitor set
-  out_dir: /abs/path/data/dapo_all_v1
+  out_dir: ../../data/dapo_all_v1
   # Set true for the CARD "full train" comparison: every unique problem goes to
   # train and the dev set must be supplied through dev_file.
   card_full_train: false
@@ -40,7 +39,7 @@ teacher:
   timeout: 600
   retries: 3
   # --- engine: vllm_offline ---
-  model_path: /abs/path/models/Qwen3-30B-A3B-Instruct-2507
+  model_path: ../../assets/models/Qwen3-30B-A3B-Instruct-2507
   tensor_parallel_size: 4
   max_model_len: 12288           # must cover prompt + max_tokens
   gpu_memory_utilization: 0.90
@@ -56,10 +55,10 @@ teacher:
   enable_thinking: false         # forwarded as chat_template_kwargs.enable_thinking
   # Sampling goes to the *teacher*; the student template switch must match what
   # the three training stages use, otherwise the distillation pairs differ.
-  index_out: /abs/path/data/dapo_all_v1/teacher_index.jsonl
+  index_out: ../../data/dapo_all_v1/teacher_index.jsonl
   # stdout/stderr of the sampler (and of the in-process vLLM workers) go here, so
   # an unread terminal can never block the run with a full pty buffer.
-  log_file: /abs/path/data/dapo_all_v1/logs/sample.log
+  log_file: ../../data/dapo_all_v1/logs/sample.log
   log_every: 100
 
 # --- GAD training data ------------------------------------------------------
@@ -68,13 +67,13 @@ gad_data:
                                #   the ablation pool; correct = keep only teacher-correct prompts,
                                #   which is the original's correct-nontruncated pool)
   select_val: all              # dev/monitor split; the original leaves its val set unfiltered
-  out_train: /abs/path/data/dapo_all_v1/gad_train.parquet
-  out_val: /abs/path/data/dapo_all_v1/gad_dev.parquet
+  out_train: ../../data/dapo_all_v1/gad_train.parquet
+  out_val: ../../data/dapo_all_v1/gad_dev.parquet
 
 # --- Model / tokenizer used for length statistics ---------------------------
 student:
-  model_path: /abs/path/models/Qwen3-8B
-  tokenizer_path: /abs/path/models/Qwen3-8B
+  model_path: ../../assets/models/Qwen3-8B
+  tokenizer_path: ../../assets/models/Qwen3-8B
   enable_thinking: false
 
 # --- Length budget (must match the training config) -------------------------
@@ -84,7 +83,7 @@ lengths:
 
 # --- External evaluation sets ----------------------------------------------
 eval:
-  sources_json: configs/eval_sources.example.json
-  out_dir: /abs/path/data/math_eval
+  sources_json: eval_sources.example.json
+  out_dir: ../../data/math_eval
   benchmarks: aime24,aime25,amc23,amc24,math500
   strict: false

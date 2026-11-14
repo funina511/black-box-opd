@@ -12,7 +12,7 @@ from urllib.parse import urlparse
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from config import add_config_arguments,select_config
 from extension_config import service_identity, ROOT
-from rubric.core.contracts import digest, file_hash
+from rubric.core.contracts import digest
 
 
 def process_birth(pid):
@@ -97,8 +97,7 @@ def main():
     if any(busy.get(gpu.strip(), 100000) > 512 for gpu in gpu_ids.split(",")):
         raise RuntimeError("judge GPUs unavailable; inspect nvidia-smi before starting")
     directory.mkdir(parents=True, exist_ok=True)
-    fingerprint = {"identity": identity, "identity_hash": expected,
-                   "model_sha256": service_identity(cfg, full=True)["model_sha256"], "gpu_ids": gpu_ids}
+    fingerprint = {"identity": identity, "identity_hash": expected, "gpu_ids": gpu_ids}
     fingerprint_file.write_text(json.dumps(fingerprint, indent=2))
     env = dict(os.environ, CUDA_VISIBLE_DEVICES=gpu_ids, GAD_JUDGE_FINGERPRINT_FILE=str(fingerprint_file),
                VLLM_WORKER_MULTIPROC_METHOD="spawn", TOKENIZERS_PARALLELISM="false", VLLM_USE_V1="0")

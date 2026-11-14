@@ -1,5 +1,7 @@
 # Reuse Warmup271; 271 NEW GAD updates ->542. Full joint Critic retained.
 # beta is frozen after the development-pair diagnostic; see reports/rubric_actor_20261103.
+# Template reusing a source-machine Warmup; historical frozen configs stay in runs/.
+# H200 fresh runs need new initialization settings, not these old Warmup paths.
 backends.profile: gad_extensions_v1
 backends.recreate: false
 backends.source_repo: ../gad/verl
@@ -188,7 +190,7 @@ run.val_before_train: false
 run.wandb_mode: offline
 run.wandb_project: lmops-gad
 scoring.math.entrypoint: ../scoring/math.py
-scoring.math.fingerprint: f3549b873f06e227cdadb6fe44eff97f5d0278d414618dd6b8d39eaee814ef8e
+scoring.math.fingerprint: null # Compute in the new environment, then freeze in the new run.
 scoring.math.timeout_seconds: 2.0
 scoring.math.version: math_unified_v1
 validation.block_training_on_incomplete: false

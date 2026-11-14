@@ -1,6 +1,8 @@
-# Fill every CHANGE_ME. Same-topology fresh runs only; resharding is unsupported.
+# Paths are relative to this YAML. Select the environment with GAD_PYTHON.
+# GPU IDs, counts and TP below are examples; configure them on the target server.
+# This is not a ready-to-run H200 shared-GPU configuration or a resharding recipe.
 run:
-  python_bin: /CHANGE_ME/envs/gad/bin/python
+  python_bin: null
 resources:
   gpus: 1,2,3,4
   n_gpus_per_node: 4
@@ -14,8 +16,8 @@ models:
   ref_param_offload: true
   actor_gradient_checkpointing: true
   critic_gradient_checkpointing: true
-  student: /CHANGE_ME/models/Qwen3-0.6B
-  discriminator_init: /CHANGE_ME/assets/qwen3_0.6b_math_v2_adv_seed42
+  student: ../../assets/models/Qwen3-0.6B
+  discriminator_init: ../../assets/initialization/qwen3_0.6b_math_v2_adv_seed42
 rollout:
   tensor_model_parallel_size: 1
   gpu_memory_utilization: 0.55
@@ -25,11 +27,11 @@ rubric:
     concurrency: 2
     tensor_parallel_size: 2
     base_url: http://127.0.0.1:8031/v1
-    tokenizer_path: /CHANGE_ME/models/Qwen3-8B
+    tokenizer_path: ../../assets/models/Qwen3-8B
 data:
-  train_file: /CHANGE_ME/data/dapo_math_17k_gad_v2/gad_train.parquet
-  val_file: /CHANGE_ME/data/dapo_math_17k_gad_v2/gad_dev.parquet
-  teacher_index: /CHANGE_ME/data/dapo_math_17k_gad_v2/teacher_index.jsonl
-  manifest: /CHANGE_ME/data/dapo_math_17k_gad_v2/manifest.json
+  train_file: ../../data/dapo_math_17k_gad_v2/gad_train.parquet
+  val_file: ../../data/dapo_math_17k_gad_v2/gad_dev.parquet
+  teacher_index: ../../data/dapo_math_17k_gad_v2/teacher_index.jsonl
+  manifest: ../../data/dapo_math_17k_gad_v2/manifest.json
 validation:
-  quick_file: /CHANGE_ME/data/dapo_math_17k_gad_v2/quick_dev.parquet
+  quick_file: ../../data/dapo_math_17k_gad_v2/quick_dev.parquet
