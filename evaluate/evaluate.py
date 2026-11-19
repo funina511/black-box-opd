@@ -8,12 +8,14 @@ Real evaluation requires ready checkpoints and free training GPUs.
 from __future__ import annotations
 
 import argparse
+from datetime import datetime, timezone
 import hashlib
 import json
 import re
 import subprocess
 import sys
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 import pyarrow.parquet as pq
 import yaml
@@ -23,6 +25,7 @@ sys.path.insert(0, str(LMOPS_ROOT))
 sys.path.insert(0, str(LMOPS_ROOT / "gad" / "tools"))
 from config import load_config, nested_config, add_config_arguments, select_config
 from pipeline import stage_step_budget
+from prepare_gad_checkpoint import actor_export_problems, has_tokenizer
 
 EVALUATE_DIR = Path(__file__).resolve().parent
 METHODS = ("base", "seqkd", "warmup", "gad")
@@ -91,7 +94,7 @@ def hf_ready(model: Path) -> bool:
     if index:
         try:
             files = set(json.loads(index.read_text(encoding="utf-8"))["weight_map"].values())
-        except (OSError, ValueError, KeyError):
+        except (OSError, ValueError, KeyError, AttributeError, TypeError):
             return False
         return bool(files) and all((model / name).is_file() and (model / name).stat().st_size > 0
                                    for name in files)
@@ -100,25 +103,66 @@ def hf_ready(model: Path) -> bool:
                for path in model.glob(pattern))
 
 
-def checkpoint_complete(stage_dir: Path, step: int) -> bool:
+def stage_model(stage_dir: Path, step: int, explicit: bool, previous: dict) -> dict:
     checkpoint = stage_dir / f"global_step_{step}"
-    actor = checkpoint / "actor"
-    rank_zero = list(actor.glob("model_world_size_*_rank_0.pt"))
-    if (len(rank_zero) != 1 or not (actor / "config.json").is_file()
-            or not (checkpoint / "data.pt").is_file()
-            or not any(actor.glob("optim_world_size_*_rank_*.pt"))
-            or not any((actor / name).is_file()
-                       for name in ("tokenizer.json", "tokenizer.model", "vocab.json"))):
-        return False
-    match = re.fullmatch(r"model_world_size_(\d+)_rank_0\.pt", rank_zero[0].name)
-    if not match:
-        return False
-    world_size = int(match.group(1))
-    return (world_size > 0 and all(
-        (actor / f"model_world_size_{world_size}_rank_{rank}.pt").is_file()
-        and (actor / f"model_world_size_{world_size}_rank_{rank}.pt").stat().st_size > 0
-        for rank in range(world_size)
-    ))
+    path = checkpoint / "actor" / "huggingface"
+    latest = latest_checkpoint_step(stage_dir)
+    selected = explicit or (latest == step and stage_completed(stage_dir.parent, stage_dir.name, step))
+    manifest = stage_dir / f"eval_export_step_{step}.json"
+    if not manifest.is_file():
+        candidates = [stage_dir / "final_model_manifest.json"]
+        if stage_dir.name == "gad":
+            candidates.append(stage_dir.parent / "final_model_manifest.json")
+            if explicit:
+                candidates.append(stage_dir.parent / "handoff_manifest.json")
+        for candidate in candidates:
+            if candidate.is_file() and json.loads(candidate.read_text()).get("step") == step:
+                manifest = candidate
+                break
+    # An older profile can also attest an export made before manifests were written.
+    pinned = (previous.get("path") == str(path) and previous.get("target_step") == step
+              and previous.get("hf_content"))
+    ready = bool(hf_ready(path) and has_tokenizer(path) and (manifest.is_file() or pinned))
+    available = selected and (ready or not actor_export_problems(checkpoint))
+    return {"path": str(path), "ready": ready, "target_step": step,
+            "selection": "explicit_step" if explicit else "configured_final",
+            "checkpoint_ready": available, "latest_checkpoint_step": latest,
+            "needs_export": available and not ready,
+            "unavailable_reason": ("no verified HF export or complete actor model shards"
+                                   if selected and not available else None),
+            "stage_export_manifest": str(manifest) if manifest.is_file() or not ready else None}
+
+
+def verify_stage_export(model: dict, actual: dict) -> None:
+    manifest = Path(model["stage_export_manifest"])
+    path = Path(model["path"])
+    record = json.loads(manifest.read_text(encoding="utf-8"))
+    if manifest.name == "handoff_manifest.json":
+        source_matches = (model["selection"] == "explicit_step" and record.get("stage") == "prepare_gad_checkpoint"
+                          and record.get("merged") is True and record.get("gad_checkpoint") == str(path.parents[1]))
+        identity_path = manifest.parent / "runtime" / "gad_handoff_identity.json"
+        if identity_path.is_file():
+            identity = json.loads(identity_path.read_text())
+            if (identity["manifest_sha256"] != sha256(manifest)
+                    or any(actual.get(name) != digest for name, digest in identity["actor_content"].items())):
+                raise RuntimeError(f"HF content or handoff manifest changed since GAD initialization: {identity_path}")
+    else:
+        source_matches = record.get("mode") == "export-final" and record.get("source_checkpoint") == str(path.parents[1])
+    if (record.get("ok") is not True or not source_matches or record.get("step") != model["target_step"]
+            or record.get("actor_hf") != str(path)):
+        raise RuntimeError(f"export source does not match the selected stage/step: {manifest}")
+    exports = record["exports"]
+    weights = set(exports["actor_weight_files"])
+    actual_weights = {name for name in actual if name.endswith((".safetensors", ".bin"))}
+    if not weights or weights != actual_weights:
+        raise RuntimeError(f"HF weight files differ from the stage export: {manifest}")
+    expected = exports["actor_files"]
+    if "actor_weight_sha256" in exports:
+        if set(exports["actor_weight_sha256"]) != weights:
+            raise RuntimeError(f"incomplete weight checksums in stage export: {manifest}")
+        expected = {**expected, **exports["actor_weight_sha256"]}
+    if any(actual.get(name) != digest for name, digest in expected.items()):
+        raise RuntimeError(f"HF content changed since stage export: {manifest}")
 
 
 def named_steps(values: list[str]) -> dict[str, int]:
@@ -285,38 +329,27 @@ def build_plan(train_path: Path, *, methods: list[str], tasks: list[str],
         raise ValueError(f"unknown methods without explicit model paths: {sorted(invalid_methods)}")
     if not methods or not tasks or len(methods) != len(set(methods)) or len(tasks) != len(set(tasks)):
         raise ValueError("select at least one unique model and dataset")
+    profile = str(profile)
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", profile):
+        raise ValueError(f"unsafe output profile: {profile}")
+    profile += f"_smoke{max_prompts}" if max_prompts else ""
+    saved_plan = run_dir / "evaluation" / profile / "plan.json"
+    previous_models = json.loads(saved_plan.read_text())["models"] if saved_plan.is_file() else {}
     for name in [*methods, *tasks]:
         if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", name):
             raise ValueError(f"unsafe model/dataset name: {name}")
     model_plan = {}
     for method in methods:
         is_stage = method in METHODS[1:] and method not in model_overrides
-        step = checkpoint_steps.get(method, targets.get(method)) if is_stage else None
-        if method in model_overrides:
-            path = model_overrides[method]
-        elif is_stage:
-            path = run_dir / method / f"global_step_{step}" / "actor" / "huggingface"
-        else:
-            path = resolve_from(train_path, train["models"]["student"])
-        selection = "explicit_step" if method in checkpoint_steps else (
-            "configured_final" if is_stage else "model_path")
-        latest = latest_checkpoint_step(run_dir / method) if is_stage else None
         if is_stage:
-            checkpoint_ready = (
-                checkpoint_complete(run_dir / method, step)
-                and (method in checkpoint_steps or (latest == step and stage_completed(run_dir, method, step)))
-            )
-        else:
-            checkpoint_ready = None
-        ready = hf_ready(path)
+            model_plan[method] = stage_model(run_dir / method, checkpoint_steps.get(method, targets[method]),
+                                             method in checkpoint_steps, previous_models.get(method, {}))
+            continue
+        path = model_overrides.get(method) or resolve_from(train_path, train["models"]["student"])
         model_plan[method] = {
-            "path": str(path), "ready": ready,
-            "target_step": step, "selection": selection,
-            "checkpoint_ready": checkpoint_ready,
-            "latest_checkpoint_step": latest,
-            "needs_export": bool(checkpoint_ready and not ready),
-            'content': model_content(run_dir/method/f'global_step_{step}'/'actor' if is_stage else path, recursive=not is_stage)
-                if (run_dir/method/f'global_step_{step}'/'actor' if is_stage else path).is_dir() else None,
+            "path": str(path), "ready": hf_ready(path),
+            "target_step": None, "selection": "model_path", "checkpoint_ready": None,
+            "latest_checkpoint_step": None, "needs_export": False,
         }
 
     oprd_root = oprd_root.expanduser().resolve()
@@ -362,10 +395,6 @@ def build_plan(train_path: Path, *, methods: list[str], tasks: list[str],
         raise ValueError(f"invalid GPU IDs: {chosen_gpus}")
     if max_prompts < 0:
         raise ValueError("--max-prompts must be >= 0")
-    profile = str(profile)
-    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", profile):
-        raise ValueError(f"unsafe output profile: {profile}")
-    profile += f"_smoke{max_prompts}" if max_prompts else ""
     return {
         "experiment": train_path.parent.name, "train_config": str(train_path),
         "run_dir": str(run_dir), "training_snapshot": str(snapshot_path) if snapshot_path else None,
@@ -416,6 +445,7 @@ def export_stage(plan: dict, stage: str, model: dict) -> None:
     model["ready"] = True
     model["needs_export"] = False
     model["export_manifest"] = str(manifest)
+    model["stage_export_manifest"] = str(manifest)
 
 
 def evaluation_identity(plan):
@@ -430,14 +460,31 @@ def evaluation_identity(plan):
     return identity
 
 
+def complete_raw_sha256(path, expected, n):
+    """Hash the same JSONL bytes whose question/rollout slots are validated."""
+    missing = {(str(question), index) for question in expected for index in range(n)}
+    digest = hashlib.sha256()
+    try:
+        # Preserve the on-disk line endings, including CRLF, for the digest.
+        with path.open(encoding='utf-8', newline='') as stream:
+            for line in stream:
+                digest.update(line.encode('utf-8'))
+                if not line.strip():
+                    continue
+                row = json.loads(line)
+                if not isinstance(row, dict) or type(row.get('rollout_index')) is not int:
+                    return None
+                slot = (str(row.get('global_index')), row['rollout_index'])
+                if slot not in missing:
+                    return None
+                missing.remove(slot)
+    except (OSError, ValueError):
+        return None
+    return None if missing else digest.hexdigest()
+
+
 def raw_complete(path, expected, n):
-    if not path.is_file():return False
-    # JSONL records end at "\n" only; str.splitlines() would also split on U+2028 inside responses.
-    try:rows=[json.loads(line) for line in path.read_text(encoding='utf-8').split('\n') if line.strip()]
-    except (OSError,ValueError):return False
-    keys=[(str(r.get('global_index')),r.get('rollout_index')) for r in rows]
-    return (all(type(k[1]) is int for k in keys) and len(keys)==len(set(keys)) and
-            set(keys)=={(str(q),r) for q in expected for r in range(n)})
+    return complete_raw_sha256(path, expected, n) is not None
 
 
 def execute(plan: dict) -> None:
@@ -449,7 +496,9 @@ def execute(plan: dict) -> None:
         if model["checkpoint_ready"] is False:
             latest = model["latest_checkpoint_step"]
             detail = f"latest checkpoint {latest}" if latest is not None else "no checkpoint marker"
-            if model["selection"] == "explicit_step":
+            if model.get("unavailable_reason"):
+                unavailable.append(f"{name}: {model['unavailable_reason']} at global_step_{model['target_step']}")
+            elif model["selection"] == "explicit_step":
                 unavailable.append(
                     f"{name}: requested global_step_{model['target_step']} has no complete actor checkpoint "
                     f"({detail})"
@@ -465,8 +514,12 @@ def execute(plan: dict) -> None:
         raise RuntimeError("selected models unavailable:\n  " + "\n  ".join(unavailable))
     out_root = Path(plan["output_root"])
     saved_plan = out_root / "plan.json"
-    if saved_plan.is_file():
-        previous = json.loads(saved_plan.read_text(encoding="utf-8"))
+    previous = json.loads(saved_plan.read_text(encoding="utf-8")) if saved_plan.is_file() else None
+    if previous:
+        # Historical task-state hashes include the old raw actor/optimizer snapshot in
+        # "content". Preserve that provenance and independently verify the actual HF below.
+        for name, model in plan["models"].items():
+            model["content"] = previous["models"].get(name, {}).get("content")
         if evaluation_identity(previous) != evaluation_identity(plan):
             raise RuntimeError(f"evaluation settings changed in {out_root}; choose a new PROFILE")
     for name, model in plan["models"].items():
@@ -475,12 +528,16 @@ def execute(plan: dict) -> None:
         actual = model_content(Path(model['path']))
         if not actual:
             raise RuntimeError(f'no actual HF content after export: {model["path"]}')
-        prior_model = previous['models'].get(name, {}) if saved_plan.is_file() else {}
+        prior_model = previous['models'].get(name, {}) if previous else {}
         prior_hf = prior_model.get('hf_content')
-        if saved_plan.is_file() and prior_hf is None:
+        if previous and prior_hf is None:
             raise RuntimeError('old evaluation lacks actual HF identity; preserve it and use a new PROFILE')
         if prior_hf is not None and prior_hf != actual:
             raise RuntimeError(f'actual HF content changed for {name}; choose a new PROFILE')
+        if model.get("stage_export_manifest"):
+            verify_stage_export(model, actual)
+        if not previous:
+            model["content"] = actual
         model['hf_content'] = actual
     out_root.mkdir(parents=True, exist_ok=True)
     from gad.extensions.common import atomic_json
@@ -517,18 +574,26 @@ def execute(plan: dict) -> None:
             atomic_json(expected_path,expected)
             raw=generation/'raw_samples.jsonl'
             reuse_raw = Path(plan['reuse_generation_from'])/method/task/'generation/raw_samples.jsonl' if plan.get('reuse_generation_from') else None
-            if reuse_raw is not None and raw_complete(reuse_raw, expected, samples):
+            raw_hash = complete_raw_sha256(reuse_raw, expected, samples) if reuse_raw is not None else None
+            if raw_hash is not None:
                 raw = reuse_raw
+            else:
+                raw_hash = complete_raw_sha256(raw, expected, samples)
             state_path=task_dir/'state.json'
             state=json.loads(state_path.read_text()) if state_path.is_file() else {}
             current_identity=hashlib.sha256(json.dumps({'evaluation':evaluation_identity(plan),'hf_content':model['hf_content'],'method':method,'task':task},sort_keys=True).encode()).hexdigest()
             metric_path=Path(state.get('metrics_path',scores/'metrics.json'))
-            if (state.get('identity')==current_identity and state.get('status')=='complete' and raw.is_file() and
-                    metric_path.is_file() and state.get('raw_sha256')==sha256(raw) and
-                    state.get('metrics_sha256')==sha256(metric_path)):
-                metrics=json.loads(metric_path.read_text())
-                if metrics.get('evaluation_complete') and raw_complete(raw,expected,samples):
-                    print(f'[eval] {method}/{task}: complete, skipped',flush=True);continue
+            if (state.get('identity') == current_identity and state.get('status') == 'complete'
+                    and raw_hash is not None and state.get('raw_sha256') == raw_hash and metric_path.is_file()):
+                saved_metrics = metric_path.read_bytes()
+                if hashlib.sha256(saved_metrics).hexdigest() == state.get('metrics_sha256'):
+                    metrics = json.loads(saved_metrics)
+                else:
+                    metrics = {}
+                # Older metrics kept their input digest only in state.json.
+                if metrics.get('evaluation_complete') and metrics.get('raw_sha256', raw_hash) == raw_hash:
+                    print(f'[eval] {method}/{task}: complete, skipped', flush=True)
+                    continue
             sampler = [python_bin, "-m", "sft.sample_teacher",
                        "--input-parquet", dataset["path"], "--model-path", model["path"],
                        "--output-dir", str(generation), "--gpu-ids", plan["gpu_ids"],
@@ -545,7 +610,7 @@ def execute(plan: dict) -> None:
             if protocol["enforce_eager"]:
                 sampler.append("--enforce-eager")
             print(f"[eval] {method}/{task}: {samples} samples/question", flush=True)
-            if not raw_complete(raw,expected,samples):
+            if raw_hash is None:
                 if plan.get('allow_new_eval_scorer') and not plan.get('generate_missing'):
                     raise RuntimeError(f'{method}/{task}: saved raw samples are incomplete; '
                                        'rescoring does not generate answers. For first-time evaluation '
@@ -555,20 +620,26 @@ def execute(plan: dict) -> None:
                                         'training_scorer':plan.get('training_scorer'),
                                         'evaluation_scorer':task_scorer})
                 subprocess.run(sampler, cwd=oprd_root, check=True)
-            if (scores/'metrics.json').exists():
-                # Preserve old/incomplete/corrupt scores. Each replacement has its own directory.
-                from datetime import datetime,timezone
-                scores=task_dir/('scores_'+datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ'))
-            atomic_json(state_path,{'identity':current_identity,'status':'scoring','raw_sha256':sha256(raw),
+                raw_hash = sha256(raw)
+            atomic_json(state_path,{'identity':current_identity,'status':'scoring','raw_sha256':raw_hash,
                                     'raw_path':str(raw),
                                     'training_scorer':plan.get('training_scorer'),
                 'evaluation_scorer':task_scorer})
-            subprocess.run([python_bin, str(LMOPS_ROOT / 'evaluate/rescore.py'), '--raw-jsonl', str(raw),
-                '--output-dir', str(scores), '--task', task, '--n', str(samples), '--expected-ids', str(expected_path),
-                '--config-json', json.dumps(scoring_config)], cwd=LMOPS_ROOT, check=True)
-            metrics=json.loads((scores/'metrics.json').read_text())
+            with TemporaryDirectory(dir=task_dir, prefix='.scoring-') as temporary:
+                pending = Path(temporary) / 'scores'
+                subprocess.run([python_bin, str(LMOPS_ROOT / 'evaluate/rescore.py'), '--raw-jsonl', str(raw),
+                    '--output-dir', str(pending), '--task', task, '--n', str(samples), '--expected-ids', str(expected_path),
+                    '--config-json', json.dumps(scoring_config)], cwd=LMOPS_ROOT, check=True)
+                metrics_bytes = (pending / 'metrics.json').read_bytes()
+                metrics = json.loads(metrics_bytes)
+                if metrics.get('raw_sha256') != raw_hash or sha256(raw) != raw_hash:
+                    raise RuntimeError(f'{method}/{task}: raw samples changed during scoring: {raw}')
+                if scores.exists():
+                    # Preserve every previous attempt, including partial legacy directories.
+                    scores = task_dir / ('scores_' + datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ'))
+                pending.rename(scores)
             atomic_json(state_path,{'identity':current_identity,'status':'complete' if metrics.get('evaluation_complete') else 'incomplete',
-                'raw_sha256':sha256(raw),'raw_path':str(raw),'metrics_path':str(scores/'metrics.json'), 'metrics_sha256':sha256(scores/'metrics.json'),
+                'raw_sha256':raw_hash,'raw_path':str(raw),'metrics_path':str(scores/'metrics.json'), 'metrics_sha256':hashlib.sha256(metrics_bytes).hexdigest(),
                 'counter_correct':metrics.get('confirmed_correct'),'counter_incorrect':metrics.get('confirmed_incorrect'),
                 'unresolved_samples':metrics.get('unresolved_samples'),
                 'sample_accuracy_lower':metrics.get('sample_accuracy_lower'),

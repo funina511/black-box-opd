@@ -59,7 +59,7 @@ def plan_retention(stage_dir: Path, *, keep_checkpoints: int) -> dict:
                 "reason": "latest checkpoint incomplete: " + "; ".join(problems)}
     found = checkpoint_dirs(stage_dir)
     available = [(step, path) for step, path in found if step <= latest]
-    complete = [step for step, path in available if not check_checkpoint(path, roles=roles)]
+    complete = [step for step, path in available if path == checkpoint or not check_checkpoint(path, roles=roles)]
     recent_steps = complete[-keep_checkpoints:]
     pins = pinned_steps(stage_dir)
     keep_steps = set(recent_steps) | pins | {latest}

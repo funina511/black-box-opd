@@ -2,7 +2,7 @@
 import importlib.util
 import time
 from pathlib import Path
-from .common import DIMENSIONS, append_json, digest, file_hash
+from .common import DIMENSIONS, append_json, digest, file_hash, semantic_module_hash
 from .core.contracts import ANNOTATION_SCHEMA, judge_messages, validate_label
 from .judge_client import JudgeClient
 from .label_cache import LabelCache
@@ -37,8 +37,7 @@ class OnlineRubric:
             self.annotation_contract_hash = file_hash(process_v2.__file__)
             self.protocol_identity = process_v2.protocol_identity(self.spec, self.instruction)
             self.protocol_identity['semantic_policy'] = {key:options.get(key, default) for key,default in (('semantic_check',False),('semantic_max_extra_requests',1))}
-            from .core import semantic_v24
-            self.protocol_identity['semantic_module_hash'] = file_hash(semantic_v24.__file__)
+            self.protocol_identity['semantic_module_hash'] = semantic_module_hash(self.process_protocol)
             if options.get('protocol_identity') is not None and self.protocol_identity != options['protocol_identity']:
                 raise ValueError('rubric protocol/semantic policy changed after launch')
             self.scoring_config = options['scoring_math']

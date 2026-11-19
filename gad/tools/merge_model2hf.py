@@ -36,45 +36,64 @@ def merge_by_placement(tensors: List[torch.Tensor], placement: Placement):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--local_dir', required=True, type = str, help="The path for your saved model")
+    parser.add_argument('--output-dir', help="HF directory with model config (default: <local_dir>/huggingface)")
     parser.add_argument("--hf_upload_path", default=False, type = str, help="The path of the huggingface repo to upload")
     args = parser.parse_args()
 
-    assert not args.local_dir.endswith("huggingface"), "The local_dir should not end with huggingface"
     local_dir = args.local_dir
+    hf_path = args.output_dir or os.path.join(local_dir, 'huggingface')
+    if os.path.realpath(hf_path) == os.path.realpath(local_dir):
+        raise ValueError("HF output directory must differ from the source shard directory")
 
     # copy rank zero to find the shape of (dp, fsdp)
     rank = 0
     world_size = 0
     for filename in os.listdir(local_dir):
-        match = re.match(r"model_world_size_(\d+)_rank_0\.pt", filename)
+        match = re.fullmatch(r"model_world_size_(\d+)_rank_0\.pt", filename)
         if match:
             world_size = match.group(1)  
             break  
-    assert world_size, "No model file with the proper format"
+    if not world_size:
+        raise ValueError(f"No rank-zero model shard found in {local_dir}")
         
-    state_dict = torch.load(os.path.join(local_dir, f'model_world_size_{world_size}_rank_{rank}.pt'), map_location='cpu')
+    state_dict = torch.load(os.path.join(local_dir, f'model_world_size_{world_size}_rank_{rank}.pt'),
+                            map_location='cpu', weights_only=False)
     pivot_key = sorted(list(state_dict.keys()))[0]
     weight = state_dict[pivot_key]
-    assert isinstance(weight, torch.distributed._tensor.DTensor)
-    # get sharding info
-    device_mesh = weight.device_mesh
-    mesh = device_mesh.mesh
-    mesh_dim_names = device_mesh.mesh_dim_names
+    if isinstance(weight, DTensor):
+        # Preserve the existing distributed checkpoint merge path.
+        device_mesh = weight.device_mesh
+        mesh = device_mesh.mesh
+        mesh_dim_names = device_mesh.mesh_dim_names
 
-    print(f'Got device mesh {mesh}, mesh_dim_names {mesh_dim_names}')
+        print(f'Got device mesh {mesh}, mesh_dim_names {mesh_dim_names}')
 
-    assert mesh_dim_names in (
-        ('fsdp',),
-    ), f'Unsupported mesh_dim_names {mesh_dim_names}'
+        assert mesh_dim_names in (
+            ('fsdp',),
+        ), f'Unsupported mesh_dim_names {mesh_dim_names}'
 
-    if 'tp' in mesh_dim_names:
-        # fsdp * tp
-        total_shards = mesh.shape[-1] * mesh.shape[-2]
-        mesh_shape = (mesh.shape[-2], mesh.shape[-1])
+        if 'tp' in mesh_dim_names:
+            # fsdp * tp
+            total_shards = mesh.shape[-1] * mesh.shape[-2]
+            mesh_shape = (mesh.shape[-2], mesh.shape[-1])
+        else:
+            # fsdp
+            total_shards = mesh.shape[-1]
+            mesh_shape = (mesh.shape[-1],)
     else:
-        # fsdp
-        total_shards = mesh.shape[-1]
-        mesh_shape = (mesh.shape[-1],)
+        # FSDP world_size=1 switches to NO_SHARD and saves full ordinary tensors.
+        # Never interpret rank-local tensors from a multi-rank save as a full model.
+        model_files = sorted(name for name in os.listdir(local_dir)
+                             if re.fullmatch(r'model_world_size_\d+_rank_\d+\.pt', name))
+        if int(world_size) != 1 or model_files != ['model_world_size_1_rank_0.pt']:
+            raise ValueError('ordinary Tensor export requires exactly one world_size=1 rank_0 model file')
+        if any(not isinstance(value, torch.Tensor) or isinstance(value, DTensor)
+               for value in state_dict.values()):
+            raise ValueError('world_size=1 NO_SHARD checkpoint must contain only ordinary Tensors')
+        mesh_dim_names = ('fsdp',)
+        total_shards = 1
+        mesh_shape = (1,)
+        print('Using full ordinary Tensor state from world_size=1 FSDP NO_SHARD')
 
     print(f'Processing model shards with {total_shards} {mesh_shape} in total')
 
@@ -133,7 +152,6 @@ if __name__ == '__main__':
             raise NotImplementedError("FSDP + TP is not supported yet")
 
     print('Writing to local disk')
-    hf_path = os.path.join(local_dir, 'huggingface')
     config = AutoConfig.from_pretrained(hf_path)
 
     if 'ForTokenClassification' in config.architectures[0]:

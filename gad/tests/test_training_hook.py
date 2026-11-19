@@ -100,6 +100,48 @@ class TrainingHookTests(unittest.TestCase):
             self.assertEqual(['annotate'], self.execute(block, fail='judge'))
             self.assertEqual(['annotate', 'critic', 'actor'], self.execute(block, fail='actor'))
 
+    def test_vanilla_warmup_only_skips_unused_policy_diagnostics(self):
+        import json
+        from omegaconf import OmegaConf
+        sys.path.insert(0, str(ROOT))
+        from gad.extensions.warmup import skip_policy_diagnostics
+
+        config = OmegaConf.load(self.backend_root / "warmup/verl/trainer/config/ppo_trainer.yaml")
+        batch = SimpleNamespace(batch={}, non_tensor_batch={})
+        config.algorithm.adv_estimator = "grpo"
+        config.actor_rollout_ref.actor.entropy_coeff = 0
+        config.actor_rollout_ref.actor.use_kl_loss = True  # pinned SFT loss ignores this PPO option
+        with tempfile.TemporaryDirectory() as directory:
+            for model, architecture in ((config.actor_rollout_ref.model, "Qwen3ForCausalLM"),
+                                        (config.critic.model, "Qwen3ForTokenClassification")):
+                path = Path(directory) / architecture
+                path.mkdir()
+                (path / "config.json").write_text(json.dumps({"model_type": "qwen3", "architectures": [architecture]}))
+                model.path = str(path)
+            for rubric in (False, True):
+                config.critic.rubric.enabled = rubric
+                self.assertTrue(skip_policy_diagnostics(config, batch))
+            scaled = Path(directory) / "dynamic_rope"
+            scaled.mkdir()
+            (scaled / "config.json").write_text(json.dumps({"model_type": "qwen3",
+                "architectures": ["Qwen3ForCausalLM"], "rope_scaling": {"rope_type": "dynamic", "factor": 2.}}))
+            for key, value in (("trainer.warmup_forward_diagnostics", True),
+                               ("trainer.rollout_data_dir", directory),
+                               ("trainer.gad_extensions.student_scorer_monitor", True),
+                               ("critic.rubric.actor_reward_shadow", True),
+                               ("actor_rollout_ref.actor.policy_loss.loss_mode", "gpg"),
+                               ("actor_rollout_ref.actor.entropy_coeff", .1),
+                               ("actor_rollout_ref.model.path", str(scaled)),
+                               ("algorithm.use_kl_in_reward", True),
+                               ("critic.model.path", str(Path(directory) / "custom"))):
+                with self.subTest(key=key):
+                    setting = OmegaConf.select(config, key)
+                    OmegaConf.update(config, key, value)
+                    self.assertFalse(skip_policy_diagnostics(config, batch))
+                    OmegaConf.update(config, key, setting)
+            batch.batch["rollout_log_probs"] = object()
+            self.assertFalse(skip_policy_diagnostics(config, batch))
+
     def test_teacher_truncation_is_observed_before_length_cap(self):
         import torch
         source=self.backend_root/'gad/verl/utils/dataset/rl_dataset.py'

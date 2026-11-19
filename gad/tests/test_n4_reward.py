@@ -142,8 +142,10 @@ class N4Tests(unittest.TestCase):
             with self.assertRaisesRegex(Exception,'ordered training content'):
                 pipeline.warmup_source_compatibility(cfg,source)
             source.data['data.train_batch_size']=32
-            with self.assertRaisesRegex(Exception,'train_batch_size'):
-                pipeline.warmup_source_compatibility(cfg,source)
+            for target in (a, b):
+                cfg.data['data.train_file'] = str(target)
+                with self.subTest(target=target), self.assertRaisesRegex(Exception,'train_batch_size'):
+                    pipeline.warmup_source_compatibility(cfg,source)
 
     def test_baseline_scorer_is_record_only(self):
         from scoring.math import identity,score,correctness_label

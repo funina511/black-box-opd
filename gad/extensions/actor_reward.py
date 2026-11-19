@@ -183,10 +183,14 @@ def auc(pred, target):
     return float(((positive[:, None] > negative).float() + .5 * (positive[:, None] == negative)).mean())
 
 
-def group_diagnostics(rows, parts, adv, full, options):
+def group_diagnostics(rows, parts, adv, full, options, advantages=None):
     uids = [(r['step'], r['uid']) for r in rows]
     groups = groups_for(uids)
-    aa, af = group_advantages(adv, uids), group_advantages(full, uids)
+    if advantages is None:
+        aa = group_advantages(adv, uids)
+        af = aa if full is adv else group_advantages(full, uids)
+    else:
+        aa, af = advantages
     rubric = rubric_scores(parts, options)
     std_r, std_a, gaps_a, gaps_f, weak_deltas = [], [], [], [], []
     mixed, truncated, correct, zero, passthrough = 0, 0, 0, 0, 0
@@ -211,6 +215,8 @@ def group_diagnostics(rows, parts, adv, full, options):
             gaps_f.append(float(af[cs].mean() - af[ws].mean()))
         if sa < 1e-5:
             weak_deltas.extend((af[ids] - aa[ids]).abs().tolist())
+        if adv is full:
+            continue
         for i, j in combinations(ids, 2):
             if float(adv[i] - adv[j]) * float(full[i] - full[j]) < 0:
                 flips += 1
@@ -332,15 +338,15 @@ def summarize(rows, options, prefix='actor_reward/'):
     uids = [(r['step'], r['uid']) for r in rows]
     adv, correct, full = reward_scores(parts, options, uids)
     stats = {'samples': len(rows), 'steps': len({r['step'] for r in rows})}
-    weights = options.get('actor_reward_weights', {})
     rubric = rubric_scores(parts, options)
+    adv_advantage = group_advantages(adv, uids)
+    full_advantage = adv_advantage if full is adv else group_advantages(full, uids)
     contribution = full - adv
     if options.get('reward_source') == 'adv_plus_rubric_groupnorm':
         contribution = torch.zeros_like(adv)
-        normalized_adv = group_advantages(adv, uids)
         for ids in groups_for(uids).values():
             if options.get('actor_reward_group_weight', 0.) > 0 and len(ids) > 1 and rubric[ids].std() != 0:
-                contribution[ids] = full[ids] - normalized_adv[ids]
+                contribution[ids] = full[ids] - adv_advantage[ids]
     distributions = [('adv', adv), ('total', full)]
     if four_heads:
         distributions += [('c', parts[:, 1]), ('p', parts[:, 2]), ('e', parts[:, 3]),
@@ -380,18 +386,15 @@ def summarize(rows, options, prefix='actor_reward/'):
             stats.update({stem + 'prediction_mean': float(parts[selected, i + 1].mean()),
                           stem + 'target_mean': float(target[selected, i].mean()),
                           stem + 'bias': float(delta.mean()), stem + 'mae': float(delta.abs().mean())})
-    group = defaultdict(list)
-    for i, uid in enumerate(uids):
-        group[uid].append(i)
+    group = groups_for(uids)
     triples = [(i, j) for ids in group.values() for i, j in combinations(ids, 2)]
-    advantages = [group_advantages(x, uids) for x in (adv, correct, full)]
-    actual = torch.tensor([r.get('grpo_advantage', float(advantages[2][i])) for i, r in enumerate(rows)])
-    stats['advantages_actual_max_error'] = float((actual - advantages[2]).abs().max())
-    stats['advantages_change_mean'] = float((advantages[2] - advantages[0]).abs().mean())
+    actual = torch.tensor([r.get('grpo_advantage', float(full_advantage[i])) for i, r in enumerate(rows)])
+    stats['advantages_actual_max_error'] = float((actual - full_advantage).abs().max())
+    stats['advantages_change_mean'] = float((full_advantage - adv_advantage).abs().mean())
     stats['groups'] = len(group)
-    stats['nonzero_advantage_groups'] = sum(bool((advantages[2][ids] != 0).any()) for ids in group.values())
+    stats['nonzero_advantage_groups'] = sum(bool((full_advantage[ids] != 0).any()) for ids in group.values())
     stats['nonzero_advantage_group_rate'] = stats['nonzero_advantage_groups'] / len(group)
-    stats.update(group_diagnostics(rows, parts, adv, full, options))
+    stats.update(group_diagnostics(rows, parts, adv, full, options, (adv_advantage, full_advantage)))
     tw = [(i, j) if rows[i]['category'] == 'T' else (j, i) for i, j in triples
           if {rows[i]['category'], rows[j]['category']} == {'T', 'W'}]
     stats['pairs/gaps/TW/count'] = len(tw)
@@ -401,13 +404,15 @@ def summarize(rows, options, prefix='actor_reward/'):
             delta = torch.stack([values[t] - values[w] for t, w in tw])
             stats['pairs/gaps/TW/T_minus_W_' + name + '_mean'] = float(delta.mean())
             stats['pairs/gaps/TW/T_minus_W_' + name + '_std'] = float(delta.std(unbiased=False))
-    for a, b, name in [(adv, correct, 'adv_to_c'), (correct, full, 'c_to_full'), (adv, full, 'adv_to_full')]:
-        buckets = defaultdict(list)
-        for i, j in triples:
-            buckets['all'].append((i, j))
-            buckets[''.join(sorted((rows[i]['category'], rows[j]['category'])))].append((i, j))
+    buckets = defaultdict(list)
+    for i, j in triples:
+        buckets['all'].append((i, j))
+        buckets[''.join(sorted((rows[i]['category'], rows[j]['category'])))].append((i, j))
+    comparisons = [(adv, correct, ('adv_to_c',)), (correct, full, ('c_to_full',)), (adv, full, ('adv_to_full',))]
+    if adv is correct and adv is full:
+        comparisons = [(adv, adv, ('adv_to_c', 'c_to_full', 'adv_to_full'))]
+    for a, b, names in comparisons:
         for bucket, pairs in buckets.items():
-            stem = 'pairs/' + name + '/' + bucket + '/'
             counts = defaultdict(int)
             for i, j in pairs:
                 da, db = float(a[i] - a[j]), float(b[i] - b[j])
@@ -433,12 +438,12 @@ def summarize(rows, options, prefix='actor_reward/'):
                     counts['right_after'] += y > 0
                     counts['corrected'] += x < 0 and y > 0
                     counts['damaged'] += x > 0 and y < 0
-            stats[stem + 'count'] = len(pairs)
-            for key, value in counts.items():
-                stats[stem + key] = value
-            stats[stem + 'strict_flip_rate'] = counts['strict_flips'] / len(pairs)
-            stats[stem + 'before_tie_rate'] = counts['before_ties'] / len(pairs)
-            stats[stem + 'after_tie_rate'] = counts['after_ties'] / len(pairs)
+            counts.update(count=len(pairs), strict_flip_rate=counts['strict_flips'] / len(pairs),
+                          before_tie_rate=counts['before_ties'] / len(pairs),
+                          after_tie_rate=counts['after_ties'] / len(pairs))
+            for name in names:
+                stem = 'pairs/' + name + '/' + bucket + '/'
+                stats.update((stem + key, value) for key, value in counts.items())
     return {prefix + key: value for key, value in stats.items()}
 
 

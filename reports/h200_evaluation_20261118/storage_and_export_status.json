@@ -1,0 +1,66 @@
+{
+  "checked_at": "2026-11-18T00:23:25.243832+08:00",
+  "run": "/tmp/bloxopd_h200_runs/h200_baseline_06b_17k_n4",
+  "profile": "all8_dapo_v2_af1_n4_16k_h200_graph",
+  "evaluation": {
+    "model_task_count": 24,
+    "generated_sample_slots": 37152,
+    "all_sample_indices_complete": true,
+    "scoring_complete_tasks": 13,
+    "unresolved_total": 301
+  },
+  "disks": {
+    "tmp": {
+      "path": "/tmp",
+      "capacity_GiB": 258.0,
+      "available_GiB": 21.30638885498047
+    },
+    "project": {
+      "path": "/root/siton-tmp/home/jinbo/bloxopd/LMOps",
+      "capacity_GiB": 512.0,
+      "available_GiB": 12.23630142211914
+    }
+  },
+  "checkpoint_file_sizes_GiB": {
+    "seqkd": {
+      "global_step_542": {
+        "other": 0.014808028005063534,
+        "resume_model": 2.800195077434182,
+        "optimizer": 4.440942491404712,
+        "hf_export": 1.4148503979668021
+      }
+    },
+    "warmup": {
+      "global_step_271": {
+        "other": 0.02961462177336216,
+        "resume_model": 5.02080449834466,
+        "optimizer": 8.881892612203956
+      }
+    },
+    "gad": {
+      "global_step_271": {
+        "other": 0.029614745639264584,
+        "resume_model": 5.02080449834466,
+        "optimizer": 8.881892612203956,
+        "hf_export": 2.5399077143520117
+      },
+      "global_step_542": {
+        "other": 0.02963515091687441,
+        "resume_model": 5.02080449834466,
+        "optimizer": 8.881892612203956,
+        "hf_export": 1.4148503979668021
+      }
+    }
+  },
+  "checkpoint_category_totals_GiB": {
+    "other": 0.10367254633456469,
+    "resume_model": 17.86260857246816,
+    "optimizer": 31.08662032801658,
+    "hf_export": 5.369608510285616
+  },
+  "exports": {
+    "detail_csv": "reports/h200_evaluation_20261118/baseline_all8_n4_detail.csv",
+    "comparison_csv": "reports/h200_evaluation_20261118/baseline_all8_n4_comparison.csv"
+  },
+  "files_deleted": false
+}

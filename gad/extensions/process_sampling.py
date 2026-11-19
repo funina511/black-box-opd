@@ -13,6 +13,10 @@ def selection_order(options, step, stage, index, identity):
                    'supervision_identity': identity})
 
 
+def initial_teacher_quota(budget, stage):
+    return (budget + 1) // 3 if stage == 'gad' else budget // 2
+
+
 def logical_minibatches(size, global_mini, dp_size):
     if size % dp_size or global_mini % dp_size or size % global_mini:
         raise ValueError('extension batches must divide DP and logical minibatch sizes')
@@ -41,7 +45,7 @@ def select_process(pairs, global_mini, dp_size, options, step, stage):
         else:
             # Both roles get a quota; identities appearing in both roles consume
             # one total slot and contribute to both observed role counts.
-            teacher_quota = (budget + 1) // 3 if stage == 'gad' else budget // 2
+            teacher_quota = initial_teacher_quota(budget, stage)
             student_quota = budget - teacher_quota
             teacher = sorted(candidates['teacher'], key=order)[:teacher_quota]
             student = sorted(candidates['student'], key=order)[:student_quota]

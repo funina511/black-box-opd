@@ -32,6 +32,45 @@ def replace(text, old, new, name):
     return text.replace(old, new, 1)
 
 
+def patch_warmup_sft(texts):
+    from textwrap import indent
+
+    ray = "verl/trainer/ppo/ray_trainer.py"
+    start = texts[ray].index("                    # recompute old_log_probs")
+    end = texts[ray].index("                    # update critic", start)
+    # The reference configuration enables KL, but this pinned vanilla SFT
+    # actor never adds it to its loss. Keep the full path for score consumers.
+    texts[ray] = texts[ray][:start] + (
+        "                    from verl.experimental.gad_extensions.warmup import skip_policy_diagnostics, length_metrics\n"
+        "                    skip_diagnostics = skip_policy_diagnostics(self.config, batch)\n"
+        "                    if skip_diagnostics:\n"
+        "                        batch.meta_info['skip_warmup_policy_diagnostics'] = True\n"
+        "                        batch.meta_info['temperature'] = self.config.actor_rollout_ref.rollout.temperature\n"
+        "                        batch.meta_info['compute_teacher'] = False\n"
+        "                    else:\n"
+    ) + indent(texts[ray][start:end], "    ") + texts[ray][end:]
+    metrics = "compute_data_metrics(batch=batch, use_critic=self.use_critic)"
+    texts[ray] = replace(texts[ray], metrics, "length_metrics(batch) if skip_diagnostics else " + metrics,
+                         "warmup data metrics")
+
+    actor = "verl/workers/actor/dp_actor.py"
+    texts[actor] = replace(texts[actor], '        if multi_turn:\n            select_keys.append("loss_mask")\n',
+        '        skip_diagnostics = data.meta_info.get("skip_warmup_policy_diagnostics", False)\n'
+        '        if not skip_diagnostics:\n'
+        '            select_keys.extend(["old_log_probs", "advantages"])\n'
+        '        if multi_turn:\n            select_keys.append("loss_mask")\n', "warmup policy fields")
+    texts[actor] = replace(texts[actor], '"position_ids", "old_log_probs", "advantages",',
+                           '"position_ids",', "warmup SFT fields")
+    texts[actor] = replace(texts[actor], '        if self.config.use_kl_loss:\n            select_keys.append("ref_log_prob")',
+        '        if not skip_diagnostics and self.config.use_kl_loss:\n            select_keys.append("ref_log_prob")',
+        "warmup reference field")
+    reads = '                    old_log_prob = data["old_log_probs"]\n                    advantages = data["advantages"]\n'
+    # Both tensors are used exclusively in the non-vanilla policy loss.
+    texts[actor] = replace(texts[actor], reads, "", "warmup PPO reads")
+    loss = '                        policy_loss_fn = get_policy_loss_fn(loss_mode)'
+    texts[actor] = replace(texts[actor], loss, indent(reads, "    ") + loss, "warmup PPO loss")
+
+
 def apply(worktree, stage):
     worktree = Path(worktree)
     if stage == "seqkd":
@@ -58,6 +97,8 @@ def apply(worktree, stage):
              "verl/trainer/ppo/ray_trainer.py", "verl/utils/dataset/rl_dataset.py",
              "verl/workers/rollout/vllm_rollout/vllm_rollout_spmd.py", "verl/trainer/config/ppo_trainer.yaml",
              "verl/trainer/main_ppo.py"]
+    if stage == "warmup":
+        paths.append("verl/workers/actor/dp_actor.py")
     texts = {name: (worktree / name).read_text() for name in paths}
     key = paths[0]
     texts[key] = replace(texts[key], "    def _forward_micro_batch(self, micro_batch, compute_teacher):\n",
@@ -261,6 +302,9 @@ def apply(worktree, stage):
              "actor_reward_fp32": False, "student_scorer_monitor": False}
     texts[key] = replace(texts[key], "trainer:\n", "trainer:\n" + block(
         {"rubric": driver, "critic_replay": nested("replay"), "gad_extensions": state}), "trainer yaml")
+    if stage == "warmup":
+        texts[key] = replace(texts[key], "trainer:\n", "trainer:\n  warmup_forward_diagnostics: false\n",
+                             "warmup forward diagnostics")
     key = paths[6]
     texts[key] = replace(texts[key], '        sampler = RandomSampler(data_source=dataset, generator=train_dataloader_generator)\n',
         '        if data_config.get("gad_extensions", {}).get("enabled", False):\n'
@@ -269,6 +313,8 @@ def apply(worktree, stage):
         '        else:\n'
         '            sampler = RandomSampler(data_source=dataset, generator=train_dataloader_generator)\n',
         'exact random sampler')
+    if stage == "warmup":
+        patch_warmup_sft(texts)
     # Validate all anchors and compile in memory before writing any file.
     for name, text in texts.items():
         if name.endswith(".py"):

@@ -5,6 +5,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import yaml
 
@@ -13,6 +14,7 @@ from common import PipelineError
 from config import (add_config_arguments, compose_config, load_config, load_run_config,
                     nested_config, new_run_id, save_run_config, select_config, validate_config)
 from pipeline import stage_signature
+import prune_checkpoints
 from prune_checkpoints import apply_retention, plan_retention
 
 
@@ -211,7 +213,10 @@ class RunConfigTests(unittest.TestCase):
         (stage / 'global_step_400').mkdir()
         marker = stage / 'latest_checkpointed_iteration.txt'
         marker.write_text('350')
-        plan = plan_retention(stage, keep_checkpoints=5)
+        with patch.object(prune_checkpoints, 'check_checkpoint', wraps=prune_checkpoints.check_checkpoint) as check:
+            plan = plan_retention(stage, keep_checkpoints=5)
+        inspected = [call.args[0] for call in check.call_args_list]
+        self.assertEqual(inspected.count(stage / 'global_step_350'), 1)
         self.assertEqual(plan['recent_steps'], [150, 200, 250, 300, 350])
         self.assertEqual([Path(path).name for path in plan['delete']], ['global_step_100'])
         apply_retention(stage, keep_checkpoints=5)
@@ -220,6 +225,42 @@ class RunConfigTests(unittest.TestCase):
         self.assertFalse((stage / 'global_step_100').exists())
         (stage / 'global_step_350/data.pt').unlink()
         self.assertEqual(plan_retention(stage, keep_checkpoints=1)['delete'], [])
+
+    def test_retention_one_save_preserves_warmup_handoff_and_in_progress_save(self):
+        def complete(stage, step):
+            checkpoint = self.root / stage / f'global_step_{step}'
+            for role in ('actor', 'critic'):
+                directory = checkpoint / role
+                directory.mkdir(parents=True)
+                for name in ('model_world_size_1_rank_0.pt', 'optim_world_size_1_rank_0.pt',
+                             'config.json', 'tokenizer.json'):
+                    (directory / name).touch()
+            (checkpoint / 'data.pt').touch()
+            return checkpoint
+
+        warmup = complete('warmup', 271)
+        handoff = complete('gad', 271)
+        old = complete('gad', 300)
+        latest = complete('gad', 350)
+        exported = handoff / 'actor/huggingface'
+        exported.mkdir()
+        (exported / 'model.safetensors').touch()
+        stage = latest.parent
+        (stage / 'latest_checkpointed_iteration.txt').write_text('350')
+        pending = stage / 'global_step_400'
+        pending.mkdir()
+
+        plan = apply_retention(stage, keep_checkpoints=1)
+        self.assertEqual(plan['recent_steps'], [350])
+        self.assertEqual(plan['delete'], [str(old)])
+        self.assertFalse(old.exists())
+        for retained in (warmup, handoff, latest, pending, exported):
+            self.assertTrue(retained.exists(), str(retained))
+
+        # A newly announced but incomplete save must not remove the last usable one.
+        (stage / 'latest_checkpointed_iteration.txt').write_text('400')
+        self.assertEqual(apply_retention(stage, keep_checkpoints=1)['delete'], [])
+        self.assertTrue(latest.exists())
 
 
 if __name__ == '__main__':

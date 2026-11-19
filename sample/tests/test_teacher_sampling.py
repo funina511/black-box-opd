@@ -55,6 +55,8 @@ class MockTeacherHandler(BaseHTTPRequestHandler):
         messages = payload.get("messages") or []
         text = "\n".join(str(m.get("content", "")) for m in messages)
         n = int(payload.get("n") or 1)
+        if getattr(self.server, "return_short", False):
+            n = 1
 
         if "FAILME" in text:
             body = json.dumps({"error": {"message": "synthetic server failure"}}).encode()
@@ -260,6 +262,46 @@ class TeacherSamplingTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("fingerprint changed", result.stdout + result.stderr)
         self.assertEqual(self.index.read_bytes(), before, "the existing index must not be modified")
+
+    def test_resume_preserves_leading_blank_lines_and_repairs_only_short_row(self) -> None:
+        result = run_sampler(*self.base_args())
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        lines = self.index.read_bytes().splitlines(keepends=True)
+        row = json.loads(lines[1])
+        original = row["teacher_answers"][1]
+        row["teacher_answers"] = [original]
+        for key in ("truncated", "finish_reasons"):
+            row["sampling"][key] = row["sampling"][key][1:]
+        lines[1] = (json.dumps(row) + "\n").encode()
+        self.index.write_bytes(b"\n" + b"".join(lines))
+        before = self.index.read_bytes()
+        self.teacher.server.return_short = True
+        failed = run_sampler(*self.base_args())
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertEqual(self.index.read_bytes(), before)
+        self.teacher.server.return_short = False
+        requests = len(self.teacher.server.requests)
+        result = run_sampler(*self.base_args())
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(len(self.teacher.server.requests), requests + 1)
+        repaired = self.index.read_bytes().splitlines(keepends=True)
+        self.assertEqual(repaired[:2], [b"\n", lines[0]])
+        self.assertEqual(repaired[3:], lines[2:])
+        saved = json.loads(repaired[2])
+        self.assertEqual(saved["teacher_answers"][0], original)
+        self.assertEqual(len(saved["teacher_answers"]), 2)
+        self.assertNotEqual(saved["teacher_answers"][1], original)
+        self.assertEqual(len(TeacherIndex.load(self.index)), 3)
+
+    def test_corrupt_index_is_left_untouched(self) -> None:
+        result = run_sampler(*self.base_args())
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        before = b"\n" + self.index.read_bytes() + b"broken-json\n"
+        self.index.write_bytes(before)
+        result = run_sampler(*self.base_args())
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(f"{self.index}:6", result.stdout + result.stderr)
+        self.assertEqual(self.index.read_bytes(), before)
 
     def test_server_failure_reports_nonzero_and_records_failures(self) -> None:
         write_prompts(

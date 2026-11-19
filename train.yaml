@@ -135,6 +135,7 @@ resources:
   nnodes: 1
   gpus: 1,2,3,4
   judge_gpus: 6,7 # Independent service; never included in Ray training resources.
+  allow_judge_gpu_sharing: false # H200 rubric configs explicitly opt in; service identity checks remain required.
   save_freq: 50
   keep_last_checkpoints: 5
   test_freq: 200

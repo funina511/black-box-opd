@@ -55,12 +55,13 @@ Examples::
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import os
-import random
+import stat
 import sys
+import tempfile
 import threading
-import time
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -76,9 +77,7 @@ from teacher_index import (  # noqa: E402
     TeacherIndexError,
     TeacherIndexRecord,
     append_record,
-    find_fingerprint_mismatch,
     header_record,
-    read_done_uids,
 )
 from task_template import (  # noqa: E402
     build_teacher_fingerprint_payload,
@@ -199,65 +198,97 @@ def build_fingerprint(args: argparse.Namespace, extra_body: dict, engine: Teache
     )
 
 
-def prepare_index(path: Path, header: dict) -> None:
-    """Create the index with a header, or verify the existing header matches."""
-    if not path.exists():
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(header, ensure_ascii=False) + "\n", encoding="utf-8")
-        log(f"created index {path}")
-        return
-    with path.open(encoding="utf-8") as handle:
-        first = handle.readline().strip()
-    if not first:
-        path.write_text(json.dumps(header, ensure_ascii=False) + "\n", encoding="utf-8")
-        return
-    try:
-        row = json.loads(first)
-    except json.JSONDecodeError as exc:
-        raise SystemExit(
-            f"[sample_teacher] ERROR: existing index {path} is not valid JSONL ({exc}). "
-            "Refusing to modify it; move it aside or choose another --out."
-        ) from exc
-    if INDEX_HEADER_KEY not in row:
-        raise SystemExit(
-            f"[sample_teacher] ERROR: existing index {path} has no header line. "
-            f"Expected the first line to contain {INDEX_HEADER_KEY!r}. Refusing to modify it."
-        )
-    if row.get("teacher_fingerprint_digest") != header["teacher_fingerprint_digest"]:
-        raise SystemExit(
-            f"[sample_teacher] ERROR: sampling fingerprint changed for {path}.\n"
-            f"  existing: {row.get('teacher_fingerprint_digest')}\n"
-            f"  current : {header['teacher_fingerprint_digest']}\n"
-            "The file was left untouched. Use a new --out path (recommended) or move the old index aside."
-        )
-
-
-def check_resume_consistency(path: Path, rows: list[dict], digest: str) -> None:
-    """Detect same-uid/different-prompt and fingerprint problems before sampling."""
-    mismatch = find_fingerprint_mismatch(path, digest)
-    if mismatch is not None:
-        raise SystemExit(
-            f"[sample_teacher] ERROR: record at {path}:{mismatch['line']} was produced with a different "
-            f"sampling fingerprint ({mismatch['digest']}). Refusing to resume onto it."
-        )
+def prepare_index(path: Path, header: dict, rows=()) -> tuple[set[str], dict]:
+    """Initialize an empty index or verify it in one pass before writing any answers."""
+    digest = header["teacher_fingerprint_digest"]
+    m = header["teacher_fingerprint"]["num_samples"]
     expected = {row["uid"]: row["raw_prompt_hash"] for row in rows}
-    with path.open(encoding="utf-8") as handle:
-        for line_number, raw_line in enumerate(handle, start=1):
-            line = raw_line.strip()
-            if not line:
+    done, partial = set(), {}
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a+", encoding="utf-8") as handle:
+        if os.fstat(handle.fileno()).st_size == 0:
+            handle.write(json.dumps(header, ensure_ascii=False) + "\n")
+            return done, partial
+        handle.seek(0)
+        found_header = False
+        seen = set()
+        for number, line in enumerate(handle, 1):
+            if not line.strip():
                 continue
+            where = f"{path}:{number}"
             try:
                 row = json.loads(line)
-            except json.JSONDecodeError:
+            except ValueError as exc:
+                raise SystemExit(f"invalid JSON at {where}: {exc}") from exc
+            if not isinstance(row, dict):
+                raise SystemExit(f"expected an object at {where}")
+            if not found_header:
+                if row.get(INDEX_HEADER_KEY) != header[INDEX_HEADER_KEY]:
+                    raise SystemExit(f"missing or invalid teacher header at {where}")
+                if row.get("teacher_fingerprint_digest") != digest or row.get("teacher_fingerprint") != header["teacher_fingerprint"]:
+                    raise SystemExit(f"sampling fingerprint changed at {where}; use a new --out")
+                found_header = True
                 continue
-            if INDEX_HEADER_KEY in row:
-                continue
-            uid = str(row.get("uid"))
-            if uid in expected and str(row.get("raw_prompt_hash")) != expected[uid]:
-                raise SystemExit(
-                    f"[sample_teacher] ERROR: uid {uid!r} at {path}:{line_number} was sampled from a different "
-                    "prompt than the current parquet. The prompt file changed; use a new index."
-                )
+            try:
+                record = TeacherIndexRecord.from_json(row, path=str(path), line_number=number)
+            except (TeacherIndexError, TypeError, KeyError, ValueError) as exc:
+                raise SystemExit(f"invalid teacher record at {where}: {exc}") from exc
+            uid = record.uid
+            if record.teacher_fingerprint_digest != digest:
+                raise SystemExit(f"different sampling fingerprint at {where}")
+            if uid in seen:
+                raise SystemExit(f"duplicate teacher UID {uid!r} at {where}")
+            seen.add(uid)
+            if uid in expected and record.raw_prompt_hash != expected[uid]:
+                raise SystemExit(f"uid {uid!r} at {where} came from a different prompt")
+            count = len(record.teacher_answers)
+            if count > m:
+                raise SystemExit(f"uid {uid!r} at {where} has {count} candidates, expected {m}")
+            if count == m:
+                done.add(uid)
+            elif uid in expected:
+                for key in ("finish_reasons", "truncated"):
+                    if len(record.sampling.get(key, [])) != count:
+                        raise SystemExit(f"cannot align existing candidates with {key} at {where}")
+                partial[uid] = (number, row)
+        if not found_header:
+            raise SystemExit(f"nonempty teacher index {path} contains only whitespace; missing header")
+    return done, partial
+
+
+def complete_partial_row(old: dict, fresh: dict) -> dict:
+    """Keep legacy answers in order. Legacy files dropped empty slots without recording their IDs."""
+    retained = old["teacher_answers"]
+    unused = list(range(len(fresh["teacher_answers"])))
+    for answer in retained:
+        match = next((i for i in unused if fresh["teacher_answers"][i] == answer), None)
+        if match is not None:
+            unused.remove(match)
+    missing = len(fresh["teacher_answers"]) - len(retained)
+    chosen = unused[-missing:]
+    sampling = {**old["sampling"], "num_answers": len(fresh["teacher_answers"])}
+    for key in ("finish_reasons", "truncated"):
+        sampling[key] = old["sampling"][key] + [fresh["sampling"][key][i] for i in chosen]
+    return {**old, "teacher_answers": retained + [fresh["teacher_answers"][i] for i in chosen],
+            "sampling": sampling}
+
+
+def replace_partial_rows(path: Path, replacements: dict) -> None:
+    """Install complete rows atomically; copy every other line verbatim."""
+    with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as dest:
+        temp = Path(dest.name)
+        try:
+            with path.open("rb") as source:
+                for number, line in enumerate(source, 1):
+                    if number in replacements:
+                        line = (json.dumps(replacements[number], ensure_ascii=False) + "\n").encode()
+                    dest.write(line)
+            os.fchmod(dest.fileno(), stat.S_IMODE(path.stat().st_mode))
+            dest.flush()
+            os.fsync(dest.fileno())
+            os.replace(temp, path)
+        finally:
+            temp.unlink(missing_ok=True)
 
 
 def student_token_stats(texts: list[str], tokenizer_path: str, *, limit: int, max_tokens: int) -> dict:
@@ -299,6 +330,7 @@ def run_engine(
     fingerprint: dict,
     digest: str,
     m: int,
+    partial: dict | None = None,
     fsync: bool = False,
     progress: str = "log",
     log_every: int = 100,
@@ -313,6 +345,7 @@ def run_engine(
     failures: list[dict] = []
     texts_for_stats: list[str] = []
     write_lock = threading.Lock()
+    replacements = {}
     total = len(todo)
     bar = None
     if progress == "tqdm":
@@ -325,6 +358,9 @@ def run_engine(
 
     def handle(row: Mapping[str, Any], payload: dict | None, error: str | None) -> None:
         with write_lock:
+            if payload is not None and (any(len(payload[key]) != m for key in ("answers", "finish_reasons", "truncated"))
+                                        or any(not a.strip() for a in payload["answers"])):
+                error = f"expected {m} complete candidates; received {len(payload['answers'])} answers"
             if error is not None or payload is None:
                 counters["fail"] += 1
                 failures.append(
@@ -349,7 +385,11 @@ def run_engine(
                 },
                 source="gad",
             )
-            append_record(out_path, record, fsync=fsync)
+            if partial and record.uid in partial:
+                number, old = partial[record.uid]
+                replacements[number] = complete_partial_row(old, record.to_json())
+            else:
+                append_record(out_path, record, fsync=fsync)
             counters["ok"] += 1
             counters["truncated"] += sum(1 for flag in payload["truncated"] if flag)
             texts_for_stats.extend(payload["answers"])
@@ -365,6 +405,8 @@ def run_engine(
         if bar is not None:
             bar.close()
         engine.close()
+    if replacements:
+        replace_partial_rows(out_path, replacements)
     return {"counters": counters, "failures": failures, "texts_for_stats": texts_for_stats, "total": total}
 
 
@@ -494,15 +536,22 @@ def main() -> int:
             f"answer-contract form (first: {leak['suspicious_uids'][:3]}). Refusing to send them to the teacher."
         )
 
-    prepare_index(out_path, header_record(fingerprint=fingerprint, created_by="sample_teacher.py", notes={
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with Path(str(out_path) + ".lock").open("a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise SystemExit(f"another sampler is writing {out_path}")
+        return sample_to_index(args, engine, rows, out_path, fingerprint, digest, leak)
+
+
+def sample_to_index(args, engine, rows, out_path, fingerprint, digest, leak) -> int:
+    done, partial = prepare_index(out_path, header_record(fingerprint=fingerprint, created_by="sample_teacher.py", notes={
         "prompt_parquets": [str(Path(p).resolve()) for p in args.prompt_parquet],
         "prompt_key": args.prompt_key,
         "enable_thinking": None if args.enable_thinking == "unset" else args.enable_thinking == "true",
         "engine": engine.describe(),
-    }))
-    check_resume_consistency(out_path, rows, digest)
-
-    done = read_done_uids(out_path, expected_digest=digest)
+    }), rows)
     todo = [row for row in rows if row["uid"] not in done]
     log(f"{len(done)} prompts already sampled; {len(todo)} to go")
 
@@ -512,7 +561,7 @@ def main() -> int:
 
     result = run_engine(
         engine, todo, out_path=out_path, fingerprint=fingerprint, digest=digest, m=args.m,
-        fsync=args.fsync, progress=args.progress, log_every=args.log_every,
+        partial=partial, fsync=args.fsync, progress=args.progress, log_every=args.log_every,
     )
     counters = result["counters"]
     failures = result["failures"]
@@ -550,7 +599,7 @@ def main() -> int:
     log(f"summary -> {summary_path}")
 
     if counters["fail"] and not args.allow_incomplete:
-        log(f"ERROR: {counters['fail']} prompts have no teacher answer; exiting non-zero")
+        log(f"ERROR: {counters['fail']} prompts still need teacher candidates; exiting non-zero")
         return 1
     return 0
 

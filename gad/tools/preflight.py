@@ -172,10 +172,11 @@ def check_backends(cfg: Config, report: Report, stages: list[str]) -> dict:
             from backend_patches import verify_patches
 
             frozen = (backend / ".gad_backend_used").exists() and cfg.get("backends.profile") == "gad_extensions_v1"
+            frozen_manifest = None
             if frozen:
                 try:
                     from backend_patches import verify_frozen_backend
-                    verify_frozen_backend(backend)
+                    frozen_manifest = verify_frozen_backend(backend)
                     ok, patch_problems = True, []
                 except (OSError, ValueError, RuntimeError, KeyError) as exc:
                     ok, patch_problems = False, [f"frozen backend validation failed: {exc}"]
@@ -184,10 +185,17 @@ def check_backends(cfg: Config, report: Report, stages: list[str]) -> dict:
             entry["patches_ok"] = ok
             entry["patch_problems"] = patch_problems
             problems.extend(patch_problems)
-            if cfg.get("backends.profile") == "gad_extensions_v1" and stage in ("warmup", "gad"):
+            if (cfg.get("backends.profile") == "gad_extensions_v1" and stage in ("warmup", "gad")
+                    and (ok or not frozen)):
                 try:
                     from algorithm_patches import verify, code_hash
-                    algorithm = verify(backend)
+                    # A frozen engineering-only manifest does not certify an algorithm deployment.
+                    if frozen:
+                        if "extension_code_hash" not in frozen_manifest:
+                            raise ValueError("frozen backend has no verified algorithm manifest")
+                        algorithm = frozen_manifest
+                    else:
+                        algorithm = verify(backend)
                     if not frozen and algorithm["extension_code_hash"] != code_hash():
                         raise ValueError("backend extension source is stale")
                     entry["algorithm"] = algorithm
@@ -651,6 +659,29 @@ def check_output(cfg: Config, report: Report) -> None:
         report.ok(f"output root writable, {free:.1f} GiB free")
 
 
+def check_online_judge(cfg: Config, report: Report, stages: list[str]) -> None:
+    from extension_config import active, service_identity
+    if not any(active(cfg, "rubric", stage) for stage in stages):
+        return
+    if cfg.get("rubric.mode") != "joint":
+        report.sections["online_judge"] = {"mode": "correctness_only", "service_required": False}
+        return
+    try:
+        from gad.extensions.judge_client import JudgeClient
+        from rubric.core.contracts import digest
+        options = {key[13:]: value for key, value in cfg.data.items() if key.startswith("rubric.judge.")}
+        health = JudgeClient(options, digest(service_identity(cfg)), tokenizer=object()).health()
+        if (set(str(health.get("gpu_ids", "")).split(",")) & set(str(cfg.get("resources.gpus")).split(","))
+                and cfg.get("resources.allow_judge_gpu_sharing") is not True):
+            raise ValueError("running judge uses training GPUs")
+        if set(str(health.get("gpu_ids", "")).split(",")) != set(str(cfg.get("resources.judge_gpus")).split(",")):
+            raise ValueError("running judge GPU allocation differs from declared resources.judge_gpus")
+        report.sections["online_judge"] = health
+        report.ok("online judge model/revision/template/schema/precision verified")
+    except (ValueError, RuntimeError, OSError) as exc:
+        report.fail(f"online judge: {exc}")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     add_config_arguments(parser)
@@ -690,24 +721,7 @@ def main() -> int:
     check_validation_metrics(cfg, report)
     check_quick_dev(cfg, report)
     check_eval(cfg, report)
-    from extension_config import active, service_identity
-    if any(active(cfg, "rubric", stage) for stage in stages):
-        if cfg.get("rubric.mode") == "joint":
-            try:
-                from gad.extensions.judge_client import JudgeClient
-                from rubric.core.contracts import digest
-                options = {key[13:]: value for key, value in cfg.data.items() if key.startswith("rubric.judge.")}
-                health = JudgeClient(options, digest(service_identity(cfg)), tokenizer=object()).health()
-                if set(str(health.get("gpu_ids", "")).split(",")) & set(str(cfg.get("resources.gpus")).split(",")):
-                    raise ValueError("running judge uses training GPUs")
-                if set(str(health.get("gpu_ids", "")).split(",")) != set(str(cfg.get("resources.judge_gpus")).split(",")):
-                    raise ValueError("running judge GPU allocation differs from declared resources.judge_gpus")
-                report.sections["online_judge"] = health
-                report.ok("online judge model/revision/template/schema/precision verified")
-            except (ValueError, RuntimeError, OSError) as exc:
-                report.fail(f"online judge: {exc}")
-        else:
-            report.sections["online_judge"] = {"mode": "correctness_only", "service_required": False}
+    check_online_judge(cfg, report, stages)
     if not args.skip_packages:
         check_interpreter(cfg, report, allow_no_gpu=args.allow_no_gpu)
 

@@ -258,8 +258,12 @@ def append_record(path: str | Path, record: TeacherIndexRecord, *, fsync: bool =
     target = Path(path).expanduser()
     target.parent.mkdir(parents=True, exist_ok=True)
     line = json.dumps(record.to_json(), ensure_ascii=False)
-    with target.open("a", encoding="utf-8") as handle:
-        handle.write(line + "\n")
+    with target.open("a+b") as handle:
+        if handle.tell():
+            handle.seek(-1, os.SEEK_END)
+            if handle.read(1) != b"\n":
+                handle.write(b"\n")
+        handle.write((line + "\n").encode("utf-8"))
         handle.flush()
         if fsync:
             os.fsync(handle.fileno())
@@ -288,7 +292,8 @@ def read_done_uids(path: str | Path, *, expected_digest: str | None = None) -> s
                 continue
             if expected_digest is not None and record.teacher_fingerprint_digest != expected_digest:
                 continue
-            done.add(record.uid)
+            if len(record.teacher_answers) >= record.teacher_fingerprint.get("num_samples", 1):
+                done.add(record.uid)
     return done
 
 

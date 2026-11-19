@@ -1,13 +1,12 @@
 """Speculative Teacher work uses the same labels, keys and bounded journal."""
 import time
-from .common import append_json
+from .common import append_json, digest
 from .critic_batch import extract_pairs, supervision_identity
 
 _FROM_META = object()
 
 
 def teacher_pairs(gen_batch, raw_batch, tokenizer, token_identity, step, stage, repeat, *, eos_token_id=_FROM_META):
-    import torch
     from verl import DataProto
     from verl.utils.torch_functional import get_response_mask
     prompt, teacher = gen_batch.batch['input_ids'], gen_batch.batch['teacher_response']
@@ -16,21 +15,31 @@ def teacher_pairs(gen_batch, raw_batch, tokenizer, token_identity, step, stage, 
     teacher_mask = get_response_mask(response_id=teacher,
         eos_token=eos,
         dtype=gen_batch.batch['attention_mask'].dtype)
-    attention = torch.cat([gen_batch.batch['attention_mask'], teacher_mask], dim=-1)
-    # Student fields are placeholders only; no Student is selected or annotated.
-    view = DataProto.from_dict(tensors={'prompts': prompt, 'responses': teacher,
-        'teacher_response': teacher, 'attention_mask': attention, 'teacher_attention_mask': attention},
+    view = DataProto.from_dict(tensors={'prompts': prompt, 'teacher_response': teacher,
+        'attention_mask': gen_batch.batch['attention_mask'], 'teacher_attention_mask': teacher_mask},
         non_tensors={**raw_batch.non_tensor_batch, **gen_batch.non_tensor_batch})
-    view = view.repeat(repeat_times=repeat, interleave=True)
-    return extract_pairs(view, tokenizer, token_identity, step, stage)
+    teachers = extract_pairs(view, tokenizer, token_identity, step, stage, teacher_only=True)
+    # Selection uses the post-rollout row order, including contiguous DP partitions.
+    # Old datasets without a source index use the expanded row number for provenance.
+    expanded = []
+    extras = view.non_tensor_batch.get('extra_info')
+    for i, pair in enumerate(teachers):
+        if extras is not None and 'index' in extras[i]:
+            expanded.extend([pair] * repeat)
+        else:
+            for occurrence in range(i * repeat, (i + 1) * repeat):
+                index = str(occurrence)
+                expanded.append({**pair, 'source_index': index, 'teacher': dict(pair['teacher']),
+                                 'prompt_id': digest({'index': index, 'prompt_hash': pair['prompt_hash']})})
+    return expanded
 
 
 def selected_teachers(pairs, global_mini, dp_size, options, step, stage):
-    from .process_sampling import logical_minibatches, selection_order
+    from .process_sampling import logical_minibatches, selection_order, initial_teacher_quota
     budget = options.get('process_sampling', {}).get('max_unique_per_global_minibatch')
     if options.get('mode') != 'joint' or budget is None:
         return []
-    quota = (budget + 1) // 3 if stage == 'gad' else budget // 2
+    quota = initial_teacher_quota(budget, stage)
     chosen = {}
     for index, rows in enumerate(logical_minibatches(len(pairs), global_mini, dp_size)):
         candidates = {supervision_identity(pairs[i], 'teacher'): pairs[i] for i in rows}

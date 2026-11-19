@@ -7,9 +7,12 @@ FIELDS = ("input_ids", "responses", "attention_mask", "position_ids", "teacher_i
           "teacher_response", "teacher_attention_mask", "teacher_position_ids")
 
 
-def extract_pairs(batch, tokenizer, token_identity, step, stage):
+def extract_pairs(batch, tokenizer, token_identity, step, stage, *, teacher_only=False):
     records = []
     width = batch.batch["prompts"].shape[-1]
+    roles = [("teacher", "teacher_response", "teacher_attention_mask")]
+    if not teacher_only:
+        roles.insert(0, ("student", "responses", "attention_mask"))
     for i in range(len(batch)):
         prompt_mask = batch.batch["attention_mask"][i, :width].bool()
         prompt_ids = batch.batch["prompts"][i][prompt_mask].cpu().tolist()
@@ -24,9 +27,7 @@ def extract_pairs(batch, tokenizer, token_identity, step, stage):
                 "producer_stage": stage, "actor_policy_step": step - 1,
                 "prompt_truncated": bool(batch.non_tensor_batch.get("gad_prompt_truncated", [False] * len(batch))[i]),
                 "token_identity": token_identity}
-        for role, response_key, attention_key in (
-                ("student", "responses", "attention_mask"),
-                ("teacher", "teacher_response", "teacher_attention_mask")):
+        for role, response_key, attention_key in roles:
             values = batch.batch[response_key][i]
             mask = batch.batch[attention_key][i, -values.shape[-1]:].bool()
             ids = values[mask].cpu().tolist()
@@ -48,8 +49,9 @@ def extract_pairs(batch, tokenizer, token_identity, step, stage):
             if role == 'teacher':
                 pair[role].update({key: extra.get(key) for key in ('teacher_metadata_version', 'selected_teacher_index',
                     'selected_teacher_text_sha256', 'source_finish_reason', 'source_truncated') if key in extra})
-        pair["pair_id"] = digest({"prompt": prompt_id, "teacher": pair["teacher"]["response_id"],
-                                  "student": pair["student"]["response_id"], "step": step, "occurrence": i})
+        if not teacher_only:
+            pair["pair_id"] = digest({"prompt": prompt_id, "teacher": pair["teacher"]["response_id"],
+                                      "student": pair["student"]["response_id"], "step": step, "occurrence": i})
         pair["source_index"] = str(index)
         records.append(pair)
     return records

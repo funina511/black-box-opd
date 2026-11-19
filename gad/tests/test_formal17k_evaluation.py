@@ -1,5 +1,6 @@
 """Fixed evaluation slots and interruption recovery without sampling a model."""
 from copy import deepcopy
+import hashlib
 import json
 from pathlib import Path
 import sys
@@ -219,6 +220,49 @@ class EvaluationTests(unittest.TestCase):
                 execute(plan)
             self.assertEqual(['score'],calls);self.assertEqual(before,source.read_bytes())
             self.assertFalse((root/'eval/gad/A/generation').exists())
+
+    def test_scoring_binds_consumed_bytes_and_checks_raw_before_publishing(self):
+        for change in ('after_scoring', 'during_read_then_restored'):
+            with self.subTest(change=change), tempfile.TemporaryDirectory() as d:
+                root = Path(d)
+                plan = self.ready_new_scorer_plan(root)
+                task = root / 'eval/gad/A'
+                raw = task / 'generation/raw_samples.jsonl'
+                raw.parent.mkdir(parents=True)
+                original = b'{"global_index":10,"rollout_index":0,"response":"Answer: 2","ground_truth":"2"}\r\n'
+                changed = original.replace(b'Answer: 2', b'Answer: 7')
+                raw.write_bytes(original)
+
+                def score_and_change(argv, **kwargs):
+                    if change == 'during_read_then_restored':
+                        raw.write_bytes(changed)
+                    run(raw, argv[argv.index('--output-dir') + 1], expected_questions=[10], n=1, task='A')
+                    raw.write_bytes(changed if change == 'after_scoring' else original)
+
+                with patch('evaluate.evaluate.subprocess.run', side_effect=score_and_change):
+                    with self.assertRaisesRegex(RuntimeError, 'changed during scoring'):
+                        execute(plan)
+                self.assertEqual(json.loads((task / 'state.json').read_text())['status'], 'scoring')
+                self.assertFalse(list(task.glob('scores*/metrics.json')))
+
+                execute(plan)
+                state = json.loads((task / 'state.json').read_text())
+                metrics = json.loads(Path(state['metrics_path']).read_text())
+                self.assertEqual(state['status'], 'complete')
+                self.assertEqual(metrics['confirmed_correct'], int(change == 'during_read_then_restored'))
+                self.assertEqual(metrics['raw_sha256'], hashlib.sha256(raw.read_bytes()).hexdigest())
+                self.assertEqual(state['raw_sha256'], metrics['raw_sha256'])
+
+                # A historical successful run has the raw digest in state only.
+                metrics.pop('raw_sha256')
+                legacy_metrics = json.dumps(metrics).encode()
+                Path(state['metrics_path']).write_bytes(legacy_metrics)
+                state['metrics_sha256'] = hashlib.sha256(legacy_metrics).hexdigest()
+                (task / 'state.json').write_text(json.dumps(state))
+                with patch('evaluate.evaluate.subprocess.run') as command:
+                    execute(plan)
+                    command.assert_not_called()
+                self.assertEqual(Path(state['metrics_path']).read_bytes(), legacy_metrics)
 
 
 if __name__=='__main__':unittest.main()

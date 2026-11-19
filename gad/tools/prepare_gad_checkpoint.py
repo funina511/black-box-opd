@@ -6,13 +6,8 @@ Two modes:
 ``--mode handoff`` (default)
     Warmup -> GAD: pick the last complete Warmup checkpoint, export HF actor and
     discriminator into the GAD run directory, and write the latest-step marker.
-    This is what the original GAD instructions do by hand::
-
-        STEP=800
-        cp -r .../global_step_${STEP} .../adversarial/
-        echo ${STEP} > .../adversarial/latest_checkpointed_iteration.txt
-        python tools/merge_model2hf.py --local_dir .../global_step_${STEP}/actor
-        python tools/merge_model2hf.py --local_dir .../global_step_${STEP}/critic
+    The built-in merge reads the Warmup model shards in place. GAD starts from
+    independent HF exports and the Warmup dataloader position with fresh optimizers.
 
 ``--mode export-final``
     Export the trained actor (latest complete checkpoint, or an explicitly
@@ -24,19 +19,23 @@ In both modes:
 
 * the default step is discovered from complete checkpoints; an explicit older
   step is accepted only when that exact checkpoint is complete;
-* completeness is checked first: model shards, optimizer shards, ``config.json``,
-  tokenizer files and ``data.pt`` must all be present;
-* source shard files are never modified; the HF export is written beside them;
-* every exported file is checksummed and recorded in the manifest, and the
-  merged weights are compared key-by-key against their source shards.
+* the HF export checks actor model shards, config and tokenizer files. Handoff
+  additionally checks both training roles and the saved dataloader state;
+* source shard files are read-only. Handoff writes HF weights under the GAD run;
+* the manifest records the exported files and the comparison of merged weight
+  names against their source shards.
 """
 
 from __future__ import annotations
 
 import argparse
+from contextlib import ExitStack
 import json
+import os
+import re
 import shutil
 import sys
+from tempfile import TemporaryDirectory
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -129,8 +128,30 @@ def check_checkpoint(path: Path, roles: tuple[str, ...] = ("actor", "critic")) -
     return problems
 
 
+def actor_export_problems(checkpoint: Path) -> list[str]:
+    """Inputs to the HF merger: all actor ranks and model/tokenizer metadata."""
+    actor = checkpoint / "actor"
+    shards = set(actor.glob("model_world_size_*_rank_*.pt"))
+    rank_zero = [p for p in shards if p.name.endswith("_rank_0.pt")]
+    match = re.fullmatch(r"model_world_size_(\d+)_rank_0\.pt", rank_zero[0].name) if len(rank_zero) == 1 else None
+    if not match or int(match[1]) < 1:
+        return [f"{actor}: missing or ambiguous rank-zero model shard"]
+    world = int(match[1])
+    expected = {actor / f"model_world_size_{world}_rank_{rank}.pt" for rank in range(world)}
+    if shards != expected or not all(p.is_file() and p.stat().st_size for p in expected):
+        return [f"{actor}: incomplete model shards for {world} ranks"]
+    if not (actor / "config.json").is_file() or not has_tokenizer(actor):
+        return [f"{actor}: missing config or tokenizer vocabulary"]
+    return []
+
+
+def has_tokenizer(directory: Path) -> bool:
+    return any((directory / name).is_file() and (directory / name).stat().st_size
+               for name in ("tokenizer.json", "tokenizer.model", "vocab.json"))
+
+
 def pick_last_complete(warmup_dir: Path, *, step: int | None,
-                       roles: tuple[str, ...] = ("actor", "critic")) -> tuple[int, Path, list[dict]]:
+                       roles: tuple[str, ...] = ("actor", "critic"), check=None) -> tuple[int, Path, list[dict]]:
     checkpoints = discover_checkpoints(warmup_dir)
     if not checkpoints:
         raise PipelineError(f"no global_step_* checkpoint under {warmup_dir}")
@@ -141,7 +162,7 @@ def pick_last_complete(warmup_dir: Path, *, step: int | None,
 
     report: list[dict] = []
     for candidate_step, path in sorted(checkpoints, reverse=True):
-        problems = check_checkpoint(path, roles=roles)
+        problems = check(path) if check is not None else check_checkpoint(path, roles=roles)
         report.append({"step": candidate_step, "path": str(path), "problems": problems})
         if not problems:
             return candidate_step, path, report
@@ -152,19 +173,10 @@ def pick_last_complete(warmup_dir: Path, *, step: int | None,
     )
 
 
-def copy_role(src_ckpt: Path, dst_ckpt: Path, role: str) -> None:
-    source = src_ckpt / role
-    target = dst_ckpt / role
-    if target.exists():
-        shutil.rmtree(target)
-    shutil.copytree(source, target)
-    log(f"copied {role}: {source} -> {target}")
-
-
-def export_hf(ckpt_dir: Path, role: str, merge_tool: Path, python_bin: str) -> Path:
-    """Mimic the original shell flow: copy metadata, then run merge_model2hf."""
+def export_hf(ckpt_dir: Path, role: str, merge_tool: Path, python_bin: str, *, output_dir: Path | None = None) -> Path:
+    """Copy model metadata and merge shards into the selected HF directory."""
     role_dir = ckpt_dir / role
-    hf_dir = role_dir / "huggingface"
+    hf_dir = output_dir or role_dir / "huggingface"
     hf_dir.mkdir(parents=True, exist_ok=True)
     for item in role_dir.iterdir():
         if item.is_file() and item.suffix != ".pt":
@@ -172,7 +184,10 @@ def export_hf(ckpt_dir: Path, role: str, merge_tool: Path, python_bin: str) -> P
     if not (hf_dir / "config.json").exists():
         raise PipelineError(f"{role}: config.json missing before merge (looked in {role_dir})")
     log(f"merging {role} shards -> {hf_dir}")
-    code, out, err = capture_command([python_bin, str(merge_tool), "--local_dir", str(role_dir)])
+    command = [python_bin, str(merge_tool), "--local_dir", str(role_dir)]
+    if output_dir is not None:
+        command.extend(["--output-dir", str(output_dir)])
+    code, out, err = capture_command(command)
     if code != 0:
         raise PipelineError(f"merge_model2hf failed for {role} (exit {code}): {err or out}")
     if not (hf_dir / "config.json").exists():
@@ -315,7 +330,7 @@ def export_final(args: argparse.Namespace) -> int:
         "check_only": bool(args.check_only),
     }
 
-    step, source_ckpt, inspection = pick_last_complete(gad_dir, step=args.step, roles=("actor",))
+    step, source_ckpt, inspection = pick_last_complete(gad_dir, step=args.step, check=actor_export_problems)
     if args.step is not None and step != args.step:
         raise PipelineError(
             f"requested global_step_{args.step} is incomplete; newest complete checkpoint "
@@ -403,14 +418,22 @@ def export_final(args: argparse.Namespace) -> int:
         problems.append(f"the final export is a discriminator architecture: {architectures}")
     if not any(key.startswith("model.") for key in keys):
         problems.append("merged actor has no `model.*` weights; the merge did not produce a transformer")
+    weight_files = [Path(p).name for p in (info.get("files") or [])]
     manifest["exports"] = {
-        "actor_files": {p.name: sha256_file(p) for p in sorted(actor_dir.glob("*.json"))},
-        "actor_weight_files": [Path(p).name for p in (info.get("files") or [])],
+        "actor_files": {p.name: sha256_file(p) for p in sorted(actor_dir.iterdir())
+                        if p.is_file() and p.suffix in (".json", ".jinja", ".model", ".txt", ".tiktoken", ".bpe")},
+        "actor_weight_files": weight_files,
+        "actor_weight_sha256": {name: sha256_file(actor_dir / name) for name in weight_files},
     }
     return finish()
 
 
 def run_handoff(args: argparse.Namespace) -> int:
+    with ExitStack() as cleanup:
+        return _run_handoff(args, cleanup)
+
+
+def _run_handoff(args: argparse.Namespace, cleanup: ExitStack) -> int:
     if not args.warmup_dir:
         raise PipelineError("--warmup-dir is required in handoff mode")
     warmup_dir = Path(args.warmup_dir).expanduser().resolve()
@@ -463,37 +486,74 @@ def run_handoff(args: argparse.Namespace) -> int:
         manifest["gad_steps"] = int(args.gad_steps)
         manifest["target_total_steps"] = step + int(args.gad_steps)
 
+    final_ckpt = gad_dir / f"global_step_{step}"
+    latest = gad_dir / "latest_checkpointed_iteration.txt"
+    staging = None
+
     def finish() -> int:
-        """Write the manifest and report every problem on exactly one path."""
         manifest["ok"] = not problems
         manifest["problems"] = problems
-        write_json(manifest_path, manifest)
+        if staging is None:
+            write_json(manifest_path, manifest)
+            if not problems and not args.check_only:
+                latest.write_text(str(step), encoding="utf-8")
+        elif not problems:
+            # Prepare both small files before publishing anything, including when the
+            # caller locates the manifest on a different filesystem.
+            meta_dir = cleanup.enter_context(TemporaryDirectory(prefix=".handoff-", dir=ensure_dir(manifest_path.parent)))
+            prepared_manifest = Path(meta_dir) / "manifest.json"
+            write_json(prepared_manifest, manifest)
+            prepared_latest = staging / "latest"
+            prepared_latest.write_text(str(step), encoding="utf-8")
+            with ExitStack() as rollback:
+                target_ckpt.rename(final_ckpt)
+                rollback.callback(final_ckpt.rename, target_ckpt)
+                # link publishes a new name without replacing a concurrent writer.
+                os.link(prepared_manifest, manifest_path)
+                rollback.callback(manifest_path.unlink)
+                os.link(prepared_latest, latest)
+                rollback.pop_all()
         for problem in problems:
             log(f"ERROR: {problem}")
-        log(f"handoff {'OK' if not problems else 'FAILED'} -> {manifest_path}")
+        log(f"handoff OK -> {manifest_path}" if not problems else "handoff FAILED")
         return 0 if not problems else 1
 
     if args.check_only:
         return finish()
 
-    if gad_dir.exists() and any(gad_dir.iterdir()) and not args.force:
+    if gad_dir == warmup_dir:
+        raise PipelineError("Warmup and GAD output directories must be distinct")
+    direct_merge = not args.skip_merge and merge_tool == Path(__file__).resolve().with_name("merge_model2hf.py")
+    stage_privately = direct_merge and not args.force
+    if gad_dir.exists() and not args.force and any(
+        not (stage_privately and p.is_dir() and p.name.startswith(".handoff-")) for p in gad_dir.iterdir()
+    ):
         raise PipelineError(
             f"{gad_dir} already exists and is not empty; refusing to overwrite. Use --force to reuse it."
         )
     ensure_dir(gad_dir)
-
-    target_ckpt = gad_dir / f"global_step_{step}"
+    if stage_privately:
+        if manifest_path.exists():
+            raise PipelineError(f"handoff manifest already exists: {manifest_path}; refusing to overwrite")
+        staging = Path(cleanup.enter_context(TemporaryDirectory(prefix=".handoff-", dir=gad_dir)))
+    target_ckpt = (staging or gad_dir) / final_ckpt.name
     ensure_dir(target_ckpt)
-    copy_role(source_ckpt, target_ckpt, "actor")
-    copy_role(source_ckpt, target_ckpt, "critic")
+    for role in ("actor", "critic"):
+        target_role = target_ckpt / role
+        if target_role.exists():
+            shutil.rmtree(target_role)
+        if not direct_merge:
+            # Copy-only staging and external merge scripts retain the original layout and CLI.
+            shutil.copytree(source_ckpt / role, target_role)
     shutil.copy2(source_ckpt / "data.pt", target_ckpt / "data.pt")
-    (gad_dir / "latest_checkpointed_iteration.txt").write_text(str(step), encoding="utf-8")
-    manifest["gad_checkpoint"] = str(target_ckpt)
-    manifest["gad_latest_marker"] = str(gad_dir / "latest_checkpointed_iteration.txt")
+    manifest["gad_checkpoint"] = str(final_ckpt)
+    manifest["gad_latest_marker"] = str(latest)
     manifest["data_pt_sha256"] = sha256_file(target_ckpt / "data.pt")
     manifest["dataloader_state"] = (
         {"skipped": True} if args.skip_dataloader_check else read_dataloader_state(target_ckpt / "data.pt")
     )
+    if not args.skip_dataloader_check:
+        manifest["dataloader_state"]["path"] = str(final_ckpt / "data.pt")
     if manifest["dataloader_state"].get("error"):
         problems.append(f"could not read the dataloader state from data.pt: {manifest['dataloader_state']['error']}")
 
@@ -511,8 +571,9 @@ def run_handoff(args: argparse.Namespace) -> int:
         manifest["merged"] = False
         return finish()
 
-    actor_dir = export_hf(target_ckpt, "actor", merge_tool, args.python_bin)
-    critic_dir = export_hf(target_ckpt, "critic", merge_tool, args.python_bin)
+    merge_source = source_ckpt if direct_merge else target_ckpt
+    actor_dir = export_hf(merge_source, "actor", merge_tool, args.python_bin, output_dir=actor_hf if direct_merge else None)
+    critic_dir = export_hf(merge_source, "critic", merge_tool, args.python_bin, output_dir=critic_hf if direct_merge else None)
 
     critic_info = inspect_safetensors(critic_dir)
     actor_info = inspect_safetensors(actor_dir)
@@ -538,8 +599,8 @@ def run_handoff(args: argparse.Namespace) -> int:
     actor_keys = set(actor_info.get("keys") or [])
     critic_keys = set(critic_info.get("keys") or [])
     source_keys = {
-        "actor": source_weight_keys(target_ckpt / "actor"),
-        "critic": source_weight_keys(target_ckpt / "critic"),
+        "actor": source_weight_keys(source_ckpt / "actor"),
+        "critic": source_weight_keys(source_ckpt / "critic"),
     }
     manifest["weight_keys"] = {
         "merged_actor": len(actor_keys),
@@ -596,8 +657,8 @@ def run_handoff(args: argparse.Namespace) -> int:
         "config_architectures": json.loads((critic_dir / "config.json").read_text(encoding="utf-8"))["architectures"],
     }
 
-    manifest["actor_hf"] = str(actor_dir)
-    manifest["critic_hf"] = str(critic_dir)
+    manifest["actor_hf"] = str(final_ckpt / "actor" / "huggingface")
+    manifest["critic_hf"] = str(final_ckpt / "critic" / "huggingface")
     manifest["exports"] = {
         "actor_files": {p.name: sha256_file(p) for p in sorted(actor_dir.glob("*.json"))},
         "critic_files": {p.name: sha256_file(p) for p in sorted(critic_dir.glob("*.json"))},
@@ -606,10 +667,16 @@ def run_handoff(args: argparse.Namespace) -> int:
     }
 
     manifest["merged"] = True
+    manifest["initialization_only"] = direct_merge
+    if not problems:
+        write_json(target_ckpt / "handoff_initialization.json", {
+            "source": str(source_ckpt), "step": step, "same_stage_resume": False,
+        })
     code = finish()
-    log(f"actor  init : {actor_dir}")
-    log(f"critic init : {critic_dir}")
-    log(f"resume step : {step} (latest marker written); GAD optimizer starts fresh unless resume is enabled")
+    if code == 0:
+        log(f"actor  init : {manifest['actor_hf']}")
+        log(f"critic init : {manifest['critic_hf']}")
+        log(f"resume step : {step} (latest marker written); GAD optimizer starts fresh unless resume is enabled")
     return code
 
 

@@ -193,6 +193,10 @@ def stage_env(cfg: Config, run_dir: Path, stage: str, backend: Path, *, log_back
         "GAD_EXPECT_VERL_COMMIT": planned_backend_commit(backend, stage),
         "GAD_BACKEND_STAGE": stage,
         "PYTHONUNBUFFERED": "1",
+        # Install Python's alternate signal stack before native CPU feature probes.
+        # On this H200 host, enabling faulthandler after backend imports can fail
+        # with ENOMEM despite unlimited RLIMIT_AS (dynamic xstate/AMX stack size).
+        "PYTHONFAULTHANDLER": "1",
         "TOKENIZERS_PARALLELISM": "true",
         "HYDRA_FULL_ERROR": "1",
         "NCCL_TIMEOUT": "36000",
@@ -691,6 +695,21 @@ def recorded_handoff(run_dir: Path, cfg: Config) -> dict | None:
     return None
 
 
+def verify_initial_handoff(checkpoint: Path, manifest: dict) -> None:
+    """Check the files GAD actually opens on a fresh-optimizer start."""
+    if not manifest.get("ok") or not manifest.get("merged"):
+        raise PipelineError(f"incomplete GAD initialization: {checkpoint}")
+    cursor = checkpoint / "data.pt"
+    if not cursor.is_file() or sha256_file(cursor) != manifest.get("data_pt_sha256"):
+        raise PipelineError(f"GAD initial handoff dataloader state missing or changed: {cursor}")
+    for role in ("actor", "critic"):
+        hf = Path(manifest[f"{role}_hf"])
+        weights = manifest["exports"][f"{role}_weight_files"]
+        files = [hf / "config.json", *(hf / name for name in weights)]
+        if not weights or not all(p.is_file() and p.stat().st_size for p in files):
+            raise PipelineError(f"GAD initial handoff {role} export incomplete: {hf}")
+
+
 def resolve_gad_resume(cfg: Config, run_dir: Path, *, added_steps: int,
                        resume_requested: bool) -> dict:
     """Decide how the GAD stage starts, so a resume never re-runs the handoff.
@@ -720,30 +739,41 @@ def resolve_gad_resume(cfg: Config, run_dir: Path, *, added_steps: int,
     pinned=read_json(run_dir/'runtime/gad_handoff_identity.json',default=None)
     if pinned and pinned!=handoff_identity(cfg,run_dir):
         raise PipelineError('GAD resume Warmup handoff content changed; use a new run')
-    recorded=recorded_handoff(run_dir,cfg)
-    checkpoints=checkpoint_dirs(out_dir)
-    if resume_requested and recorded and checkpoints and checkpoints[-1][0]==recorded['step']:
+    recorded = recorded_handoff(run_dir, cfg)
+    checkpoints = checkpoint_dirs(out_dir)
+    existing = last_complete_checkpoint(out_dir, stage="gad", extensions_required=required) if checkpoints else None
+    if recorded and checkpoints and (existing is None or existing[0] == recorded['step']):
         initial=out_dir/f'global_step_{recorded["step"]}'
+        manifest = read_json(run_dir/'handoff_manifest.json', default={})
+        compact = manifest.get('initialization_only') and initial.is_dir()
         # Extension state wins over a stale initialization marker: this is already GAD.
         extension_state = (initial/'training_extensions').exists() or (initial/'checkpoint_complete.json').exists()
-        if required and extension_state:
-            problems = verify_checkpoint_dir(initial, roles=('actor','critic'), extensions_required=True)
-            if problems:
+        if resume_requested and required and extension_state:
+            if existing is None:
+                problems = verify_checkpoint_dir(initial, roles=('actor','critic'), extensions_required=True)
                 raise PipelineError('incomplete GAD extension checkpoint: ' + str(problems))
-        elif required:
-            marker = read_json(initial/'handoff_initialization.json', default=None)
-            source = read_json(run_dir/'handoff_manifest.json', default={}).get('source_checkpoint')
-            if (not isinstance(marker,dict) or not source or marker.get('source') != source
-                    or marker.get('step') != recorded['step'] or marker.get('same_stage_resume') is not False):
-                raise PipelineError('GAD initial handoff marker missing or inconsistent with recorded source/step')
-        # Copied Warmup optimizer files are not GAD optimizer state.
-        if not (required and extension_state) and not verify_checkpoint_dir(initial,roles=('actor','critic')):
-            decision.update(mode='handoff',from_step=recorded['step'],handoff=recorded,
-                total_steps=recorded['step']+added_steps,reason='reusing initial Warmup handoff with fresh GAD optimizers')
-            return decision
-    existing = last_complete_checkpoint(out_dir, stage="gad", extensions_required=required) if out_dir.is_dir() else None
-    if required and existing is None and resume_requested and checkpoint_dirs(out_dir):
-        latest=checkpoint_dirs(out_dir)[-1][1]
+        elif resume_requested and initial.is_dir():
+            if required:
+                marker = read_json(initial/'handoff_initialization.json', default=None)
+                source = manifest.get('source_checkpoint')
+                if (not isinstance(marker,dict) or not source or marker.get('source') != source
+                        or marker.get('step') != recorded['step'] or marker.get('same_stage_resume') is not False):
+                    raise PipelineError('GAD initial handoff marker missing or inconsistent with recorded source/step')
+            if compact or checkpoints[-1][0] != recorded["step"]:
+                latest = out_dir / "latest_checkpointed_iteration.txt"
+                if not latest.is_file() or latest.read_text().strip() != str(recorded["step"]):
+                    raise PipelineError("latest GAD marker does not select the initial Warmup handoff")
+            if compact:
+                verify_initial_handoff(initial, manifest)
+            if compact or not verify_checkpoint_dir(initial, roles=('actor','critic')):
+                decision.update(mode='handoff',from_step=recorded['step'],handoff=recorded,
+                    total_steps=recorded['step']+added_steps,reason='reusing initial Warmup handoff with fresh GAD optimizers')
+                return decision
+        elif compact and existing is None:
+            # Report the same resume advice for an already staged initialization.
+            existing = (recorded['step'], initial)
+    if required and existing is None and resume_requested and checkpoints:
+        latest=checkpoints[-1][1]
         # The first Warmup handoff intentionally has fresh optimizers and no extension state.
         raise PipelineError('no complete extension checkpoint for GAD resume: '+str(
             verify_checkpoint_dir(latest,roles=('actor','critic'),extensions_required=True)))
@@ -754,7 +784,7 @@ def resolve_gad_resume(cfg: Config, run_dir: Path, *, added_steps: int,
             step, path = existing
             decision["conflict"] = {"step": step, "path": str(path)}
             decision["reason"] = (
-                f"{out_dir} already holds a complete checkpoint (global_step_{step}) but no resume was "
+                f"{out_dir} already holds a complete checkpoint or staged handoff (global_step_{step}) but no resume was "
                 "requested. Pass --resume-gad to continue that run in place, or start over in a fresh "
                 "run directory (--run-id <new-id>)."
             )
@@ -773,7 +803,8 @@ def resolve_gad_resume(cfg: Config, run_dir: Path, *, added_steps: int,
     previous_identity=history.get('plan',{}).get('warmup_handoff')
     if not history and not pinned:
         raise PipelineError('GAD resume handoff provenance missing; explicitly reverify legacy provenance or use a new run')
-    if history and (not previous_identity or previous_identity!=handoff_identity(cfg,run_dir)):
+    # A pinned identity already matched the live handoff files in this decision.
+    if history and (not previous_identity or previous_identity != (pinned or handoff_identity(cfg, run_dir))):
         raise PipelineError('GAD resume handoff provenance missing/changed; preserve this run and use a new run or explicitly reverify legacy provenance')
     handoff = recorded_handoff(run_dir, cfg)
     if handoff is None:
@@ -818,7 +849,7 @@ def _stage_signature(cfg: Config, stage: str, *, legacy: bool, handoff_identity:
                 "run.resume_worker_state",
                 "data.val_batch_size", "data.teacher_index", "data.manifest",
                 "backends.source_repo", "backends.root", "validation.scorer_path"}
-    excluded.update({"run.max_stage_steps", "run.wandb_mode"})
+    excluded.update({"run.max_stage_steps", "run.wandb_mode", "execution.warmup_forward_diagnostics"})
     excluded.update(key for key in ('models.actor_param_offload','models.actor_optimizer_offload',
         'models.critic_param_offload','models.critic_optimizer_offload',
         'models.actor_gradient_checkpointing','models.critic_gradient_checkpointing') if cfg.get(key) is None)
@@ -1121,6 +1152,10 @@ def verify_backend_import(cfg: Config, run_dir: Path, stage: str, plan: dict) ->
 
 def warmup_source_compatibility(cfg, source_cfg):
     """Allow metadata-only dataset migration, after checking all ordered rows."""
+    for key in ('data.train_batch_size', 'data.prompt_key', 'data.max_prompt_length',
+                'data.max_response_length', 'run.seed', 'rollout.enable_thinking'):
+        if source_cfg.get(key) != cfg.get(key):
+            raise PipelineError('explicit Warmup initialization requires matching ' + key)
     model_identity = {'same_model_path': True}
     old_model, new_model = (Path(c.require('models.student')).resolve() for c in (source_cfg, cfg))
     if old_model != new_model:
@@ -1136,10 +1171,6 @@ def warmup_source_compatibility(cfg, source_cfg):
     source, target = source_cfg.require('data.train_file'), cfg.require('data.train_file')
     if Path(source).resolve() == Path(target).resolve():
         return {'same_data_path': True, **model_identity}
-    for key in ('data.train_batch_size', 'data.prompt_key', 'data.max_prompt_length',
-                'data.max_response_length', 'run.seed', 'rollout.enable_thinking'):
-        if source_cfg.get(key) != cfg.get(key):
-            raise PipelineError('metadata-only Warmup migration requires matching ' + key)
     import pyarrow.parquet as pq
     import pyarrow.compute as pc
     columns = [cfg.get('data.prompt_key'), 'teacher_response', 'reward_model', 'data_source', 'ability', 'extra_info']
@@ -1184,11 +1215,6 @@ def export_warmup_handoff(cfg: Config, run_dir: Path, *, dry_run: bool) -> dict:
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     if not manifest.get("ok"):
         raise PipelineError(f"handoff failed: {manifest.get('problems')}")
-    from extension_config import extension_enabled
-    if extension_enabled(cfg):
-        initial = Path(manifest["gad_checkpoint"])
-        write_json(initial / "handoff_initialization.json", {"source": manifest["source_checkpoint"],
-                                                           "step": manifest["step"], "same_stage_resume": False})
     return manifest
 
 

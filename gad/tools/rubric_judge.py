@@ -70,7 +70,8 @@ def main():
     if url.hostname not in ("127.0.0.1", "localhost"):
         raise RuntimeError("start owns only a loopback local endpoint; use health for explicitly configured external services")
     gpu_ids = str(cfg.require("resources.judge_gpus"))
-    if set(gpu_ids.split(",")) & set(str(cfg.get("resources.gpus")).split(",")):
+    if (set(gpu_ids.split(",")) & set(str(cfg.get("resources.gpus")).split(","))
+            and cfg.get("resources.allow_judge_gpu_sharing") is not True):
         raise RuntimeError("judge GPU IDs overlap training")
     argv = [str(cfg.require("run.python_bin")), str(Path(__file__).with_name("rubric_judge_server.py")),
             "--model", options["tokenizer_path"], "--served-model-name", options["model"],

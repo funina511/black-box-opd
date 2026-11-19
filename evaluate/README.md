@@ -5,6 +5,26 @@
 默认 profile 名称也改为 `16k`。可用 `--max-tokens`、`--max-model-len` 临时覆盖；
 训练 rollout 的长度与已保存的实验配置不受影响。
 
+## H200：单入口八任务、统一 n=4
+
+2026-11-17新增 [run_all_eval.sh](run_all_eval.sh)，复用现有 `evaluate.py`，默认GPU0、八项任务全部每题采样4次（包含MATH-500），输出16384/上下文18432，non-thinking和原评分规则不变。按模型→任务顺序串行执行；默认依次评base、SeqKD、GAD，每个模型跑完八任务后再切换模型。每项生成仍使用现有独立sampler进程，不新增常驻推理服务。
+
+```bash
+cd /root/siton-tmp/home/jinbo/bloxopd/LMOps
+export GAD_PYTHON=/root/siton-tmp/home/jinbo/miniconda3/envs/gad/bin/python
+bash evaluate/run_all_eval.sh \
+  --run /tmp/bloxopd_h200_runs/h200_baseline_06b_17k_n4 --dry-run
+# 正式运行：去掉 --dry-run。只评GAD时追加 --methods gad。
+```
+
+任务顺序为AMC23、AIME24、AIME25、MATH-500、Minerva、Olympiad-Bench、GPQA、MMLU-Pro-Math。扩展四项仍使用`extended_dapo_v2`；新结果统一写到run下的`evaluation/all8_dapo_v2_af1_n4_16k_h200_graph/`，不与旧core4/ext4不同采样次数的profile混用。当前数据共3096题，每模型12384条回答，默认三模型合计37152条。重复同一命令沿用已有身份和完整性检查，跳过已完整评完的任务；`--summary`只读取汇总，`--max-prompts 2`会使用独立的`_smoke2`目录。旧入口和历史协议保持原样。
+
+单卡H200默认传入`--no-enforce-eager`，允许vLLM V1使用torch.compile和CUDA Graph；显存预算保持`0.85`，采样器提交批量保持256，未指定时设置`OMP_NUM_THREADS=4`。`gpu-memory-utilization`表示显存预算比例，并非GPU计算利用率；继续调高不一定更快。Qwen3-0.6B在当前16k输出设置下仍需要较大的KV缓存，因此先保留这些批量和显存设置。每个任务仍会单独初始化引擎、捕获CUDA Graph，首次还会编译；编译缓存默认放在`/tmp/bloxopd_h200_cache/vllm`，可通过`VLLM_CACHE_ROOT`覆盖。评测次数、长度、温度、seed和评分规则不变，但执行方式变化可能导致采样结果不同，故使用独立profile。
+
+2026-11-17实测最终GAD step542的AMC23前8题×4，三轮均正常退出、32条回答完整且评分完成：eager采样247.5秒，Graph首次冷启动256.8秒，复用编译缓存后176.9秒。缓存复用后耗时减少28.5%，按实际输出token数归一化的吞吐提高约30%（两种模式回答长度不同）。计时包含sampler/引擎启动、编译及图捕获，不含checkpoint导出与外部评分；这只是32条回答的短测，不代表完整八任务或256条提交批量的固定加速比。详细数据见[单卡性能报告](../reports/h200_evaluation_20261117/single_gpu_speed_comparison.json)。正式全量评测尚未启动。
+
+## 原有分组入口
+
 在 [run_eval.sh](run_eval.sh) 顶部设置 `RUN`、`MODELS`、`MODEL_PATHS`、`DATASETS`、GPU 和采样参数，然后运行：
 
 ```bash
@@ -38,7 +58,7 @@ bash evaluate/run_eval.sh --run qwen3_1.7b \
 
 新增的 Minerva、Olympiad-Bench、GPQA Diamond 和 MMLU-Pro 数学子集通过 [run_extended_eval.sh](run_extended_eval.sh) 选择，默认使用与训练相同 DAPO 提示词的 `extended_dapo_v2` 数据（选择题另要求只输出选项字母）；原 `run_eval.sh` 的四任务默认设置保留。数据范围、评分限制及命令见 [扩展评测说明](EXTENDED_EVALUATION.md)。
 
-`evaluate.py` 和 `summarize_eval.py` 是通用实现，日常只需使用和编辑 `run_eval.sh`。跨 run、跨 profile 的各任务准确率及均值表用 `python evaluate/summarize_runs.py RUN [RUN ...]`（或 `--all`），说明见 [扩展评测说明](EXTENDED_EVALUATION.md#运行)。
+`evaluate.py` 和 `summarize_eval.py` 是通用实现；当前H200八任务实验使用 `run_all_eval.sh`，原有分组协议分别使用 `run_eval.sh`、`run_extended_eval.sh`。跨 run、跨 profile 的各任务准确率及均值表用 `python evaluate/summarize_runs.py RUN [RUN ...]`（或 `--all`），说明见 [扩展评测说明](EXTENDED_EVALUATION.md#运行)。
 
 ## 单独导出模型
 

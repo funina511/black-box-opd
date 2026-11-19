@@ -2,6 +2,7 @@
 """Pure CPU unified grading, fixed denominator metrics and bounded legacy audit."""
 import argparse
 from collections import Counter, defaultdict
+import hashlib
 import json
 from pathlib import Path
 import statistics
@@ -79,8 +80,8 @@ def _ground_truth_audit(records, inspector=None):
         'unsupported_questions': len(unsupported),
         'details': (unsupported[:20] + [{'question_id': uid, 'reason': 'ground truth differs between rollouts'}
                                         for uid in conflicts[:20]]),
-        'conflict_question_ids': conflicts[:50],
-        'unsupported_question_ids': [item['question_id'] for item in unsupported[:50]],
+        'conflict_question_ids': conflicts,
+        'unsupported_question_ids': [item['question_id'] for item in unsupported],
     }
 
 
@@ -196,8 +197,14 @@ def run(raw_path, output_dir, config=None, expected_questions=None, n=None, task
     if config and config.get('fingerprint') and config['fingerprint'] != identity(config.get('timeout_seconds', 2.0))['fingerprint']:
         raise ValueError('rescore snapshot scorer/dependency fingerprint mismatch')
     if (output_dir / 'metrics.json').exists():raise ValueError('new scoring output required; refusing overwrite of metrics')
-    with Path(raw_path).open(encoding='utf-8') as stream:
-        records = [json.loads(line) for line in stream if line.strip()]
+    raw_digest = hashlib.sha256()
+    records = []
+    # Retain the original UTF-8 line endings for the input digest.
+    with Path(raw_path).open(encoding='utf-8', newline='') as stream:
+        for line in stream:
+            raw_digest.update(line.encode('utf-8'))
+            if line.strip():
+                records.append(json.loads(line))
     audit = _ground_truth_audit(records, inspector=(lambda gt: {
         'supported': isinstance(gt, str) and len(gt.strip()) == 1 and gt.strip().upper() in 'ABCDEFGHIJKLMNOPQRSTUVWXYZ',
         'reason': 'expected one option letter'}) if is_choice else
@@ -221,6 +228,7 @@ def run(raw_path, output_dir, config=None, expected_questions=None, n=None, task
             result.update(scorer_version=choice_identity['version'], scorer_fingerprint=choice_identity['fingerprint'])
         scored.append({**row, **result})
     metrics = summarize(scored, expected_questions=expected_questions, n=n)
+    metrics['raw_sha256'] = raw_digest.hexdigest()
     if is_choice:
         metrics['aggregation_protocol']['status_mapping'] = 'evaluate.choice: explicit final option exact match'
         content_correct = sum(r.get('content_option_correct') is True for r in scored)
@@ -242,7 +250,11 @@ def run(raw_path, output_dir, config=None, expected_questions=None, n=None, task
         metrics['answer_form_changed_samples'] = sum(bool(r.get('answer_form_applied')) for r in scored)
         metrics['answer_form_correct'] = sum(bool(r.get('answer_form_applied')) and r.get('grade_status') == 'correct' for r in scored)
     metrics['task'] = task
-    metrics['ground_truth_audit'] = audit
+    metrics['ground_truth_audit'] = {
+        **audit,
+        'conflict_question_ids': audit['conflict_question_ids'][:50],
+        'unsupported_question_ids': audit['unsupported_question_ids'][:50],
+    }
     output_dir.mkdir(parents=True, exist_ok=True)
     (output_dir / 'scored_samples.jsonl').write_text(''.join(json.dumps(r, ensure_ascii=False) + '\n' for r in scored))
     (output_dir / 'metrics.json').write_text(json.dumps(metrics, indent=2))

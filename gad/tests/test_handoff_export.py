@@ -27,11 +27,13 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 GAD_DIR = Path(__file__).resolve().parents[1]
 TOOLS_DIR = GAD_DIR / "tools"
@@ -75,9 +77,9 @@ sharded = {k: distribute_tensor(v.detach().clone(), mesh, [Replicate()]) for k, 
 torch.save(sharded, role_dir / "model_world_size_1_rank_0.pt")
 torch.save({"state": {}}, role_dir / "optim_world_size_1_rank_0.pt")
 torch.save({"lr_scheduler": None, "rng": {}}, role_dir / "extra_state_world_size_1_rank_0.pt")
-source = gad_dir / f"global_step_{handoff_step}" / "actor"
+source = gad_dir / f"global_step_{handoff_step}" / "actor" / "huggingface"
 for item in source.iterdir():
-    if item.is_file() and item.suffix != ".pt":
+    if item.is_file() and item.suffix not in (".pt", ".safetensors", ".bin"):
         (role_dir / item.name).write_bytes(item.read_bytes())
 torch.save({"_num_yielded": trained_step * 10}, ckpt / "data.pt")
 (gad_dir / "latest_checkpointed_iteration.txt").write_text(str(trained_step), encoding="utf-8")
@@ -300,9 +302,16 @@ class HandoffExportTests(unittest.TestCase):
     def test_gad_directory_is_staged_and_warmup_is_untouched(self) -> None:
         self.assertEqual((self.gad_dir / "latest_checkpointed_iteration.txt").read_text().strip(), str(self.step))
         staged = self.gad_dir / f"global_step_{self.step}"
+        self.assertTrue(self.manifest["initialization_only"])
+        marker = json.loads((staged / "handoff_initialization.json").read_text())
+        self.assertEqual(marker, {"source": self.manifest["source_checkpoint"],
+                                  "step": self.step, "same_stage_resume": False})
         for role in ("actor", "critic"):
-            self.assertTrue((staged / role / "model_world_size_1_rank_0.pt").exists())
             self.assertTrue((staged / role / "huggingface" / "config.json").exists())
+            for prefix in ("model", "optim", "extra_state"):
+                name = f"{prefix}_world_size_1_rank_0.pt"
+                self.assertFalse((staged / role / name).exists())
+                self.assertTrue((self.root / "warmup" / staged.name / role / name).is_file())
         self.assertTrue((staged / "data.pt").exists())
         # the warmup checkpoint must not gain merge outputs
         self.assertFalse((self.root / "warmup" / f"global_step_{self.step}" / "actor" / "huggingface").exists())
@@ -319,6 +328,46 @@ class HandoffExportTests(unittest.TestCase):
         )
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("refusing to overwrite", result.stdout + result.stderr)
+
+    def test_failed_merge_can_retry_in_place_without_force(self) -> None:
+        sys.path.insert(0, str(TOOLS_DIR))
+        import prepare_gad_checkpoint as pgc
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target = root / "gad"
+            manifest = root / "handoff.json"
+            with patch.object(sys, "argv", ["prepare", "--warmup-dir", str(self.root / "warmup"),
+                                            "--gad-dir", str(target), "--manifest", str(manifest)]):
+                args = pgc.parse_args()
+
+            def merged(command):
+                role = Path(command[command.index("--local_dir") + 1]).name
+                output = Path(command[command.index("--output-dir") + 1])
+                shutil.copytree(self.manifest[role + "_hf"], output, dirs_exist_ok=True)
+                return role
+
+            def fail_on_critic(command):
+                return (1, "", "disk full") if merged(command) == "critic" else (0, "", "")
+
+            with patch.object(pgc, "capture_command", side_effect=fail_on_critic):
+                with self.assertRaisesRegex(pgc.PipelineError, "disk full"):
+                    pgc.run_handoff(args)
+            self.assertEqual(list(target.iterdir()), [])
+            self.assertFalse(manifest.exists())
+
+            manifest.write_text("existing provenance")
+            with self.assertRaisesRegex(pgc.PipelineError, "refusing to overwrite"):
+                pgc.run_handoff(args)
+            self.assertEqual(manifest.read_text(), "existing provenance")
+            manifest.unlink()
+
+            with patch.object(pgc, "capture_command", side_effect=lambda cmd: (0, merged(cmd), "")):
+                self.assertEqual(pgc.run_handoff(args), 0)
+            record = json.loads(manifest.read_text())
+            self.assertEqual((target / "latest_checkpointed_iteration.txt").read_text(), str(self.step))
+            for path in (record["actor_hf"], record["critic_hf"], record["dataloader_state"]["path"]):
+                self.assertTrue(Path(path).exists())
 
 
 class FinalModelExportTests(unittest.TestCase):
@@ -489,13 +538,19 @@ class TiedEmbeddingExportTests(unittest.TestCase):
             raise unittest.SkipTest(f"could not build tied DTensor shards:\n{built.stderr[-800:]}")
         cls.tied = json.loads((cls.root / "seed" / "tied_summary.json").read_text(encoding="utf-8"))
 
+        # An external merge tool may implement only the original --local_dir interface.
+        legacy_merge = cls.root / "legacy_merge.py"
+        legacy_merge.write_text(
+            "import runpy, sys\nassert sys.argv[1::2] == ['--local_dir']\n"
+            f"runpy.run_path({str(MERGE_TOOL)!r}, run_name='__main__')\n"
+        )
         cls.gad_dir = cls.root / "gad"
         cls.handoff_proc = subprocess.run(
             [
                 PYTHON, str(TOOLS_DIR / "prepare_gad_checkpoint.py"),
                 "--warmup-dir", str(cls.root / "warmup"),
                 "--gad-dir", str(cls.gad_dir),
-                "--merge-tool", str(MERGE_TOOL),
+                "--merge-tool", str(legacy_merge),
                 "--python-bin", PYTHON,
                 "--manifest", str(cls.root / "handoff.json"),
             ],
@@ -535,6 +590,8 @@ class TiedEmbeddingExportTests(unittest.TestCase):
     def test_handoff_accepts_the_tied_model_without_data_loss(self) -> None:
         self.assertEqual(self.handoff_proc.returncode, 0, self.handoff_proc.stdout + self.handoff_proc.stderr)
         self.assertTrue(self.manifest.get("ok"), self.manifest.get("problems"))
+        self.assertFalse(self.manifest["initialization_only"])
+        self.assertTrue((Path(self.manifest["gad_checkpoint"]) / "critic" / "optim_world_size_1_rank_0.pt").is_file())
         keys = self.manifest["weight_keys"]
         self.assertEqual(keys["actor_lost"], [])
         self.assertEqual(keys["actor_added"], [])
@@ -569,7 +626,7 @@ class TiedEmbeddingExportTests(unittest.TestCase):
             "the merged export must have lm_head tied to embed_tokens",
         )
         source = torch.load(
-            self.gad_dir / f"global_step_{self.step}" / "actor" / "model_world_size_1_rank_0.pt",
+            self.root / "warmup" / f"global_step_{self.step}" / "actor" / "model_world_size_1_rank_0.pt",
             map_location="cpu", weights_only=False,
         )
         self.assertTrue(
@@ -618,7 +675,7 @@ class TiedEmbeddingExportTests(unittest.TestCase):
         sys.path.insert(0, str(TOOLS_DIR))
         import prepare_gad_checkpoint as pgc
 
-        source = pgc.source_weight_keys(self.gad_dir / f"global_step_{self.step}" / "actor")
+        source = pgc.source_weight_keys(self.root / "warmup" / f"global_step_{self.step}" / "actor")
         merged = set()
         from safetensors import safe_open
 

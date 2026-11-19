@@ -30,6 +30,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 GAD_DIR = Path(__file__).resolve().parents[1]
 TOOLS_DIR = GAD_DIR / "tools"
@@ -978,6 +979,7 @@ class HandoffTests(unittest.TestCase):
             )
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("dataloader state", result.stdout + result.stderr)
+            self.assertFalse((tmp_path / "gad" / "latest_checkpointed_iteration.txt").exists())
 
     def test_gad_steps_record_the_target_total(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1206,11 +1208,69 @@ class GadResumeTests(unittest.TestCase):
             self.assertEqual(decision["handoff"]["actor_hf"], manifest["actor_hf"])
 
             plan = pipeline.plan_stage(
-                cfg, run_dir, "gad", steps_per_epoch_value=4, handoff=decision["handoff"], resume=decision
+                cfg, run_dir, "gad", steps_per_epoch_value=4, handoff=decision["handoff"], resume=decision,
+                install_guard=False,
             )
             self.assertEqual(plan["resume"]["mode"], "resume")
             self.assertEqual(plan["total_steps"], 18)
             self.assertEqual(plan["model_path"], manifest["actor_hf"])
+
+    def test_resume_checks_live_handoff_once_with_recorded_history(self) -> None:
+        for keep_pin in (True, False):
+            with self.subTest(keep_pin=keep_pin), tempfile.TemporaryDirectory() as tmp:
+                cfg, run_dir, gad_dir = self._run_dir(Path(tmp))
+                manifest = self._handoff_manifest(run_dir, gad_dir, 12)
+                self._gad_checkpoint(gad_dir, 14)
+                pin = run_dir / "runtime/gad_handoff_identity.json"
+                history = run_dir / "stage_gad.json"
+                identity = json.loads(pin.read_text())
+                if not keep_pin:
+                    pin.unlink()
+                write_json(history, {"plan": {"warmup_handoff": identity}})
+                with patch.object(pipeline, "handoff_identity", wraps=pipeline.handoff_identity) as check:
+                    decision = pipeline.resolve_gad_resume(cfg, run_dir, added_steps=6, resume_requested=True)
+                    self.assertEqual(decision["mode"], "resume")
+                    check.assert_called_once_with(cfg, run_dir)
+
+                write_json(history, {"plan": {"warmup_handoff": {**identity, "step": 99}}})
+                with self.assertRaisesRegex(PipelineError, "handoff provenance"):
+                    pipeline.resolve_gad_resume(cfg, run_dir, added_steps=6, resume_requested=True)
+
+                write_json(history, {"plan": {"warmup_handoff": identity}})
+                (Path(manifest["actor_hf"]) / "config.json").write_text("{}")
+                with self.assertRaisesRegex(PipelineError, "handoff"):
+                    pipeline.resolve_gad_resume(cfg, run_dir, added_steps=6, resume_requested=True)
+
+    def test_compact_handoff_restarts_with_fresh_optimizers(self) -> None:
+        for rubric in (False, True):
+            with self.subTest(rubric=rubric), tempfile.TemporaryDirectory() as tmp:
+                cfg, run_dir, gad_dir = self._run_dir(Path(tmp))
+                cfg.data["rubric.enabled"] = rubric
+                cfg.data["rubric.mode"] = "correctness_only"
+                initial = gad_dir / "global_step_12"
+                manifest = self._handoff_manifest(run_dir, gad_dir, 12)
+                (initial / "data.pt").write_bytes(b"cursor")
+                (gad_dir / "latest_checkpointed_iteration.txt").write_text("12")
+                manifest.update(initialization_only=True, merged=True, source_checkpoint=str(run_dir / "warmup/global_step_12"),
+                                data_pt_sha256=pipeline.sha256_file(initial / "data.pt"),
+                                exports={f"{role}_weight_files": ["model.safetensors"] for role in ("actor", "critic")})
+                write_json(run_dir / "handoff_manifest.json", manifest)
+                write_json(run_dir / "runtime/gad_handoff_identity.json", pipeline.handoff_identity(cfg, run_dir))
+                if rubric:
+                    write_json(initial / "handoff_initialization.json", {"source": manifest["source_checkpoint"],
+                                                                       "step": 12, "same_stage_resume": False})
+                # The first GAD save can be interrupted before the trainer publishes its marker.
+                (gad_dir / "global_step_14/actor").mkdir(parents=True)
+                self.assertIsNone(pipeline.last_complete_checkpoint(gad_dir, stage="gad"))
+                decision = pipeline.resolve_gad_resume(cfg, run_dir, added_steps=6, resume_requested=True)
+                self.assertEqual(("handoff", 12, 18), (decision["mode"], decision["from_step"], decision["total_steps"]))
+                (gad_dir / "latest_checkpointed_iteration.txt").write_text("14")
+                with self.assertRaisesRegex(PipelineError, "latest GAD marker"):
+                    pipeline.resolve_gad_resume(cfg, run_dir, added_steps=6, resume_requested=True)
+                (gad_dir / "latest_checkpointed_iteration.txt").write_text("12")
+                (initial / "data.pt").write_bytes(b"wrong cursor")
+                with self.assertRaisesRegex(PipelineError, "dataloader"):
+                    pipeline.resolve_gad_resume(cfg, run_dir, added_steps=6, resume_requested=True)
 
     def test_resume_ignores_an_incomplete_newer_checkpoint(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

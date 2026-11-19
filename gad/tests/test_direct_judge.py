@@ -78,6 +78,18 @@ class DirectTests(unittest.TestCase):
         c.data['rubric.semantic_check']=True
         self.assertTrue(any('direct_v1' in p for p in validate_config(c)))
 
+    def test_inactive_semantic_code_keeps_existing_direct_identity(self):
+        from gad.extensions.common import semantic_module_hash
+        c = cfg()
+        expected = service_identity(c)
+        legacy_hash = '7bd48b6379513e9d2ce453620f169466f687774fb48cc4d1d176175c4059a26d'
+        self.assertEqual(legacy_hash, expected['semantic_module_hash'])
+        with patch('gad.extensions.common.file_hash', return_value='changed'):
+            self.assertEqual('changed', semantic_module_hash('events_v27'))
+            self.assertEqual(expected, service_identity(c))
+            with tempfile.TemporaryDirectory() as d:
+                self.assertEqual(legacy_hash, self.owner(d).protocol_identity['semantic_module_hash'])
+
     def test_direct_label_to_mask_preserves_correctness_for_all_pairs(self):
         import torch
         with tempfile.TemporaryDirectory() as directory:

@@ -103,11 +103,21 @@ class ChoiceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             raw = root / 'raw.jsonl'
-            rows = [self.row('B', truth=truth, global_index=0, rollout_index=i)
-                    for i, truth in enumerate(('A', 'B'))]
+            rows = [self.row(truth, truth=truth, global_index=q, rollout_index=i)
+                    for q in range(51) for i, truth in enumerate(('A', 'B'))]
             raw.write_text(''.join(json.dumps(row) + '\n' for row in rows))
-            result = run(raw, root / 'scores', expected_questions=[0], n=2, task='GPQA')
-            self.assertEqual(result['unresolved_samples'], 2)
+            result = run(raw, root / 'scores', expected_questions=range(51), n=2, task='GPQA')
+            self.assertEqual((result['confirmed_correct'], result['unresolved_samples']), (0, 102))
+            audit = result['ground_truth_audit']
+            self.assertEqual((audit['conflict_questions'], len(audit['conflict_question_ids'])), (51, 50))
+
+            rows = [self.row('A', truth='?', global_index=q, rollout_index=0) for q in range(51)]
+            raw.write_text(''.join(json.dumps(row) + '\n' for row in rows))
+            result = run(raw, root / 'unsupported', expected_questions=range(51), n=1, task='GPQA')
+            scored = (root / 'unsupported/scored_samples.jsonl').read_text().splitlines()
+            self.assertTrue(all(json.loads(line)['parse_method'] == 'ground_truth_audit' for line in scored))
+            audit = result['ground_truth_audit']
+            self.assertEqual((audit['unsupported_questions'], len(audit['unsupported_question_ids'])), (51, 50))
 
 
 class MinervaTests(unittest.TestCase):
@@ -258,6 +268,92 @@ class SummarizeRunsTests(unittest.TestCase):
             self.assertEqual(short[8192]['partial_tasks'], [])
             self.assertEqual(short[16384]['Avg'], .5)
             self.assertEqual(len(notes), 1)
+
+
+class StageArtifactTests(unittest.TestCase):
+    def test_existing_profile_keeps_historical_state_identity_after_raw_shards_are_archived(self):
+        from evaluate.evaluate import evaluation_identity, execute, model_content, stage_model
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            stage = root / "gad"
+            hf = stage / "global_step_9/actor/huggingface"
+            hf.mkdir(parents=True)
+            for name in ("config.json", "tokenizer.json", "model.safetensors"):
+                (hf / name).write_bytes(b"fixture")
+            prior = {"path": str(hf), "selection": "explicit_step", "target_step": 9,
+                     "content": {"optim_world_size_1_rank_0.pt": "historical-digest"},
+                     "hf_content": model_content(hf)}
+            plan = {"run_dir": str(root), "output_root": str(root / "evaluation"), "models": {"gad": prior},
+                    "tasks": {}, "protocol": {}, "max_prompts": 0, "scoring_math": {}, "scorer_identity": {},
+                    "python_bin": "unused", "oprd_root": str(root)}
+            saved = root / "evaluation/plan.json"
+            saved.parent.mkdir()
+            saved.write_text(json.dumps(plan))
+            rebuilt = {**plan, "models": {"gad": stage_model(stage, 9, True, prior)}}
+            execute(rebuilt)
+            self.assertEqual(evaluation_identity(json.loads(saved.read_text())), evaluation_identity(plan))
+            (hf / "model.safetensors").write_bytes(b"changed")
+            with self.assertRaisesRegex(RuntimeError, "actual HF content changed"):
+                execute(rebuilt)
+
+    def test_archived_hf_source_weight_and_tokenizer(self):
+        from evaluate.evaluate import model_content, stage_model, verify_stage_export
+        with tempfile.TemporaryDirectory() as directory:
+            stage = Path(directory) / "gad"
+            checkpoint = stage / "global_step_9"
+            hf = checkpoint / "actor/huggingface"
+            hf.mkdir(parents=True)
+            for name in ("config.json", "tokenizer.json", "model.safetensors"):
+                (hf / name).write_bytes(b"fixture")
+            (stage / "latest_checkpointed_iteration.txt").write_text("9")
+            (stage / "COMPLETED.json").write_text(json.dumps({"verified": {"ok": True, "last_step": 9}}))
+            actual = model_content(hf)
+            manifest = stage / "eval_export_step_9.json"
+            record = {"ok": True, "mode": "export-final", "step": 9, "actor_hf": str(hf),
+                      "source_checkpoint": str(checkpoint), "exports": {
+                          "actor_files": {k: v for k, v in actual.items() if k.endswith(".json")},
+                          "actor_weight_files": ["model.safetensors"]}}
+            # A loose HF directory without provenance is available via --model-path.
+            self.assertFalse(stage_model(stage, 9, False, {})["checkpoint_ready"])
+            previous = {"path": str(hf), "target_step": 9, "hf_content": actual}
+            self.assertTrue(stage_model(stage, 9, False, previous)["ready"])
+            manifest.write_text(json.dumps(record))
+            model = stage_model(stage, 9, False, {})
+            self.assertTrue(model["checkpoint_ready"])
+            self.assertFalse(model["needs_export"])
+            verify_stage_export(model, actual)  # Original manifest format, with metadata hashes.
+            record["exports"]["actor_weight_sha256"] = {"model.safetensors": actual["model.safetensors"]}
+            manifest.write_text(json.dumps(record))
+            verify_stage_export(model, actual)
+            for name in ("model.safetensors", "tokenizer.json"):
+                with self.assertRaisesRegex(RuntimeError, "HF content changed"):
+                    verify_stage_export(model, {**actual, name: "changed"})
+            manifest.write_text(json.dumps({**record, "source_checkpoint": str(stage / "global_step_8")}))
+            with self.assertRaisesRegex(RuntimeError, "source does not match"):
+                verify_stage_export(model, actual)
+            (hf / "tokenizer.json").unlink()
+            self.assertFalse(stage_model(stage, 9, False, {})["checkpoint_ready"])
+
+    def test_export_uses_all_actor_ranks_and_needs_no_training_state(self):
+        from evaluate.evaluate import actor_export_problems, stage_model
+        from prepare_gad_checkpoint import export_final
+        from types import SimpleNamespace
+        with tempfile.TemporaryDirectory() as directory:
+            stage = Path(directory) / "seqkd"
+            checkpoint = stage / "global_step_2"
+            actor = checkpoint / "actor"
+            actor.mkdir(parents=True)
+            for name in ("model_world_size_2_rank_0.pt", "config.json", "tokenizer.json"):
+                (actor / name).write_bytes(b"fixture")
+            self.assertTrue(actor_export_problems(checkpoint))
+            (actor / "model_world_size_2_rank_1.pt").write_bytes(b"fixture")
+            (stage / "latest_checkpointed_iteration.txt").write_text("2")
+            self.assertTrue(stage_model(stage, 2, True, {})["needs_export"])
+            self.assertFalse(stage_model(stage, 2, False, {})["checkpoint_ready"])
+            args = SimpleNamespace(gad_dir=stage, merge_tool=Path(__file__), manifest=stage / "check.json",
+                                   step=2, check_only=True)
+            self.assertEqual(export_final(args), 0)
+            self.assertTrue(json.loads(args.manifest.read_text())["ok"])
 
 
 class RawCompleteTests(unittest.TestCase):

@@ -6,6 +6,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 from rubric.core.contracts import LAYOUT, layout_for, schema_for, digest, file_hash
+from gad.extensions.common import semantic_module_hash
 
 EXTENSION_DEFAULTS = {
     'scoring.math.version': 'legacy_card_v1', 'scoring.math.entrypoint': None, 'scoring.math.timeout_seconds': 2.0,
@@ -22,6 +23,7 @@ EXTENSION_DEFAULTS = {
     "actor_reward.scorer_monitor": False,
     "execution.teacher_prefetch": False,
     "execution.early_annotation": False,
+    "execution.warmup_forward_diagnostics": False,
     "optim.critic_ppo_mini_batch_size": None,
     "rubric.enabled": False, "rubric.stages": ["warmup", "gad"], "rubric.mode": "joint",
     "rubric.loss_mode": "legacy_active", "rubric.count_gate_tau": 4,
@@ -66,6 +68,7 @@ EXTENSION_DEFAULTS = {
     "replay.sampling": "uniform_without_replacement", "replay.eviction": "oldest_first",
     "replay.insert_after_step": True, "replay.store_labels": True, "replay.seed": 43,
     "resources.judge_gpus": None,
+    "resources.allow_judge_gpu_sharing": False,
 }
 
 
@@ -83,7 +86,7 @@ N4_DEFAULTS = {key: EXTENSION_DEFAULTS[key] for key in (
     'execution.teacher_prefetch', 'execution.early_annotation',
     'actor_reward.fp32', 'actor_reward.scorer_monitor', 'rubric.actor_reward_shadow',
     'rubric.actor_reward_group_weight', 'rubric.actor_reward_rubric_std_floor',
-    'rubric.actor_reward_selection_confirmed')}
+    'rubric.actor_reward_selection_confirmed', 'resources.allow_judge_gpu_sharing')}
 
 
 ACTOR_REWARD_DEFAULTS = {key: value for key, value in EXTENSION_DEFAULTS.items()
@@ -97,7 +100,8 @@ def legacy_reward_defaults(cfg):
 
 def validate(cfg):
     problems = []
-    for key in ('execution.teacher_prefetch', 'execution.early_annotation'):
+    for key in ('execution.teacher_prefetch', 'execution.early_annotation', 'execution.warmup_forward_diagnostics',
+                'resources.allow_judge_gpu_sharing'):
         if type(cfg.get(key)) is not bool:
             problems.append(key + ' must be boolean')
     if cfg.get('execution.teacher_prefetch') or cfg.get('execution.early_annotation'):
@@ -251,7 +255,7 @@ def validate(cfg):
             judging = set(str(cfg.get("resources.judge_gpus") or "").split(","))
             if not cfg.get("resources.judge_gpus"):
                 problems.append("joint requires explicit resources.judge_gpus")
-            if training & judging:
+            if training & judging and cfg.get('resources.allow_judge_gpu_sharing') is not True:
                 problems.append("judge GPUs and training GPUs overlap")
             if cfg.get("rubric.judge.tensor_parallel_size") != len(judging):
                 problems.append("judge TP must match its explicit GPU count")
@@ -357,7 +361,7 @@ def service_identity(cfg, full=False):
         if cfg.get('rubric.process_protocol')=='direct_v1':
             from rubric.core.process_direct import protocol_identity
         identity['semantic_policy'] = {key: cfg.get('rubric.' + key) for key in ('semantic_check', 'semantic_max_extra_requests')}
-        identity['semantic_module_hash'] = file_hash(ROOT / 'rubric/core/semantic_v24.py')
+        identity['semantic_module_hash'] = semantic_module_hash(cfg.get('rubric.process_protocol'))
         identity['protocol_identity'] = protocol_identity(Path(cfg.require('rubric.spec')).read_text(), Path(cfg.require('rubric.prompt')).read_text())
     if full:
         identity["model_sha256"] = {p.name: file_hash(p) for p in files}
@@ -374,8 +378,6 @@ def deployed_code_identity(cfg, stage):
 
 
 def hydra_overrides(cfg, stage, out_dir, start_step):
-    from common import sha256_file
-    from algorithm_patches import code_hash
     rubric = active(cfg, "rubric", stage)
     replay = active(cfg, "replay", stage)
     if cfg.get("backends.profile") != "gad_extensions_v1" or stage == "seqkd":
@@ -415,7 +417,7 @@ def hydra_overrides(cfg, stage, out_dir, start_step):
                 from rubric.core.process_direct import protocol_identity
             driver['protocol_identity']=protocol_identity(Path(driver['spec']).read_text(),Path(driver['prompt']).read_text())
             driver['protocol_identity']['semantic_policy']={k:driver[k] for k in ('semantic_check','semantic_max_extra_requests')}
-            driver['protocol_identity']['semantic_module_hash']=file_hash(ROOT/'rubric/core/semantic_v24.py')
+            driver['protocol_identity']['semantic_module_hash']=semantic_module_hash(driver['process_protocol'])
         driver["judge_fingerprint"] = digest(service_identity(cfg)) if cfg.get("rubric.mode") == "joint" else "rule_only"
         driver['scoring_math'] = {key[13:]: value for key, value in cfg.data.items() if key.startswith('scoring.math.')}
         worker = {"enabled": True, 'gradient_diagnostics_dir':str(Path(out_dir)/'gradient_diagnostics'), "mode": driver["mode"], "loss_coef": driver["loss_coef"],
@@ -439,13 +441,16 @@ def hydra_overrides(cfg, stage, out_dir, start_step):
                    if p.name.startswith("tokenizer") or p.suffix == ".jinja"}
     monitoring = stage == 'gad' and (cfg.get('actor_reward.fp32') or cfg.get('actor_reward.scorer_monitor'))
     enabled = rubric or replay or monitoring
+    extension_code_hash = getattr(cfg, "_recovery_code_hash", None)
+    if not extension_code_hash:
+        extension_code_hash = deployed_code_identity(cfg, stage)["extension_code_hash"]
     state = {"enabled": enabled, "stage": stage, "start_step": start_step,
              "max_invocation_steps": cfg.get("run.max_stage_steps"),
              "sampling_seed": cfg.get("rollout.seed"),
              'scorer_identity': {key[13:]: value for key, value in cfg.data.items() if key.startswith('scoring.math.')},
              "token_identity": digest({"tokenizer": token_files, "thinking": cfg.get("rollout.enable_thinking")}),
              "teacher_index": cfg.get("data.teacher_index"),
-             "identity": digest({"declared": declared, "code": getattr(cfg, "_recovery_code_hash", None) or deployed_code_identity(cfg,stage)["extension_code_hash"], "stage": stage,
+             "identity": digest({"declared": declared, "code": extension_code_hash, "stage": stage,
                                  "scorer": {key: value for key, value in cfg.data.items() if key.startswith('scoring.math.')},
                                  "train_data": file_hash(cfg.require("data.train_file")),
                                  "judge": driver.get("judge_fingerprint"),
@@ -464,9 +469,11 @@ def hydra_overrides(cfg, stage, out_dir, start_step):
         if isinstance(value, list):
             return "[" + ",".join(encode(v) for v in value) + "]"
         return json.dumps(value, ensure_ascii=False)
-    return [f"trainer.rubric={encode(driver)}", f"critic.rubric={encode(worker)}",
+    extra = (["++trainer.warmup_forward_diagnostics=true"]
+             if stage == "warmup" and cfg.get("execution.warmup_forward_diagnostics") else [])
+    return extra + [f"trainer.rubric={encode(driver)}", f"critic.rubric={encode(worker)}",
             f"trainer.critic_replay={encode(replay_config)}", f"trainer.gad_extensions={encode(state)}",
-            f"critic.extensions_code_hash={getattr(cfg, '_recovery_code_hash', None) or deployed_code_identity(cfg,stage)['extension_code_hash']}",
+            f"critic.extensions_code_hash={extension_code_hash}",
             f"critic.extensions_enabled={str(enabled).lower()}",
             f"data.gad_extensions.enabled={str(enabled).lower()}",
             f"actor_rollout_ref.rollout.gad_extensions.enabled={str(enabled).lower()}",

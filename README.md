@@ -21,7 +21,7 @@
 ```bash
 cd /你的项目路径/bloxopd/LMOps
 export GAD_PYTHON="$(command -v python)"
-bash scripts/train.sh --model qwen3_0.6b --dataset dapo_math_17k --name trial --dry-run
+bash scripts/train.sh --model qwen3_0.6b --dataset dapo_math_17k_v2 --name trial --dry-run
 ```
 
 这是检查命令，不是 H200 已验证的训练配置。新机还需要下载模型、补齐数据、重建 Critic 初始化并设置机器资源。
@@ -34,7 +34,9 @@ bash scripts/train.sh --model qwen3_0.6b --dataset dapo_math_17k --name trial --
 - [整体实现与实验记录](docs/20261105/GAD与Rubric整体实现及n4实验记录_20261112.md)
 - [三组对照方案](docs/20261105/GAD_n4三组对照实施方案.md)
 
-这三份配置仍描述本机从旧 Warmup271 开始的实验，只做了路径可移植化，没有偷偷改成从零训练。H200 完整重跑需按迁移计划生成新配置、替换初始化来源，Actor 正式参数需先完成 naive 选参确认。
+这三份配置仍描述源机从旧 Warmup271 开始的实验，保留用于历史复现。
+
+H200 新实验使用 [baseline](configs/h200_baseline_n4.yaml)、[naive](configs/h200_naive_n4.yaml)、[Actor](configs/h200_actor_n4.yaml)。0.6B baseline 已通过环境安装、训练/恢复、导出外评和正式形状一步对照，采用 rollout 0.40/并发128/Critic microbatch4；正式输出已设为用户确认的 `/tmp/bloxopd_h200_runs`，短测权重已获授权清理，正式训练尚未启动。rubric 共卡尚未实测，Actor 正式参数仍需新 naive 选参确认。安装顺序、实测边界和保存策略见 [H200 适配说明](environments/H200_SETUP.md)。
 
 ## 配置路径与迁移
 

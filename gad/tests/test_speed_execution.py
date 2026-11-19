@@ -14,6 +14,8 @@ from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path[:0] = [str(ROOT), str(ROOT / 'gad/tools'), str(ROOT / 'gad/tests')]
+if os.environ.get('GAD_TEST_EXTENSION_ROOT'):
+    sys.path.insert(0, str(Path(os.environ['GAD_TEST_EXTENSION_ROOT']) / 'gad'))
 import torch
 from torch.utils.data import RandomSampler
 from torchdata.stateful_dataloader import StatefulDataLoader
@@ -221,11 +223,29 @@ class RuntimeTests(unittest.TestCase):
     def test_teacher_extraction_matches_main_cache_keys_including_eos_and_visibility(self):
         with tempfile.TemporaryDirectory() as d:
             rt, batch, gen, raw = self.fixture(d)
-            pre = teacher_pairs(gen, raw, rt.trainer.tokenizer, 'tok', 272, 'gad', 4)
+            tokenizer = rt.trainer.tokenizer
+            with patch.object(tokenizer, 'decode', wraps=tokenizer.decode) as decode:
+                pre = teacher_pairs(gen, raw, tokenizer, 'tok', 272, 'gad', 4)
+            self.assertEqual(len(gen), sum(call.kwargs['skip_special_tokens'] for call in decode.call_args_list))
+            self.assertEqual(2 * len(gen), decode.call_count)
             fresh = rt._fresh_pairs(batch, 272)
             rt._attach_teacher_source(pre)
             self.assertEqual([rt.rubric.cache_key(p, 'teacher') for p in fresh],
                              [rt.rubric.cache_key(p, 'teacher') for p in pre])
+            rt.close()
+
+    def test_teacher_provenance_without_dataset_index_uses_expanded_occurrences(self):
+        with tempfile.TemporaryDirectory() as d:
+            rt, batch, gen, raw = self.fixture(d)
+            del raw.non_tensor_batch['extra_info']
+            del batch.non_tensor_batch['extra_info']
+            rt.teacher_provenance = {'1': {'truncated': True}}
+            pre = teacher_pairs(gen, raw, rt.trainer.tokenizer, 'tok', 272, 'gad', 4)
+            fresh = rt._fresh_pairs(batch, 272)
+            rt._attach_teacher_source(pre)
+            for old, new in zip(fresh, pre, strict=True):
+                self.assertEqual((old['source_index'], old['prompt_id'], old['teacher']),
+                                 (new['source_index'], new['prompt_id'], new['teacher']))
             rt.close()
 
     def test_full_prefetch_early_submit_wait_commit_lifecycle(self):
