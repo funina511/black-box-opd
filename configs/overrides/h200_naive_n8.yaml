@@ -1,0 +1,9 @@
+# Apply to configs/h200_baseline_n8.yaml for naive rubric Warmup and GAD.
+run.run_id: h200_naive_06b_17k_n8
+run.output_root: ../../runs
+resources.allow_judge_gpu_sharing: true
+rubric.enabled: true
+rubric.process_sampling.max_unique_per_global_minibatch: 64
+rubric.actor_reward_shadow: true
+execution.teacher_prefetch: true
+execution.early_annotation: true

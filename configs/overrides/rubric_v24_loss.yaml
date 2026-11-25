@@ -1,0 +1,7 @@
+# Phase B / formal B and C: identical normalization and correctness coefficient.
+rubric:
+  loss_mode: fixed_dimension_gated
+  count_gate_tau: 4
+  loss_coef: 0.1
+  gradient_diagnostics_interval: 100
+  gradient_diagnostics_max_pairs: 4

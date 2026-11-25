@@ -1,0 +1,227 @@
+--- a/verl/utils/dataset/rl_dataset.py
++++ b/verl/utils/dataset/rl_dataset.py
+@@ -230,10 +230,8 @@
+         row_dict: dict = self.dataframe[item]
+         messages = self._build_messages(row_dict)
+         
+-        teacher_response = None
+-        if 'teacher_response' in row_dict:
+-            teacher_response = row_dict.pop('teacher_response')
+-        
++        row_dict.pop("teacher_response", None)
++
+         model_inputs = {}
+ 
+         if self.processor is not None:
+@@ -282,11 +280,6 @@
+             input_ids = model_inputs.pop("input_ids")
+             attention_mask = model_inputs.pop("attention_mask")
+         
+-        if teacher_response is not None:
+-            teacher_response = self.tokenizer(teacher_response, return_tensors="pt", add_special_tokens=False)
+-            if self.gad_extensions_enabled:
+-                row_dict['gad_teacher_token_truncated'] = bool(teacher_response['input_ids'].shape[-1] > self.max_response_length)
+-
+         if self.gad_extensions_enabled:
+             row_dict['gad_prompt_truncated'] = bool(input_ids.shape[-1] > self.max_prompt_length)
+         if not self.processor_type == "MiniCPMVImageProcessor":
+@@ -298,17 +291,6 @@
+                 left_pad=True,
+                 truncation=self.truncation,
+             )
+-            if teacher_response is not None:
+-                teacher_response_ids, _ = verl_F.postprocess_data(
+-                    input_ids=teacher_response["input_ids"],
+-                    attention_mask=teacher_response["attention_mask"],
+-                    max_length=self.max_response_length,
+-                    pad_token_id=self.tokenizer.eos_token_id, # it is a response, so use eos token to pad
+-                    left_pad=False, # it is a response, so pad from right side
+-                    truncation=self.truncation,
+-                )
+-                teacher_response_ids = teacher_response_ids.long()
+-
+             if self.processor is not None and "Qwen2VLImageProcessor" in self.processor.image_processor.__class__.__name__:
+                 from verl.models.transformers.qwen2_vl import get_rope_index
+ 
+@@ -329,8 +311,6 @@
+             row_dict["input_ids"] = input_ids[0]
+             row_dict["attention_mask"] = attention_mask[0]
+             row_dict["position_ids"] = position_ids[0]
+-            if teacher_response is not None:
+-                row_dict["teacher_response"] = teacher_response_ids[0]
+         else:
+             row_dict["input_ids"] = input_ids
+             row_dict["attention_mask"] = attention_mask
+--- a/verl/trainer/main_ppo.py
++++ b/verl/trainer/main_ppo.py
+@@ -121,7 +121,6 @@
+         # Map roles to their corresponding remote worker classes.
+         role_worker_mapping = {
+             Role.ActorRollout: ray.remote(actor_rollout_cls),
+-            Role.Critic: ray.remote(CriticWorker),
+         }
+ 
+         # Define the resource pool specification.
+@@ -132,7 +131,6 @@
+         }
+         mapping = {
+             Role.ActorRollout: global_pool_id,
+-            Role.Critic: global_pool_id,
+         }
+ 
+         # We should adopt a multi-source reward function here:
+--- a/verl/trainer/ppo/ray_trainer.py
++++ b/verl/trainer/ppo/ray_trainer.py
+@@ -511,8 +511,6 @@
+             self.use_critic = False
+         else:
+             raise NotImplementedError
+-        # NOTE: we hack critic as reward model. so always use critic
+-        self.use_critic = True
+ 
+         self._validate_config()
+         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
+@@ -820,7 +818,7 @@
+             input_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in input_ids]
+             sample_inputs.extend(input_texts)
+ 
+-            batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids", "teacher_response"]
++            batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
+             non_tensor_batch_keys_to_pop = ["raw_prompt_ids"]
+             if "multi_modal_data" in test_batch.non_tensor_batch:
+                 non_tensor_batch_keys_to_pop.append("multi_modal_data")
+@@ -861,10 +859,9 @@
+ 
+             # Store generated outputs
+             output_ids = test_output_gen_batch.batch["responses"]
+-            teacher_ids = test_output_gen_batch.batch["teacher_response"]
+             _gad_tick = time.perf_counter()
+             output_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in output_ids]
+-            teacher_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in teacher_ids] if rouge_enabled else []
++            teacher_texts = []
+             sample_outputs.extend(output_texts)
+             teacher_outputs.extend(teacher_texts)
+             _gad_timing["decode"] += time.perf_counter() - _gad_tick
+@@ -1120,10 +1117,9 @@
+             from verl.experimental.gad_extensions.checkpoint_state import save
+             save(self.gad_extensions, local_global_step_folder)
+-        # latest checkpointed iteration tracker (for atomic usage)
+-        local_latest_checkpointed_iteration = os.path.join(self.config.trainer.default_local_dir, "latest_checkpointed_iteration.txt")
+-        with open(local_latest_checkpointed_iteration, "w") as f:
+-            f.write(str(self.global_steps))
++        from verl.trainer.ppo.rlvr_checkpoint import commit_checkpoint
++        commit_checkpoint(self.config.trainer.default_local_dir, self.global_steps,
++                          self.config.trainer.rlvr_eval_steps)
+ 
+     def _load_checkpoint(self):
+         if self.config.trainer.resume_mode == "disable":
+             return 0
+@@ -1295,7 +1291,7 @@
+                 batch: DataProto = DataProto.from_single_dict(batch_dict)
+ 
+                 # pop those keys for generation
+-                batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids", "teacher_response"]
++                batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
+                 non_tensor_batch_keys_to_pop = ["raw_prompt_ids"]
+                 if "multi_modal_data" in batch.non_tensor_batch:
+                     non_tensor_batch_keys_to_pop.append("multi_modal_data")
+@@ -1408,13 +1404,14 @@
+                                 ref_log_prob = self.actor_rollout_wg.compute_ref_log_prob(batch)
+                             batch = batch.union(ref_log_prob)
+ 
+-                    # NOTE: we use critic to calculate score of student here
++                    # RLVR uses the verified final answer of each student rollout.
+                     with (self.gad_extensions.timed_phase(marked_timer, "reward", timing_raw, color="yellow") if self.gad_extensions is not None else marked_timer("reward", timing_raw, color="yellow")):
+                         future_reward = None
+                         reward_extra_infos_dict = {}
+-                        values = self.critic_wg.compute_values(batch)
+-                        batch = batch.union(values)
+-                        reward_tensor = batch.batch["values"]
++                        from verl.trainer.ppo.rlvr_reward import verified_rewards
++                        scorer = _gad_load_math_scorer(_gad_math_scorer_path(self.config))
++                        reward_tensor, reward_metrics = verified_rewards(batch, self.tokenizer, scorer)
++                        metrics.update(reward_metrics)
+                         # reward_tensor: (bsz, response_length)
+ 
+                     with (self.gad_extensions.timed_phase(marked_timer, "adv", timing_raw, color="brown") if self.gad_extensions is not None else marked_timer("adv", timing_raw, color="brown")):
+@@ -1500,7 +1497,9 @@
+                                 last_val_metrics = val_metrics
+                         metrics.update(val_metrics)
+ 
+-                    if is_last_step or extension_stop or (self.config.trainer.save_freq > 0 and self.global_steps % self.config.trainer.save_freq == 0):
++                    periodic_save = self.config.trainer.save_freq > 0 and self.global_steps % self.config.trainer.save_freq == 0
++                    eval_save = self.global_steps in self.config.trainer.rlvr_eval_steps
++                    if is_last_step or extension_stop or periodic_save or eval_save:
+                         with (self.gad_extensions.timed_phase(marked_timer, "save_checkpoint", timing_raw, color="green") if self.gad_extensions is not None else marked_timer("save_checkpoint", timing_raw, color="green")):
+                             self._save_checkpoint()
+ 
+--- a/verl/utils/checkpoint/fsdp_checkpoint_manager.py
++++ b/verl/utils/checkpoint/fsdp_checkpoint_manager.py
+@@ -143,6 +143,9 @@
+ 
+         # wait for everyone to load checkpoints
+         torch.distributed.barrier()
++        if self.rank == 0:
++            from verl.trainer.ppo.rlvr_checkpoint import saved_actor_paths
++            self.previous_saved_paths = saved_actor_paths(local_path)
+ 
+     def save_checkpoint(self, local_path: str, hdfs_path: str = None, global_step: int = 0, max_ckpt_to_keep=None):
+         """
+--- a/verl/workers/rollout/vllm_rollout/vllm_rollout_spmd.py
++++ b/verl/workers/rollout/vllm_rollout/vllm_rollout_spmd.py
+@@ -278,7 +278,6 @@
+         # used to construct attention_mask
+         eos_token_id = prompts.meta_info["eos_token_id"]
+ 
+-        teacher_response = prompts.batch["teacher_response"]
+ 
+         batch_size = idx.size(0)
+ 
+@@ -369,7 +368,6 @@
+                 idx = _repeat_interleave(idx, self.sampling_params.n)
+                 attention_mask = _repeat_interleave(attention_mask, self.sampling_params.n)
+                 position_ids = _repeat_interleave(position_ids, self.sampling_params.n)
+-                teacher_response = _repeat_interleave(teacher_response, self.sampling_params.n)
+                 batch_size = batch_size * self.sampling_params.n
+                 # NOTE(linjunrong): for multi-turn https://github.com/volcengine/verl/pull/1037
+                 if "tools_kwargs" in non_tensor_batch.keys():
+@@ -380,7 +378,6 @@
+                     non_tensor_batch["raw_prompt"] = _repeat_interleave(non_tensor_batch["raw_prompt"], self.sampling_params.n)
+ 
+             seq = torch.cat([idx, response], dim=-1)
+-            teacher_seq = torch.cat([idx, teacher_response], dim=-1)
+ 
+         # for student
+         response_length = response.size(1)
+@@ -388,20 +385,11 @@
+         delta_position_id = delta_position_id.unsqueeze(0).expand(batch_size, -1)
+         if position_ids.dim() == 3:  # qwen2vl mrope
+             delta_position_id = delta_position_id.view(batch_size, 1, -1).expand(batch_size, 3, -1)
+-        # for teacher
+-        teacher_response_length = teacher_response.size(1)
+-        teacher_delta_position_id = torch.arange(1, teacher_response_length + 1, device=position_ids.device)
+-        teacher_delta_position_id = teacher_delta_position_id.unsqueeze(0).expand(batch_size, -1)
+ 
+         # TODO(sgm): fix position_ids on right_pad
+         # prompt: left pad + response: right pad
+         # attention_mask: [0,0,0,0,1,1,1,1, | 1,1,1,0,0,0,0,0]
+         # position_ids:   [0,0,0,0,0,1,2,3, | 4,5,6,7,8,9,10,11]
+-        # for teacher
+-        teacher_response_position_ids = position_ids[..., -1:] + teacher_delta_position_id
+-        teacher_position_ids = torch.cat([position_ids, teacher_response_position_ids], dim=-1)
+-        teacher_response_attention_mask = get_response_mask(response_id=teacher_response, eos_token=eos_token_id, dtype=attention_mask.dtype)
+-        teacher_attention_mask = torch.cat((attention_mask, teacher_response_attention_mask), dim=-1)
+         # for student
+         response_position_ids = position_ids[..., -1:] + delta_position_id
+         position_ids = torch.cat([position_ids, response_position_ids], dim=-1)
+@@ -418,10 +406,6 @@
+             "input_ids": seq,  # here input_ids become the whole sentences
+             "attention_mask": attention_mask,
+             "position_ids": position_ids,
+-            "teacher_response": teacher_response,
+-            "teacher_input_ids": teacher_seq,  # here input_ids become the whole sentences
+-            "teacher_attention_mask": teacher_attention_mask,
+-            "teacher_position_ids": teacher_position_ids,
+         }
+         if self.shuffle_before_dispatch:
+             batch_dict['indices_before_dispatch'] = prompts.batch['indices_before_dispatch']

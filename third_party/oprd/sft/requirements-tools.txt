@@ -1,0 +1,10 @@
+# Install these into the vLLM/preparation environment if they are not already
+# provided by the existing verl environment. Install vLLM separately using the
+# wheel/version matched to that server's CUDA and PyTorch stack.
+pandas
+pyarrow>=19.0.0
+wandb
+sympy
+pylatexenc
+latex2sympy2_extended
+math_verify

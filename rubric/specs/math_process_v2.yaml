@@ -1,0 +1,38 @@
+version: math_process_v2
+schema_version: rubric.events.v2.6
+input_protocol: rubric.input.v2.4
+head_layout: [adv, answer_correctness, verified_progress, unresolved_error_severity]
+verified_progress:
+  "0": 无可验证且与目标相关的实质进展；复述、计划、重复不增加进展。
+  "0.5": 有独立正确的中间结论或有效修复，但不足以解决目标。
+  "1": 可见推导已充分解决目标；接受不同有效解法、简洁推导和常规省略。
+unresolved_error_severity:
+  "0": 充分检查可见数学内容后，无影响推导的未修复错误；不要求整题已完成。
+  "0.5": 确有局部错误，核心路线仍有效；按数学后果判断，不以修复难度判断，不是不确定。
+  "1": 确有使关键路线或结论失效的未修复错误；正确步骤不能抵消它。
+unknown: 不能可靠判断时 value=null 且 valid=false，分别处理两维，不猜测分数。
+checks:
+  - 检查建模、目标相关性、代数逻辑、定义域、除法/开方/对数合法性、关键假设、分支和穷尽性；已由上下文保证的条件无需重述。
+  - 保留错误前独立成立的进展；从错误前提出发的局部计算不能算可靠进展。
+  - 合法条件下的未完成分支不是错误；无条件非法运算并声称穷尽才是已发生错误。
+  - 修复须在回答原文实际识别失效结果、给出正确替代、恢复相关推导且不再依赖旧错；空泛声称修复无效，judge自己算出的答案不能代替原文证据。
+  - 只评价完整可见内容，不补出缺失推导。截断后的未到达结论不算错误；半截公式局部unknown，不清空独立可靠进展。
+  - 空回答、纯复述或计划的progress可为0，error通常unknown。未发现错误不等于已证明无错误。
+  - analysis_complete表示已完成当前可见材料的必要检查；completion表示整题解答状态，两者独立。
+  - 参考最终答案仅辅助核查，不能用结果对错反推过程；不评价身份、文风、篇幅或与参考路径的相似度。
+evidence_protocol:
+  - 程序按非空物理行提供固定原文片段及s编号，空白无损保留；事件用supporting_span_ranges选择一个或多个片段，不生成quote或行号，原文由程序回填。
+  - 最多四个关键事件，不要求列完每句或每个正确计算；可见内容仍须充分检查，关键错误不得隐去。
+  - 合法片段只说明引用可定位，不证明数学判断正确；trajectory_claim忠实转述原文主张，judge_verification独立说明Judge的核查；核查不能冒充原文进展。
+  - 局部进展保留独立有效事件；未知错误或修复不能支持全局完成与无错判断，辅助neutral失败不清空整维。
+  - corrected_error使用必填error_event_id链接一个explicit_error，修复必须至少包含一个错误证据之外的实际替代推导片段，可同时引用前提和上下文。两者同一行无法结构确证，保守弃判；不同片段也不保证确有修复。
+  - unjudgeable表示确有无法判断的数学内容，阻断全局progress=1与error=0；普通无关说明使用neutral，不阻断独立进展。
+  - parser仅保证结构、原文定位与依赖一致性，不能证明片段蕴含reason。真实替代、约束及自算答案归属须由数学语义审查确认。
+answer_correctness: 由独立math_unified_v1规则评分，不由judge输出。
+
+compact_evidence:
+  representation: inclusive_source_ranges
+  maximum_units_per_event: 8
+  recommended_units: [1, 4]
+  overflow: explicit_capacity_conflict_preserve_raw
+  broad_reference_audit_threshold: 0.8

@@ -1,0 +1,323 @@
+"""CPU checks for config composition and saved-run isolation."""
+import argparse
+import json
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+import yaml
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'tools'))
+from common import PipelineError
+from config import (add_config_arguments, compose_config, load_config, load_run_config,
+                    nested_config, new_run_id, save_run_config, select_config, validate_config)
+from pipeline import stage_signature
+import prune_checkpoints
+from prune_checkpoints import apply_retention, plan_retention
+
+
+class RunConfigTests(unittest.TestCase):
+    def test_flat_config_paths_resolve_from_yaml_not_cwd(self):
+        source = self.root / 'configs' / 'launch.yaml'
+        source.parent.mkdir()
+        source.write_text(yaml.safe_dump({
+            'scoring.math.version': 'math_unified_v1',
+            'scoring.math.entrypoint': '../scoring/math.py',
+            'scoring.math.fingerprint': 'frozen-training-fingerprint',
+            'validation.scorer_path': '../scoring/math.py',
+            'budget.init_from_warmup_run': '../runs/warmup',
+            'run.output_root': '../runs',
+            'models.student': '../assets/models/student',
+        }))
+        cfg = load_config(source)
+        self.assertEqual(cfg.get('validation.scorer_path'), str(self.root / 'scoring/math.py'))
+        self.assertEqual(cfg.get('budget.init_from_warmup_run'), str(self.root / 'runs/warmup'))
+        self.assertEqual(cfg.get('models.student'), str(self.root / 'assets/models/student'))
+
+    def test_warmup_run_name_keeps_alias_lookup(self):
+        from config import resolve_paths
+        for name in ('qwen3_0.6b_17k', 'new_warmup_run'):
+            resolved = resolve_paths({'budget.init_from_warmup_run': name}, self.root)
+            self.assertEqual(resolved['budget.init_from_warmup_run'], name)
+
+    def test_unified_scorer_without_explicit_validation_path(self):
+        source = self.root / 'unified.yaml'
+        source.write_text(yaml.safe_dump({
+            'scoring.math.version': 'math_unified_v1',
+            'scoring.math.entrypoint': 'scoring/math.py',
+            'scoring.math.fingerprint': 'frozen-training-fingerprint',
+        }))
+        cfg = load_config(source)
+        self.assertEqual(cfg.get('validation.scorer_path'), str(self.root / 'scoring/math.py'))
+
+    def test_frozen_scorer_paths_can_point_to_another_checkout(self):
+        scorer = str(self.root / 'other_checkout/scoring/math.py')
+        saved = self.root / 'frozen.yaml'
+        data = {'scoring.math.version': 'math_unified_v1',
+                'scoring.math.entrypoint': scorer,
+                'scoring.math.fingerprint': 'frozen-training-fingerprint',
+                'validation.scorer_path': scorer}
+        saved.write_text(yaml.safe_dump(data))
+        before = saved.read_bytes()
+        cfg = load_config(saved)
+        self.assertEqual(cfg.get('validation.scorer_path'), scorer)
+        self.assertEqual(cfg.get('scoring.math.fingerprint'), 'frozen-training-fingerprint')
+        self.assertEqual(saved.read_bytes(), before)
+        data['validation.scorer_path'] = str(self.root / 'different.py')
+        saved.write_text(yaml.safe_dump(data))
+        with self.assertRaisesRegex(PipelineError, 'scorer_path conflicts'):
+            load_config(saved)
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        self.template = self.root / 'train.yaml'
+        self.raw = {
+            'selection': {'model': 'small', 'dataset': 'full'},
+            'catalog': {
+                'models': {'small': {'models': {'student': 'models/small'}},
+                           'large': {'models': {'student': 'models/large'}}},
+                'datasets': {name: {'data': {'train_file': f'data/{name}/train.parquet',
+                                            'val_file': f'data/{name}/dev.parquet',
+                                            'manifest': f'data/{name}/manifest.json',
+                                            'teacher_index': f'data/{name}/index.jsonl',
+                                            'expected_fingerprint_digest': name},
+                                    'validation': {'quick_file': f'data/{name}/quick.parquet'}}
+                             for name in ('full', 'subset')},
+            },
+            'run': {'output_root': 'runs', 'run_id': 'auto'},
+            'backends': {'root': 'backends'},
+            'data': {'train_batch_size': 64},
+            'budget': {'stage_epochs': {'seqkd': 2, 'warmup': 1, 'gad': 2}},
+            'rollout': {'n': 2},
+            'optim': {'gad_actor_lr': 1e-6},
+        }
+        self.write_template()
+
+    def write_template(self):
+        self.template.write_text(yaml.safe_dump(self.raw))
+
+    def arguments(self, *values):
+        parser = argparse.ArgumentParser()
+        add_config_arguments(parser)
+        return parser.parse_args(values)
+
+    def saved_run(self):
+        cfg = compose_config(self.template)
+        cfg.data['run.run_id'] = 'example'
+        run = self.root / 'runs/example'
+        save_run_config(cfg, run)
+        return cfg, run
+
+    def test_model_and_dataset_switch_together(self):
+        cfg = compose_config(self.template, model='large', dataset='subset')
+        self.assertEqual(cfg.get('models.student'), str(self.root / 'models/large'))
+        self.assertEqual(cfg.get('models.discriminator_init'), cfg.get('models.student'))
+        for key, filename in [('train_file', 'train.parquet'), ('manifest', 'manifest.json'),
+                              ('teacher_index', 'index.jsonl')]:
+            self.assertEqual(cfg.get('data.' + key), str(self.root / 'data/subset' / filename))
+        self.assertEqual(cfg.get('data.expected_fingerprint_digest'), 'subset')
+        self.assertEqual(cfg.get('validation.quick_file'), str(self.root / 'data/subset/quick.parquet'))
+        self.assertEqual(cfg.get('run.output_root'), str(self.root / 'runs'))
+        self.assertFalse(any(key.startswith('catalog.') for key in cfg.data))
+
+    def test_override_priority_and_relative_paths(self):
+        folder = self.root / 'choices'
+        folder.mkdir()
+        override = folder / 'small.yaml'
+        override.write_text('rollout:\n  n: 4\ndata:\n  train_file: ./local.parquet\n')
+        cfg = compose_config(self.template, overrides=[str(override)], settings=['rollout.n=6'])
+        self.assertEqual(cfg.get('rollout.n'), 6)
+        self.assertEqual(cfg.get('data.train_file'), str(folder / 'local.parquet'))
+
+    def test_unknown_model_and_mistyped_override_fail(self):
+        with self.assertRaises(PipelineError):
+            compose_config(self.template, model='missing')
+        with self.assertRaises(PipelineError):
+            compose_config(self.template, settings=['rollout.nn=4'])
+
+    def test_flat_and_nested_configs_round_trip(self):
+        cfg = compose_config(self.template)
+        flat = self.root / 'flat.yaml'
+        nested = self.root / 'nested.yaml'
+        flat.write_text(yaml.safe_dump(cfg.data))
+        nested.write_text(yaml.safe_dump(nested_config(cfg.data)))
+        self.assertEqual(load_config(flat).data, load_config(nested).data)
+
+    def test_saved_run_ignores_future_global_changes(self):
+        cfg, run = self.saved_run()
+        self.raw['optim']['gad_actor_lr'] = 3e-5
+        self.write_template()
+        self.assertEqual(load_run_config(run).get('optim.gad_actor_lr'), 1e-6)
+        self.assertEqual(compose_config(self.template).get('optim.gad_actor_lr'), 3e-5)
+        with self.assertRaises(PipelineError):
+            save_run_config(compose_config(self.template), run)
+        self.assertEqual(load_run_config(run).get('optim.gad_actor_lr'), 1e-6)
+
+    def test_resume_rejects_training_changes_and_preserves_identity_for_gpu_change(self):
+        cfg, run = self.saved_run()
+        before = stage_signature(load_run_config(run), 'seqkd')['signature']
+        with self.assertRaises(PipelineError):
+            select_config(self.arguments('--run', str(run), '--set', 'rollout.n=8'))
+        changed = select_config(self.arguments('--run', str(run), '--set', 'resources.gpus=6,7'))
+        self.assertEqual(changed.get('resources.gpus'), '6,7')
+        self.assertEqual(stage_signature(changed, 'seqkd')['signature'], before)
+        self.assertEqual(load_run_config(run).get('resources.gpus'), '')
+
+    def test_resume_conflicting_selectors_fail(self):
+        _, run = self.saved_run()
+        with self.assertRaises(PipelineError):
+            select_config(self.arguments('--run', str(run), '--dataset', 'subset'))
+
+    def test_historical_stage_configs_remain_distinct(self):
+        cfg, run = self.saved_run()
+        raw = yaml.safe_load((run / 'train.yaml').read_text())
+        raw['_stage_overrides'] = {'seqkd': {'rollout': {'n': 8},
+                                           'budget': {'stage_epochs': {'gad': 4}}}}
+        (run / 'train.yaml').write_text(yaml.safe_dump(raw))
+        restored = load_run_config(run)
+        self.assertEqual(restored.get('rollout.n'), 2)
+        self.assertEqual(restored.for_stage('seqkd').get('rollout.n'), 8)
+        self.assertEqual(restored.for_stage('seqkd').stage_epochs('gad'), 4)
+        self.assertNotIn('_stage_overrides', restored.data)
+
+    def test_run_names_are_unique_and_invalid_label_fails(self):
+        cfg = compose_config(self.template)
+        self.assertNotEqual(new_run_id(cfg, 'trial'), new_run_id(cfg, 'trial'))
+        with self.assertRaises(PipelineError):
+            new_run_id(cfg, '../escape')
+
+    def test_invalid_epoch_budgets_fail_validation(self):
+        cfg = compose_config(self.template, settings=['budget.stage_epochs.gad=1'])
+        self.assertTrue(any('GAD absolute' in message for message in validate_config(cfg)))
+        cfg = compose_config(self.template, settings=['budget.stage_epochs.seqkd=2.5'])
+        self.assertTrue(any('positive integer' in message for message in validate_config(cfg)))
+
+    def test_retention_keeps_five_saves_exports_and_in_progress_checkpoint(self):
+        stage = self.root / 'seqkd'
+        stage.mkdir()
+        for step in range(50, 351, 50):
+            checkpoint = stage / f'global_step_{step}'
+            actor = checkpoint / 'actor'
+            actor.mkdir(parents=True)
+            for name in ('model_world_size_1_rank_0.pt', 'optim_world_size_1_rank_0.pt',
+                         'extra_state_world_size_1_rank_0.pt', 'config.json', 'tokenizer.json'):
+                (actor / name).write_bytes(b'{}')
+            (checkpoint / 'data.pt').write_bytes(b'cursor')
+        exported = stage / 'global_step_50/actor/huggingface'
+        exported.mkdir()
+        (exported / 'model.safetensors').touch()
+        (stage / 'global_step_400').mkdir()
+        marker = stage / 'latest_checkpointed_iteration.txt'
+        marker.write_text('350')
+        with patch.object(prune_checkpoints, 'verify_checkpoint_dir', wraps=prune_checkpoints.verify_checkpoint_dir) as check:
+            plan = plan_retention(stage, keep_checkpoints=5)
+        inspected = [call.args[0] for call in check.call_args_list]
+        self.assertEqual(inspected.count(stage / 'global_step_350'), 1)
+        self.assertEqual(plan['recent_steps'], [150, 200, 250, 300, 350])
+        self.assertEqual([Path(path).name for path in plan['delete']], ['global_step_100'])
+        apply_retention(stage, keep_checkpoints=5)
+        self.assertTrue(exported.exists())
+        self.assertTrue((stage / 'global_step_400').exists())
+        self.assertFalse((stage / 'global_step_100').exists())
+        (stage / 'global_step_350/data.pt').unlink()
+        self.assertEqual(plan_retention(stage, keep_checkpoints=1)['delete'], [])
+
+    def test_retention_one_save_preserves_warmup_handoff_and_in_progress_save(self):
+        def complete(stage, step):
+            checkpoint = self.root / stage / f'global_step_{step}'
+            for role in ('actor', 'critic'):
+                directory = checkpoint / role
+                directory.mkdir(parents=True)
+                for name in ('model_world_size_1_rank_0.pt', 'optim_world_size_1_rank_0.pt',
+                             'extra_state_world_size_1_rank_0.pt', 'config.json', 'tokenizer.json'):
+                    (directory / name).write_bytes(b'{}')
+            (checkpoint / 'data.pt').write_bytes(b'cursor')
+            return checkpoint
+
+        warmup = complete('warmup', 271)
+        handoff = complete('gad', 271)
+        old = complete('gad', 300)
+        latest = complete('gad', 350)
+        exported = handoff / 'actor/huggingface'
+        exported.mkdir()
+        (exported / 'model.safetensors').touch()
+        stage = latest.parent
+        (stage / 'latest_checkpointed_iteration.txt').write_text('350')
+        pending = stage / 'global_step_400'
+        pending.mkdir()
+
+        tokenizer = latest / 'actor/tokenizer.json'
+        tokenizer.unlink()
+        self.assertEqual([], prune_checkpoints.verify_checkpoint_dir(latest, roles=('actor', 'critic')))
+        self.assertEqual([], plan_retention(stage, keep_checkpoints=1)['delete'])
+        tokenizer.write_text('{}')
+        plan = apply_retention(stage, keep_checkpoints=1)
+        self.assertEqual(plan['recent_steps'], [350])
+        self.assertEqual(plan['delete'], [str(old)])
+        self.assertFalse(old.exists())
+        for retained in (warmup, handoff, latest, pending, exported):
+            self.assertTrue(retained.exists(), str(retained))
+
+        # A newly announced but incomplete save must not remove the last usable one.
+        (stage / 'latest_checkpointed_iteration.txt').write_text('400')
+        self.assertEqual(apply_retention(stage, keep_checkpoints=1)['delete'], [])
+        self.assertTrue(latest.exists())
+
+    def test_rubric_retention_retries_repaired_checkpoint_and_skips_idle_verification(self):
+        from hashlib import sha256
+
+        stage = self.root / 'gad'
+        old, latest = (stage / f'global_step_{s}' for s in (50, 100))
+        old.mkdir(parents=True)
+        for role in ('actor', 'critic'):
+            directory = latest / role
+            directory.mkdir(parents=True)
+            for rank in range(2):
+                for kind in ('model', 'optim', 'extra_state'):
+                    (directory / f'{kind}_world_size_2_rank_{rank}.pt').write_bytes(b'state')
+            (directory / 'config.json').write_text('{}')
+            (directory / 'tokenizer.json').write_text('{}')
+        (latest / 'data.pt').write_bytes(b'cursor')
+        (stage / 'latest_checkpointed_iteration.txt').write_text('100')
+        requirements = dict(keep_checkpoints=1, extensions_required=True, world_size=2)
+        self.assertIn('training_extensions missing', plan_retention(stage, **requirements)['reason'])
+        extension = latest / 'training_extensions'
+        extension.mkdir()
+        manifest = extension / 'manifest.json'
+        files = {}
+        for name in ('sampling_rng.pt', 'rubric_state.json'):
+            (extension / name).write_bytes(b'{}')
+            files[name] = sha256(b'{}').hexdigest()
+        manifest.write_text(json.dumps({'files': files, 'world_size': 2}))
+        (latest / 'checkpoint_complete.json').write_text(json.dumps({'manifest_hash': sha256(manifest.read_bytes()).hexdigest()}))
+        for path in (latest / 'critic/extra_state_world_size_2_rank_1.pt',
+                     latest / 'actor/optim_world_size_2_rank_0.pt', latest / 'data.pt'):
+            contents = path.read_bytes()
+            path.write_bytes(b'')
+            self.assertEqual([], apply_retention(stage, **requirements)['delete'])
+            self.assertTrue(old.exists())
+            path.write_bytes(contents)
+        missing = latest / 'actor/model_world_size_2_rank_1.pt'
+        missing.unlink()
+        self.assertEqual([], apply_retention(stage, **requirements)['delete'])
+        missing.write_bytes(b'shard')
+        saved_plan = plan_retention(stage, **requirements)
+        self.assertEqual([str(old)], saved_plan['delete'])
+        marker = stage / 'COMPLETED.json'
+        marker.write_text(json.dumps({'verified': {'ok': True, 'last_step': 50}}))
+        with patch.object(prune_checkpoints, 'plan_retention', return_value=saved_plan):
+            self.assertEqual([], apply_retention(stage, **requirements)['delete'])
+        self.assertTrue(old.exists())
+        marker.unlink()
+        self.assertEqual([str(old)], apply_retention(stage, **requirements)['delete'])
+        with patch.object(prune_checkpoints, 'verify_checkpoint_dir') as check:
+            self.assertEqual([], apply_retention(stage, **requirements)['delete'])
+            check.assert_not_called()
+
+
+if __name__ == '__main__':
+    unittest.main()

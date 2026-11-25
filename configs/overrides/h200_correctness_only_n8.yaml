@@ -1,0 +1,5 @@
+# Apply to configs/h200_baseline_n8.yaml for local correctness supervision.
+# The four-head Critic learns BT and c; the GAD Actor uses the adv head.
+run.run_id: h200_correctness_only_06b_17k_n8
+rubric.enabled: true
+rubric.mode: correctness_only

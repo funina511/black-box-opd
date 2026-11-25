@@ -1,0 +1,45 @@
+version: math_v1
+input_mode: implicit_fixed
+dimensions:
+  answer_correctness:
+    values: [0, 1]
+    definition: 使用 CARD Answer 评分器的 acc；保存解析状态，±1 score 不作为标签。
+  reasoning_validity:
+    values: [0, 0.5, 1]
+    definition: 可见数学推导是否成立并支持回答结论。
+    anchors:
+      "0": 存在影响结论的实质错误或没有所需推理证据。
+      "0.5": 有可核查的有效进展，但关键论证不完整。
+      "1": 主要推导有效，足以支持所给结论；允许常规代数省略及不同解法。
+  condition_coverage:
+    values: [0, 0.5, 1]
+    definition: 题目必要条件、分支与边界是否充分处理。
+    anchors:
+      "0": 忽略关键条件并影响结论。
+      "0.5": 部分条件得到处理，仍有实质缺漏。
+      "1": 必要条件均得到处理；简单题无需额外分类，简洁解法可得满分。
+unknown: 无法判断使用 null 和 valid=false；0.5 不是 unknown。
+rules:
+  - 不根据最终答案正确推定过程正确。
+  - 不根据最终答案错误推定所有过程无效。
+  - 不奖励长度、格式词、教师措辞相似度或反复自纠。
+  - 回答只有最终答案且题目要求推导时，记录缺少过程证据。
+  - 截断回答的过程维度标为 unknown，不评价其未提供的完整证明。
+  - 每个有效过程标签必须提供简短证据，指出对应数学步骤或条件。
+examples:
+  - problem: 解方程 2x+3=7。
+    response: 2x=4，所以 x=2。Answer：2。
+    labels: {reasoning_validity: 1, condition_coverage: 1}
+    note: 常规代数步骤完整，不因简洁扣分。
+  - problem: 在实数中解 x²=4。
+    response: x=2。Answer：2。
+    labels: {reasoning_validity: 0.5, condition_coverage: 0}
+    note: 正根有效但负根遗漏。
+  - problem: 解方程 2x+3=7。
+    response: 因为 7-3=5，所以 x=2.5。Answer：2.5。
+    labels: {reasoning_validity: 0, condition_coverage: 1}
+    note: 计算错误与条件遗漏是不同维度。
+  - problem: 依赖不可辨认的图片且文字无法还原条件。
+    response: 由图可知答案是 3。
+    labels: {reasoning_validity: null, condition_coverage: null}
+    note: 无法核查应当 unknown，不给中间分。

@@ -1,0 +1,14 @@
+version: math_process_v2
+process_protocol: direct_v1
+schema_version: rubric.direct.v1
+input_protocol: rubric.direct.input.v1
+dimensions:
+  answer_correctness: 由冻结的本地数学评分器计算；Judge不输出此字段。
+  verified_progress: 判断可见回答中实际成立的进展。0无实质进展；0.5独立正确中间结果；1充分解决整题；null无法判断。
+  unresolved_error_severity: 判断可见回答中未解决错误。0未发现明确错误；0.5不破坏关键路线的局部错误；1破坏关键路线或结论；null无法判断。
+rules:
+  - 未完成不是过程错误；无数学内容不自动获得无错误标签。
+  - Judge自行推导不能冒充原回答进展或修复。
+  - 兼容不同合法解法，独立判断过程和最终答案。
+review_status: not_requested
+independently_verified: false

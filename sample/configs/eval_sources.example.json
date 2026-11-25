@@ -1,0 +1,35 @@
+{
+  "_comment": "Benchmark sources for prepare_eval_data.py. Every path is local to the machine that runs the evaluation. 'kind' is one of parquet_dir | parquet_file | jsonl | load_from_disk | hf. Leave a path empty to mark the benchmark as unavailable (it is then listed explicitly in eval_manifest.json).",
+  "sources": [
+    {
+      "name": "aime24",
+      "kind": "parquet_dir",
+      "path": "",
+      "split": null
+    },
+    {
+      "name": "aime25",
+      "kind": "load_from_disk",
+      "path": "",
+      "split": "train"
+    },
+    {
+      "name": "amc23",
+      "kind": "parquet_dir",
+      "path": "",
+      "split": null
+    },
+    {
+      "name": "amc24",
+      "kind": "jsonl",
+      "path": "",
+      "split": null
+    },
+    {
+      "name": "math500",
+      "kind": "load_from_disk",
+      "path": "",
+      "split": "test"
+    }
+  ]
+}

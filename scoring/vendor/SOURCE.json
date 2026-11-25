@@ -1,0 +1,18 @@
+{
+  "source": "/mnt/jinbo/RLRM/OPRD/verl/verl/utils/reward_score/ttrl_math/math_utils.py",
+  "oprd_commit": "0e3fbe839e961b342d71a84175ba0e436c5ecce7",
+  "source_sha256": "417e696e9335613bc6a28860c0e86585656cd8a5fd00fcfb48edd95b799dc8cc",
+  "retained_symbols": [
+    "_parse_latex",
+    "_strip_string",
+    "_sympy_parse",
+    "grade_answer_mathd",
+    "mathd_normalize_answer",
+    "unit_texts"
+  ],
+  "license": "Apache-2.0",
+  "adaptation": "fixed extraction and typed strict SymPy grading live in scoring/math.py; legacy broad exception/approximation wrappers not reused",
+  "local_changes": [
+    "Preserve simple exponent grouping before latex2text and insert multiplication around pi to avoid identifier concatenation."
+  ]
+}
