@@ -340,7 +340,8 @@ class MathValidationTests(unittest.TestCase):
             for patch in (backend_patches.ResumeWorkerStatePatch(),
                           backend_patches.MathValidationPatch(),
                           backend_patches.ValidationScopePatch(),
-                          backend_patches.ValidationDiagnosticsPatch()):
+                          backend_patches.ValidationDiagnosticsPatch(),
+                          backend_patches.CheckpointStepsPatch()):
                 patch.apply(expected)
             self.assertEqual((expected / trainer).read_text(encoding="utf-8"), self.source)
 

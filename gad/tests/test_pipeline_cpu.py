@@ -153,6 +153,17 @@ def write_yaml(path: Path, payload: dict) -> None:
 
 
 class ConfigTests(unittest.TestCase):
+    def test_native_shard_rotation_cannot_remove_configured_milestones(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            snapshot = directory / "run.yaml"
+            write_yaml(snapshot, base_config(directory))
+            cfg = gad_config.load_config(snapshot)
+            cfg.data.update({"resources.checkpoint_steps.gad": [542], "resources.max_actor_ckpt_to_keep": 1})
+            self.assertIn("milestone-aware", " ".join(gad_config.validate_config(cfg)))
+            cfg.data["resources.keep_last_checkpoints"] = 1
+            self.assertNotIn("milestone-aware", " ".join(gad_config.validate_config(cfg)))
+
     def test_missing_required_keys_are_reported(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             cfg_path = Path(tmp) / "run.yaml"
