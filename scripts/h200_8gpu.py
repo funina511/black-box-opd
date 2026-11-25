@@ -18,6 +18,30 @@ TOOLS = ROOT / "gad/tools"
 sys.path.insert(0, str(TOOLS))
 from config import compose_config, load_run_config, validate_config
 
+JUDGE_MODELS = {
+    "30b-instruct": "Qwen3-30B-A3B-Instruct-2507",
+    "8b-thinking": "Qwen3-8B",
+}
+
+
+def check_judge_source(source, preset, parser):
+    expected = JUDGE_MODELS[preset]
+    if source.get("rubric.judge.model") != expected or source.get("rubric.judge.enable_thinking") != (preset == "8b-thinking"):
+        parser.error(f"source run uses a different Judge from {expected}; select the matching run/model")
+
+
+def judge_fingerprint(config):
+    from extension_config import service_identity
+    from rubric.core.contracts import digest
+    return digest(service_identity(config))
+
+
+def recorded_judge(run, config):
+    record = run / "rubric_judge_identity.txt"
+    # Early 8B runs predate this launcher record. Their trainer still verifies
+    # the frozen service identity in the checkpoint during resume.
+    return record.read_text().strip() if record.is_file() else judge_fingerprint(config)
+
 
 def gpu_list(value):
     ids = value.split(",")
@@ -71,15 +95,19 @@ def launch(args, parser):
         root = root / "gray" / args.tag
     root = root / f"e{args.epochs}"
     method = args.method
-    naive = root / "naive"
-    run = root / method
+    # Keep prior 8B experiment paths resumable while keeping the new labels and
+    # Actor reward selection in their own run family.
+    suffix = "_30b_instruct" if args.judge_model == "30b-instruct" else ""
+    naive = root / ("naive" + suffix)
+    run = root / (method + suffix if method in ("naive", "actor", "judge") else method)
     selection = naive / "reports/actor_reward_selection"
     py = sys.executable
     if args.warmup_only and (method not in ("base", "correctness", "naive") or args.warmup_source):
         parser.error("--warmup-only is for the first stage of base, correctness or naive")
     if method == "select":
-        if args.smoke or args.resume or args.dry_run:
+        if args.smoke or args.resume or args.dry_run or args.write_config:
             parser.error("select operates on completed formal naive trajectories")
+        check_judge_source(load_run_config(naive), args.judge_model, parser)
         subprocess.run([py, TOOLS / "select_actor_reward.py", "--run", naive, "--output", selection], check=True)
         return
 
@@ -88,10 +116,16 @@ def launch(args, parser):
     if args.warmup_only:
         stages[method] = "warmup"
     if args.resume:
+        if args.write_config:
+            parser.error("--write-config materializes a new recipe; --resume uses the existing frozen config")
         if method == "rlvr":
             cmd = [py, TOOLS / "train_rlvr.py", "--output", run, "--resume"]
         elif method in stages:
             frozen = load_run_config(run)
+            if method in ("naive", "actor"):
+                check_judge_source(frozen, args.judge_model, parser)
+                if recorded_judge(run, frozen) != judge_fingerprint(frozen):
+                    parser.error("the current Judge differs from the service identity saved at training launch")
             stage = "gad" if frozen.get("budget.init_from_warmup_run") else stages[method]
             cmd = [py, TOOLS / "pipeline.py", "--run", run, "--resume", "--stages", stage]
             return run_pipeline(cmd, run, stage, args)
@@ -113,7 +147,7 @@ def launch(args, parser):
     model_root = args.model_root.expanduser().resolve()
     total = 271 * args.epochs
     cfg.data.update({
-        "run.run_id": method, "run.output_root": str(root),
+        "run.run_id": run.name, "run.output_root": str(root),
         "models.student": str(model_root / "Qwen3-0.6B"),
         "rubric.judge.tokenizer_path": str(model_root / "Qwen3-8B"),
         "resources.n_gpus_per_node": len(args.train_gpus),
@@ -129,6 +163,15 @@ def launch(args, parser):
         "budget.gad_new_steps": total - 271, "budget.rlvr_steps": total,
         "budget.rlvr_eval_steps": list(range(271, total + 1, 271)),
     })
+    if joint:
+        model = JUDGE_MODELS[args.judge_model]
+        cfg.data.update({"rubric.judge.model": model, "rubric.judge.tokenizer_path": str(model_root / model)})
+        if args.judge_model == "30b-instruct":
+            cfg.data.update({
+                "rubric.judge.enable_thinking": False, "rubric.judge.reasoning_parser": None,
+                "rubric.judge.base_url": "http://127.0.0.1:8153/v1",
+                "rubric.prompt": str(ROOT / "rubric/prompts/judge_math_process_direct_v1_instruct.txt"),
+            })
     if args.smoke:
         cfg.data.update({"run.engineering_smoke": True, "run.disable_validation": True,
                          "run.log_backend": "console", "optim.critic_warmup": 0,
@@ -139,10 +182,12 @@ def launch(args, parser):
     if args.warmup_source:
         if not args.smoke or method not in ("actor", "base", "correctness", "naive"):
             parser.error("--warmup-source is for GAD smoke runs")
-        if method == "base":
-            source_cfg = load_run_config(args.warmup_source)
-            if source_cfg.get("rubric.enabled") and "warmup" in source_cfg.get("rubric.stages"):
+        source_cfg = load_run_config(args.warmup_source)
+        if source_cfg.get("rubric.enabled") and "warmup" in source_cfg.get("rubric.stages"):
+            if method == "base":
                 parser.error("base needs a single-head Warmup source; this run trained a four-head Critic")
+            if joint and source_cfg.get("rubric.mode") == "joint":
+                check_judge_source(source_cfg, args.judge_model, parser)
         stages[method] = "gad"
         cfg.data.update({"budget.init_from_warmup_run": str(args.warmup_source.expanduser().resolve()),
                          "budget.init_step": args.init_step})
@@ -158,10 +203,24 @@ def launch(args, parser):
         else:
             if not args.confirm_selection:
                 parser.error("first run select and inspect selection.json, then pass actor --confirm-selection")
+            source_cfg = load_run_config(naive)
+            check_judge_source(source_cfg, args.judge_model, parser)
+            if recorded_judge(naive, source_cfg) != judge_fingerprint(cfg):
+                parser.error("Actor Judge settings differ from the selected naive run")
             cfg.data.update(actor_options(selection / "selection.json", naive))
     problems = validate_config(cfg)
     if problems:
         parser.error("\n".join(problems))
+    if args.write_config:
+        output = args.write_config.expanduser().resolve()
+        output.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            with output.open("x", encoding="utf-8") as handle:
+                yaml.safe_dump(cfg.data, handle, sort_keys=True)
+        except FileExistsError:
+            parser.error(f"{output} already exists; choose a new --write-config path")
+        print(output)
+        return
     if method != "judge" and not args.dry_run and run.exists():
         parser.error(f"{run} already exists; use --resume, a new smoke tag, or a different --runs-root")
 
@@ -185,8 +244,11 @@ def launch(args, parser):
         else:
             cmd = [py, TOOLS / "pipeline.py", "--config", config, "--stages", stages[method]]
             if not args.dry_run:
+                fingerprint = judge_fingerprint(cfg) if joint else None
                 run.mkdir(parents=True, exist_ok=False)
                 (run / "current_resolved_config.txt").write_text(config + "\n", encoding="utf-8")
+                if fingerprint:
+                    (run / "rubric_judge_identity.txt").write_text(fingerprint + "\n", encoding="utf-8")
             return run_pipeline(cmd, run, stages[method], args)
         if args.dry_run:
             cmd.append("--dry-run")
@@ -199,6 +261,8 @@ def main():
     p.add_argument("--epochs", type=int, choices=(2, 3), default=2, help="total data passes")
     p.add_argument("--runs-root", type=Path, default=os.environ.get("H200_RUNS_ROOT", ROOT / "runs/h200_8gpu"))
     p.add_argument("--model-root", type=Path, default=ROOT / "assets/models")
+    p.add_argument("--judge-model", choices=JUDGE_MODELS, default="30b-instruct",
+                   help="online rubric Judge; 30B uses the same model release as the offline Teacher")
     p.add_argument("--train-gpus", type=gpu_list, default="0,1,2,3")
     p.add_argument("--judge-gpus", type=gpu_list, default="4", help="dedicated physical indices, TP = count")
     p.add_argument("--judge-memory", type=float, default=.70, help="vLLM memory fraction on dedicated Judge cards")
@@ -214,7 +278,9 @@ def main():
     p.add_argument("--action", default="health", choices=("start", "stop", "health", "logs", "restart"),
                    help="judge service action")
     p.add_argument("--confirm-selection", action="store_true", help="use this series' recommendation for formal Actor")
-    p.add_argument("--dry-run", action="store_true")
+    preview = p.add_mutually_exclusive_group()
+    preview.add_argument("--dry-run", action="store_true")
+    preview.add_argument("--write-config", type=Path, help="write resolved YAML to a new file and exit")
     p.add_argument("--resume", action="store_true", help="resume using the run's frozen configuration")
     args = p.parse_args()
     os.environ.setdefault("VLLM_USE_V1", "1")

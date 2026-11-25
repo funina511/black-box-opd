@@ -171,6 +171,40 @@ class ThinkingTests(unittest.TestCase):
         self.assertEqual(0, summary['boundary_raw_anchor_mismatch_count'])
         self.assertEqual(0, summary['overall']['attempted'])
 
+    def test_calibration_direct_v1_pairs_and_human_metrics(self):
+        from calibrate_rubric_judge import benchmark_summary
+        from rubric.core.process_direct import parse_direct
+        from score_rubric_judge_reviews import compare_arms, metrics
+        progress, error = 'verified_progress', 'unresolved_error_severity'
+        def sample(rid, p, e):
+            answer = json.dumps({progress: p, error: e})
+            return {
+                'id': rid, 'uid': rid, 'kind': 'real', 'source_role': 'student',
+                'prompt': 'q', 'response': 'r', 'ground_truth': '1', 'truncated': False,
+                'scoring': {'correct': True},
+                'result': {'parsed': parse_direct(answer), 'attempts': 1},
+                'api_response': {'choices': [{'finish_reason': 'stop', 'message': {'content': answer}}]},
+            }
+        first = {'a': sample('a', 1, None), 'b': sample('b', .5, 1)}
+        second = {'a': sample('a', .5, 1), 'b': {**first['b'], 'result': {'error': 'timeout'}}}
+        summary = benchmark_summary(list(first.values()))
+        self.assertEqual({'None': 1, '1': 1}, summary['overall']['raw_labels'][error])
+        self.assertEqual(1, summary['overall']['mathematical_unknowns'][error])
+        counts = compare_arms(first, second)
+        self.assertEqual(1, counts[progress]['mutually_known'])
+        self.assertEqual(.5, counts[progress]['mean_absolute_difference'])
+        self.assertEqual(0, counts[progress]['exact_agreement'])
+        self.assertEqual({'null -> 1': 1, '1 -> failed': 1}, counts[error]['first_to_second'])
+        self.assertIsNone(counts[error]['exact_agreement'])
+        self.assertEqual(['a', 'b'], counts[error]['disagreement_ids'])
+        human = {progress: {'valid': True, 'value': 1}, error: {'valid': True, 'value': 0}}
+        reviews = [(human, first['a'])]
+        self.assertEqual(1, metrics(reviews, progress, raw=True)['agreement_on_mutually_known'])
+        self.assertEqual(metrics(reviews, error, raw=False), metrics(reviews, error, raw=True))
+        second['a']['response'] = 'changed answer'
+        with self.assertRaisesRegex(ValueError, 'paired inputs differ'):
+            compare_arms(first, second)
+
     def test_failed_startup_preserves_partial_artifacts(self):
         import subprocess
         import yaml

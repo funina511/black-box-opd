@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare explicitly completed blind human reviews with frozen judge outputs."""
+"""Measure agreement between two frozen judges or against completed blind human reviews."""
 import argparse
 from collections import Counter
 import json
@@ -16,10 +16,15 @@ def raw_record(sample):
         try:
             result = json.loads(choices[0]['message']['content'])
             if isinstance(result, dict):
+                if set(result) == set(DIMENSIONS) and all(
+                    value is None or type(value) in (int, float) for value in result.values()
+                ):
+                    return {d: {'value': result[d], 'valid': result[d] is not None} for d in DIMENSIONS}
                 return result
         except (ValueError, KeyError, TypeError):
             pass
-    return sample['result'].get('parsed', {}).get('_record', {})
+    parsed = sample['result'].get('parsed', {})
+    return parsed if parsed.get('_process_protocol') == 'direct_v1' else parsed.get('_record', {})
 
 
 def metrics(rows, dimension, raw):
@@ -61,13 +66,69 @@ def metrics(rows, dimension, raw):
             'confusion_human_to_judge': dict(confusion), 'severe_error_counts': dict(severe)}
 
 
+def effective_label(sample, dimension):
+    parsed = sample['result'].get('parsed')
+    if not parsed:
+        return 'failed'
+    label = parsed[dimension]
+    return label['value'] if label['valid'] else 'null'
+
+
+def compare_arms(left, right):
+    """Paired agreement only; either judge can be wrong."""
+    if not left or left.keys() != right.keys():
+        raise ValueError('the two runs must contain the same nonempty set of response IDs')
+    for rid, a in left.items():
+        b = right[rid]
+        if any(a[k] != b[k] for k in ('prompt', 'response', 'ground_truth', 'truncated', 'source_role')):
+            raise ValueError(f'paired inputs differ for {rid}')
+    results = {}
+    for dim in DIMENSIONS:
+        confusion = Counter()
+        differences = []
+        known_left = known_right = exact = 0
+        disagreement_ids = []
+        for rid, a in left.items():
+            x, y = effective_label(a, dim), effective_label(right[rid], dim)
+            known_left += isinstance(x, (int, float))
+            known_right += isinstance(y, (int, float))
+            confusion[f'{x} -> {y}'] += 1
+            if x != y:
+                disagreement_ids.append(rid)
+            if isinstance(x, (float, int)) and isinstance(y, (float, int)):
+                differences.append(abs(x-y))
+                exact += int(x == y)
+        mutual = len(differences)
+        results[dim] = dict(rows=len(left), first_known=known_left, second_known=known_right,
+                            mutually_known=mutual, mutually_known_exact=exact,
+                            exact_agreement=exact/mutual if mutual else None,
+                            mean_absolute_difference=sum(differences)/mutual if mutual else None,
+                            first_to_second=dict(confusion), disagreement_ids=disagreement_ids)
+    return results
+
+
+def load_samples(directory):
+    rows = [json.loads(line) for line in (directory / 'samples.jsonl').read_text().splitlines()]
+    by_id = {row['id']: row for row in rows}
+    if len(rows) != len(by_id):
+        raise ValueError(f'duplicate response ID in {directory}')
+    return by_id
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--benchmark', required=True)
-    parser.add_argument('--reviews', required=True)
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument('--reviews', help='completed blind human reviews')
+    mode.add_argument('--compare', help='second judge output directory on the same frozen inputs')
     args = parser.parse_args()
     directory = Path(args.benchmark)
-    samples = {r['id']: r for r in (json.loads(line) for line in (directory / 'samples.jsonl').read_text().splitlines())}
+    samples = load_samples(directory)
+    if args.compare:
+        second = Path(args.compare)
+        other = load_samples(second)
+        print(json.dumps(compare_arms(samples, other), ensure_ascii=False, indent=2))
+        return
     blind = {r['review_id']: r for r in (json.loads(line) for line in (directory / 'human_review_blind.jsonl').read_text().splitlines())}
     key = json.loads((directory / 'human_review_key.json').read_text())
     completed = []

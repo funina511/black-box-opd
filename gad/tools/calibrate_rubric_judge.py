@@ -34,6 +34,13 @@ def labels(row):
     return {d: parsed.get(d, {}).get('value') for d in DIMENSIONS}
 
 
+def raw_labels(parsed):
+    # direct_v1's parser preserves each original ordinal or null unchanged.
+    if parsed.get('_process_protocol') == 'direct_v1':
+        return {d: parsed[d] for d in DIMENSIONS}
+    return parsed.get('_record', {})
+
+
 def benchmark_summary(samples):
     def statistics(rows):
         parsed = [r for r in rows if 'parsed' in r['result']]
@@ -45,8 +52,8 @@ def benchmark_summary(samples):
             'errors': dict(Counter(r['result']['error'] for r in rows if 'error' in r['result'])),
             'effective_coverage_of_planned': {d: sum(bool(r['result']['parsed'][d]['valid']) for r in parsed) / len(rows) if rows else None for d in DIMENSIONS},
             'effective_labels': {d: dict(Counter(str(r['result']['parsed'][d]['value']) for r in parsed)) for d in DIMENSIONS},
-            'raw_labels': {d: dict(Counter(str(r['result']['parsed']['_record'][d]['value']) for r in parsed)) for d in DIMENSIONS},
-            'mathematical_unknowns': {d: sum(not r['result']['parsed']['_record'][d]['valid'] for r in parsed) for d in DIMENSIONS},
+            'raw_labels': {d: dict(Counter(str(raw_labels(r['result']['parsed'])[d]['value']) for r in parsed)) for d in DIMENSIONS},
+            'mathematical_unknowns': {d: sum(not raw_labels(r['result']['parsed'])[d]['valid'] for r in parsed) for d in DIMENSIONS},
             'program_discarded_dimensions': {d: sum(bool(r['result']['parsed'].get('_mask_reasons', {}).get(d)) for r in parsed) for d in DIMENSIONS},
             'cache_hits': 0,
             'http_generation_attempts':sum(r['result'].get('attempts',0) for r in rows),
@@ -65,7 +72,7 @@ def benchmark_summary(samples):
         if row['kind'] != 'boundary':
             continue
         parsed = row['result'].get('parsed', {})
-        raw = parsed.get('_record', {})
+        raw = raw_labels(parsed)
         anchor_rows.append({'id': row['id'], 'category': row['category'], 'expected_allowed': row['expected_allowed'],
                             'raw': {d: raw.get(d, {}).get('value') for d in DIMENSIONS},
                             'effective': labels(row),
@@ -156,6 +163,8 @@ def main():
         raise ValueError('this fixed comparison requires math_process_v2')
     options = {k[13:]: v for k, v in cfg.data.items() if k.startswith('rubric.judge.')}
     if args.max_requests < 1:parser.error('max-requests must be positive')
+    process_protocol = cfg.get('rubric.process_protocol') or 'events_v27'
+    options['process_protocol'] = process_protocol
     configured_budget=options.get('request_budget')
     options.update(rubric_version=cfg.get('rubric.version'), seed=cfg.get('rubric.seed'), max_retries=0, request_budget=min(args.max_requests,configured_budget) if configured_budget is not None else args.max_requests)
     examples = ([json.loads(line) for line in Path(args.samples).read_text().splitlines() if line.strip()]
@@ -223,7 +232,7 @@ def main():
         prompt = Path(cfg.require('rubric.prompt')).read_text()
         requests = {e['id']: judge_messages(e['prompt'], e['response'], e['ground_truth'], spec, prompt,
                     'math_process_v2', {'response_source_truncated': e['truncated'],
-                    'training_token_truncated': False, 'prompt_truncated': False, 'judge_context_overflow': False})
+                    'training_token_truncated': False, 'prompt_truncated': False, 'judge_context_overflow': False}, process_protocol=process_protocol)
                     for e in examples}
         request_ids = {digest(messages): key for key, messages in requests.items()}
         class RecordingClient(JudgeClient):
@@ -255,7 +264,7 @@ def main():
         (output / 'protocol.json').write_text(json.dumps({
             'config': str(Path(args.config).resolve()), 'config_sha256': file_hash(args.config),
             'spec_sha256': file_hash(cfg.require('rubric.spec')), 'prompt_sha256': file_hash(cfg.require('rubric.prompt')),
-            'schema_sha256': digest(schema_for('math_process_v2')), 'fixture_sha256': digest(examples),
+            'schema_sha256': digest(schema_for('math_process_v2', process_protocol)), 'fixture_sha256': digest(examples),
             'service_identity': service_identity(cfg), 'client_options': options,
             'human_review': 'pending', 'prompt_mutated_during_run': False, 'training_started': False,
             'inputs_path': str(Path(args.samples).resolve()) if args.samples else None,
@@ -298,7 +307,8 @@ def main():
                 print(f"{arm} completed {len(results)}/{len(examples)} {rid} error={result.get('error')}",flush=True)
             contexts={e['id']:(e['prompt'],e['response']) for e in examples}
             results=annotate_chains(client,requests,contexts,deadline-2,
-                semantic=cfg.get('rubric.semantic_check'),on_result=completed,stop=stop)
+                semantic=cfg.get('rubric.semantic_check'),on_result=completed,stop=stop,
+                process_protocol=process_protocol)
             arm_samples=[{**e,'result':results[e['id']],'human_review':'pending'} for e in examples]
             summary=benchmark_summary(arm_samples)
             summary.update(concurrency=concurrency, scheduler=client.last_schedule,
@@ -324,7 +334,7 @@ def main():
                     'api_response': raw_responses.get(example['id']), 'human_review': 'pending'} for example in examples]
         (output / 'samples.jsonl').write_text(''.join(json.dumps(e, ensure_ascii=False) + '\n' for e in samples))
         if args.samples:
-            summary = benchmark_summary(samples)
+            summary = arm_results['single']
             summary.update(model=options['model'], annotation_seconds=budget['annotation_seconds'])
             (output / 'summary.json').write_text(json.dumps(summary, ensure_ascii=False, indent=2))
             budget['status'] = ('completed' if not client.last_schedule['unfinished'] and not budget.get('stop_reason') else
