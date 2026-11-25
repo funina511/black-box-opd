@@ -17,8 +17,10 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / 'gad/tools'))
 from config import compose_config
 from extension_config import service_identity
-from rubric.core.contracts import digest, file_hash, judge_messages, schema_for
-from gad.extensions.judge_client import JudgeClient, RequestBudget
+from rubric.core.contracts import digest, file_hash
+from rubric.core.protocols import DIRECT_PROTOCOLS, judge_messages, schema_for
+from gad.extensions.judge_client import RequestBudget
+from gad.extensions.process_client import JudgeClient
 from validate_rubric_v2 import fixtures
 
 DIMENSIONS = ('verified_progress', 'unresolved_error_severity')
@@ -35,8 +37,7 @@ def labels(row):
 
 
 def raw_labels(parsed):
-    # direct_v1's parser preserves each original ordinal or null unchanged.
-    if parsed.get('_process_protocol') == 'direct_v1':
+    if parsed.get('_process_protocol') in DIRECT_PROTOCOLS:
         return {d: parsed[d] for d in DIMENSIONS}
     return parsed.get('_record', {})
 
@@ -86,7 +87,8 @@ def benchmark_summary(samples):
     for row in samples:
         if row['kind'] == 'real':
             result = labels(row)
-            cross_tab[(str(row['scoring']['correct']), str(result[DIMENSIONS[0]]), str(result[DIMENSIONS[1]]))] += 1
+            correct = (row.get('scoring') or {}).get('correct')
+            cross_tab[(str(correct), str(result[DIMENSIONS[0]]), str(result[DIMENSIONS[1]]))] += 1
     return {'by_kind': by_kind, 'overall': statistics(samples),
             'boundary_raw_anchor_mismatch_count': sum(bool(r['raw_mismatch_dimensions']) for r in anchor_rows),
             'boundary_effective_anchor_mismatch_count': sum(bool(r['effective_mismatch_dimensions']) for r in anchor_rows),
@@ -145,13 +147,16 @@ def main():
     parser.add_argument('--previous', default=str(ROOT / 'reports/rubric_v2/judge_samples_guarded.jsonl'))
     parser.add_argument('--samples', help='Frozen inputs.jsonl; at most 128 rows, one attempt per row')
     parser.add_argument('--max-requests', type=int, default=24, help='Total HTTP generation calls, including retries and targeted review')
-    parser.add_argument('--wall-seconds', type=int, default=1800)
+    parser.add_argument('--max-output-tokens', type=int,
+                        help='Set an equal request cap for a frozen non-thinking direct/brief comparison')
+    parser.add_argument('--wall-seconds', type=int, default=1800,
+                        help='Per-run deadline including startup; frozen --finish-cohort jobs may request over one hour')
     parser.add_argument('--concurrency-groups', help='Shared-service/shared-budget arms, e.g. 1,2; separate results and review dedup per arm')
     parser.add_argument('--finish-cohort', action='store_true', help='User-authorized fixed-cohort completion: retain per-row mode/budget failures and continue; stop on request rejection or repeated transport failures')
     parser.add_argument('--stop-file', help='Stop queue after the current request; retain completed outputs and summarize unstarted rows')
     args = parser.parse_args()
-    if not 0 < args.wall_seconds <= 3600:
-        parser.error('wall-seconds must be in 1..3600 (default 1800)')
+    if args.wall_seconds < 1 or (args.wall_seconds > 3600 and not (args.samples and args.finish_cohort)):
+        parser.error('wall-seconds must be positive; more than 3600 requires --samples and --finish-cohort')
     output = Path(args.output).resolve()
     output.mkdir(parents=True, exist_ok=True)
     if (output / 'budget.json').exists():
@@ -165,6 +170,13 @@ def main():
     if args.max_requests < 1:parser.error('max-requests must be positive')
     process_protocol = cfg.get('rubric.process_protocol') or 'events_v27'
     options['process_protocol'] = process_protocol
+    if args.max_output_tokens is not None:
+        if (not args.samples or options['enable_thinking']
+                or process_protocol not in DIRECT_PROTOCOLS):
+            parser.error('--max-output-tokens requires frozen non-thinking direct/brief samples')
+        if not 0 < args.max_output_tokens < options['max_context_tokens']:
+            parser.error('--max-output-tokens must be positive and below the configured context limit')
+        options['max_output_tokens'] = args.max_output_tokens
     configured_budget=options.get('request_budget')
     options.update(rubric_version=cfg.get('rubric.version'), seed=cfg.get('rubric.seed'), max_retries=0, request_budget=min(args.max_requests,configured_budget) if configured_budget is not None else args.max_requests)
     examples = ([json.loads(line) for line in Path(args.samples).read_text().splitlines() if line.strip()]
@@ -266,6 +278,7 @@ def main():
             'spec_sha256': file_hash(cfg.require('rubric.spec')), 'prompt_sha256': file_hash(cfg.require('rubric.prompt')),
             'schema_sha256': digest(schema_for('math_process_v2', process_protocol)), 'fixture_sha256': digest(examples),
             'service_identity': service_identity(cfg), 'client_options': options,
+            'process_protocol': process_protocol, 'request_output_cap_override': args.max_output_tokens,
             'human_review': 'pending', 'prompt_mutated_during_run': False, 'training_started': False,
             'inputs_path': str(Path(args.samples).resolve()) if args.samples else None,
             'script_sha256': file_hash(__file__)}, indent=2))
@@ -334,8 +347,10 @@ def main():
                     'api_response': raw_responses.get(example['id']), 'human_review': 'pending'} for example in examples]
         (output / 'samples.jsonl').write_text(''.join(json.dumps(e, ensure_ascii=False) + '\n' for e in samples))
         if args.samples:
+            from score_rubric_judge_reviews import within_question_student
             summary = arm_results['single']
             summary.update(model=options['model'], annotation_seconds=budget['annotation_seconds'])
+            summary['within_question_student'] = within_question_student({row['id']: row for row in samples})
             (output / 'summary.json').write_text(json.dumps(summary, ensure_ascii=False, indent=2))
             budget['status'] = ('completed' if not client.last_schedule['unfinished'] and not budget.get('stop_reason') else
                 'review_stopped' if budget.get('stop_reason') == 'semantic_or_compatibility_review_stop' else

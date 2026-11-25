@@ -1,4 +1,4 @@
-# Apply after h200_naive_n8.yaml and run the GAD stage from its Warmup checkpoint.
+# Single-H200 handoff at 271. scripts/h200_8gpu.py sets the source and step for the selected prompt batch.
 # Formal reward parameters are selected from the completed n=8 naive shadow run.
 run.run_id: h200_actor_06b_17k_n8
 budget.init_from_warmup_run: ../../runs/h200_naive_06b_17k_n8

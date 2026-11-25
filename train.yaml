@@ -1,4 +1,4 @@
-# Global defaults for NEW experiments. Each launch saves its resolved train.yaml in runs/.
+# Global catalog defaults. For the three-epoch 8-H200 math series, use scripts/h200_8gpu.py.
 # Select model/dataset below, in scripts/train.sh, or with --model / --dataset.
 # GAD stage_epochs=2 is an ABSOLUTE target including Warmup; use 3 for 2 additional epochs.
 # Resume/export/evaluate an existing experiment with --run; its saved config is authoritative.

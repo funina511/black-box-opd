@@ -4,6 +4,7 @@ import argparse
 from collections import Counter
 import json
 from pathlib import Path
+from statistics import mean
 
 DIMENSIONS = ('verified_progress', 'unresolved_error_severity')
 
@@ -16,21 +17,23 @@ def raw_record(sample):
         try:
             result = json.loads(choices[0]['message']['content'])
             if isinstance(result, dict):
-                if set(result) == set(DIMENSIONS) and all(
-                    value is None or type(value) in (int, float) for value in result.values()
+                if set(result) in (set(DIMENSIONS), {'brief_check', *DIMENSIONS}) and all(
+                    result[d] is None or type(result[d]) in (int, float) for d in DIMENSIONS
                 ):
                     return {d: {'value': result[d], 'valid': result[d] is not None} for d in DIMENSIONS}
                 return result
         except (ValueError, KeyError, TypeError):
             pass
     parsed = sample['result'].get('parsed', {})
-    return parsed if parsed.get('_process_protocol') == 'direct_v1' else parsed.get('_record', {})
+    if parsed.get('_process_protocol') in ('direct_v1', 'direct_brief_v1'):
+        return parsed
+    return parsed.get('_record', {})
 
 
 def metrics(rows, dimension, raw):
     known_reference = []
     mutual = []
-    abstained = 0
+    abstained = failed = 0
     judge_known_on_human_unknown = 0
     severe = Counter()
     confusion = Counter()
@@ -48,6 +51,12 @@ def metrics(rows, dimension, raw):
             if target['value'] == 1:
                 severe['reference_severe'] += 1
                 severe['correct_severe' if known and predicted['value'] == 1 else 'missed_severe' if known else 'abstained_severe'] += 1
+                if not known and not parsed:
+                    severe['failed_on_severe'] += 1
+            else:
+                severe['reference_nonsevere'] += 1
+                if known and predicted['value'] == 1:
+                    severe['false_severe_on_nonsevere'] += 1
             if target['value'] == 0:
                 severe['reference_zero'] += 1
                 if known and predicted['value'] == 1:
@@ -57,13 +66,44 @@ def metrics(rows, dimension, raw):
             confusion[f"{target['value']}->{predicted['value']}"] += 1
         else:
             abstained += 1
+            failed += int(not parsed)
+    severe_rates = {}
+    if dimension == 'unresolved_error_severity':
+        for metric, numerator, denominator in (
+            ('recall_on_human_severe', 'correct_severe', 'reference_severe'),
+            ('false_severe_rate_on_human_nonsevere', 'false_severe_on_nonsevere', 'reference_nonsevere'),
+        ):
+            severe_rates[metric] = severe[numerator] / severe[denominator] if severe[denominator] else None
     return {'reviewed': len(rows), 'human_known': len(known_reference), 'mutually_known': len(mutual),
             'human_unknown': len(rows) - len(known_reference),
             'judge_known_on_human_unknown': judge_known_on_human_unknown,
             'judge_abstained_or_failed_on_human_known': abstained,
+            'unusable_responses_on_human_known': failed,
+            'invalid_dimensions_on_otherwise_parsed_human_known': abstained - failed,
             'agreement_on_mutually_known': sum(a == b for a, b in mutual) / len(mutual) if mutual else None,
             'mae_on_mutually_known': sum(abs(a-b) for a, b in mutual) / len(mutual) if mutual else None,
-            'confusion_human_to_judge': dict(confusion), 'severe_error_counts': dict(severe)}
+            'confusion_human_to_judge': dict(confusion), 'severe_error_counts': dict(severe), **severe_rates}
+
+
+def real_strata(samples):
+    groups = {}
+    for rid, sample in samples.items():
+        if sample['kind'] != 'real':
+            continue
+        correct = (sample.get('scoring') or {}).get('correct')
+        outcome = 'undetermined' if correct is None else ('correct' if correct else 'incorrect')
+        labels = {'role': sample['source_role'], 'verified_answer': outcome,
+                  'truncation': 'truncated' if sample['truncated'] else 'complete'}
+        if sample.get('category'):
+            labels['category'] = sample['category']
+        for axis, label in labels.items():
+            groups.setdefault(axis, {}).setdefault(label, []).append(rid)
+    return groups
+
+
+def human_metrics(rows):
+    return {mode: {dim: metrics(rows, dim, mode == 'raw') for dim in DIMENSIONS}
+            for mode in ('raw', 'effective')}
 
 
 def effective_label(sample, dimension):
@@ -74,13 +114,84 @@ def effective_label(sample, dimension):
     return label['value'] if label['valid'] else 'null'
 
 
+def paired_student_ids(samples):
+    """Collect completed, verifier-graded correct/incorrect Student answers by UID."""
+    groups = {}
+    for rid, row in sorted(samples.items()):
+        uid = row.get('uid')
+        scorer = row.get('scoring') or {}
+        correct = scorer.get('correct')
+        if (row.get('kind') != 'real' or row.get('source_role') != 'student' or row.get('truncated') is not False
+                or not isinstance(uid, str) or not uid.strip() or type(correct) is not bool
+                or scorer.get('grade_status') != ('correct' if correct else 'incorrect')
+                or scorer.get('parse_status') != 'ok'):
+            continue
+        outcome = 'correct' if correct else 'incorrect'
+        # Keep the first stable ID for duplicate text from another checkpoint.
+        by_outcome = groups.setdefault(uid, {'correct': {}, 'incorrect': {}})
+        by_outcome[outcome].setdefault(row['response'], rid)
+    return {uid: {outcome: list(ids.values()) for outcome, ids in sides.items()}
+            for uid, sides in groups.items() if all(sides.values())}
+
+
+def student_delta(samples, sides, dimension):
+    labels = {outcome: [effective_label(samples[rid], dimension) for rid in ids]
+              for outcome, ids in sides.items()}
+    if any('failed' in values for values in labels.values()):
+        return 'failed'
+    if any('null' in values for values in labels.values()):
+        return 'abstained'
+    progress_difference = mean(labels['correct']) - mean(labels['incorrect'])
+    return progress_difference if dimension == 'verified_progress' else -progress_difference
+
+
+def delta_summary(values):
+    values = list(values)
+    valid = [value for value in values if isinstance(value, (int, float))]
+    return {'questions': len(values), 'valid': len(valid), 'abstained': values.count('abstained'),
+            'failed': values.count('failed'), 'positive': sum(v > 0 for v in valid),
+            'tie': sum(v == 0 for v in valid), 'negative': sum(v < 0 for v in valid),
+            'mean_delta': mean(valid) if valid else None}
+
+
+def within_question_student(samples, other=None):
+    pairs = paired_student_ids(samples)
+    report = {
+        'eligible_questions': len(pairs), 'response_ids_by_question': pairs,
+        'weighting': 'Average distinct response texts within each answer outcome; weight each question equally. '
+                     'Require every included rating on both outcomes for an arm and dimension. '
+                     'A failed response takes precedence over a null rating. Final-answer correctness groups the '
+                     'responses; the sign of a process-label difference is descriptive.',
+        'directions': {'verified_progress': 'correct minus incorrect',
+                       'unresolved_error_severity': 'incorrect minus correct'},
+        'dimensions': {},
+    }
+    for dim in DIMENSIONS:
+        first = {uid: student_delta(samples, sides, dim) for uid, sides in pairs.items()}
+        scores = {'benchmark': delta_summary(first.values())}
+        if other is not None:
+            second = {uid: student_delta(other, sides, dim) for uid, sides in pairs.items()}
+            common = [uid for uid in pairs if isinstance(first[uid], (int, float)) and isinstance(second[uid], (int, float))]
+            scores.update(comparison=delta_summary(second.values()), both_arms_known={
+                'questions': len(common), 'benchmark': delta_summary(first[uid] for uid in common),
+                'comparison': delta_summary(second[uid] for uid in common),
+                'mean_comparison_minus_benchmark': mean(second[uid] - first[uid] for uid in common) if common else None,
+            })
+        report['dimensions'][dim] = scores
+    return report
+
+
 def compare_arms(left, right):
     """Paired agreement only; either judge can be wrong."""
     if not left or left.keys() != right.keys():
         raise ValueError('the two runs must contain the same nonempty set of response IDs')
     for rid, a in left.items():
         b = right[rid]
-        if any(a[k] != b[k] for k in ('prompt', 'response', 'ground_truth', 'truncated', 'source_role')):
+        if (any(a[k] != b[k] for k in ('prompt', 'response', 'ground_truth', 'truncated', 'source_role'))
+                or a.get('uid') != b.get('uid') or a.get('kind') != b.get('kind')
+                or any((a.get('scoring') or {}).get(k) != (b.get('scoring') or {}).get(k)
+                       for k in ('correct', 'grade_status', 'parse_status'))
+                or a.get('category') != b.get('category')):
             raise ValueError(f'paired inputs differ for {rid}')
     results = {}
     for dim in DIMENSIONS:
@@ -127,7 +238,13 @@ def main():
     if args.compare:
         second = Path(args.compare)
         other = load_samples(second)
-        print(json.dumps(compare_arms(samples, other), ensure_ascii=False, indent=2))
+        report = compare_arms(samples, other)
+        report['benchmark_directory'], report['comparison_directory'] = str(directory), str(second)
+        report['within_question_student'] = within_question_student(samples, other)
+        report['real_subgroups'] = {
+            axis: {group: compare_arms({rid: samples[rid] for rid in ids}, {rid: other[rid] for rid in ids})
+                   for group, ids in groups.items()} for axis, groups in real_strata(samples).items()}
+        print(json.dumps(report, ensure_ascii=False, indent=2))
         return
     blind = {r['review_id']: r for r in (json.loads(line) for line in (directory / 'human_review_blind.jsonl').read_text().splitlines())}
     key = json.loads((directory / 'human_review_key.json').read_text())
@@ -160,11 +277,14 @@ def main():
         completed.append((row, samples[key[rid]]))
     if not completed:
         raise ValueError('no completed human reviews; automatic label statistics are not semantic accuracy')
+    reviewed = {sample['id']: (review, sample) for review, sample in completed}
+    real_groups = real_strata({rid: sample for rid, (_, sample) in reviewed.items()})
     report = {'human_reviews_completed': len(completed), 'human_reviews_requested': len(blind),
               'human_review_status': 'complete' if len(completed) == len(blind) else 'partial',
-              'groups': {kind: {mode: {dimension: metrics([pair for pair in completed if pair[1]['kind'] == kind], dimension, mode == 'raw')
-                                      for dimension in DIMENSIONS} for mode in ('raw', 'effective')}
+              'groups': {kind: human_metrics([pair for pair in completed if pair[1]['kind'] == kind])
                          for kind in ('real', 'boundary')},
+              'real_subgroups': {axis: {group: human_metrics([reviewed[rid] for rid in ids])
+                                        for group, ids in groups.items()} for axis, groups in real_groups.items()},
               'caveat': 'Conditional agreement excludes abstentions; review all associated counts. Raw uses complete API JSON, including evidence-rejected annotations, for semantic diagnosis only. Effective uses all program checks. Stratified diagnostic sample is not population-weighted.'}
     target = directory / 'human_review_metrics.json'
     target.write_text(json.dumps(report, ensure_ascii=False, indent=2))

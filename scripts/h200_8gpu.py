@@ -24,10 +24,11 @@ JUDGE_MODELS = {
 }
 
 
-def check_judge_source(source, preset, parser):
-    expected = JUDGE_MODELS[preset]
-    if source.get("rubric.judge.model") != expected or source.get("rubric.judge.enable_thinking") != (preset == "8b-thinking"):
-        parser.error(f"source run uses a different Judge from {expected}; select the matching run/model")
+def check_judge_source(source, args, parser):
+    expected = JUDGE_MODELS[args.judge_model]
+    if (source.get("rubric.judge.model") != expected or source.get("rubric.judge.enable_thinking") != (args.judge_model == "8b-thinking")
+            or source.get("rubric.process_protocol") != args.judge_protocol):
+        parser.error(f"source run needs the same Judge model and protocol ({expected}, {args.judge_protocol})")
 
 
 def judge_fingerprint(config):
@@ -48,6 +49,13 @@ def gpu_list(value):
     if any(not x.isdigit() for x in ids) or len(set(ids)) != len(ids):
         raise argparse.ArgumentTypeError("expected comma-separated distinct GPU indices")
     return ids
+
+
+def positive_int(value):
+    number = int(value)
+    if number < 1:
+        raise argparse.ArgumentTypeError("expected a positive integer")
+    return number
 
 
 def actor_options(report, naive_dir):
@@ -93,11 +101,18 @@ def launch(args, parser):
         if not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_.-]*", args.tag):
             parser.error("--tag must be a single directory name")
         root = root / "gray" / args.tag
-    root = root / f"e{args.epochs}"
+    series = f"e{args.epochs}" if args.prompt_batch == 64 else f"e{args.epochs}_b{args.prompt_batch}"
+    root = root / series
     method = args.method
+    if args.judge_protocol is None:
+        args.judge_protocol = "direct_brief_v1" if args.judge_model == "30b-instruct" else "direct_v1"
+    if args.judge_model == "8b-thinking" and args.judge_protocol != "direct_v1":
+        parser.error("the 8B Thinking control uses the historical direct_v1 protocol")
     # Keep prior 8B experiment paths resumable while keeping the new labels and
     # Actor reward selection in their own run family.
     suffix = "_30b_instruct" if args.judge_model == "30b-instruct" else ""
+    if args.judge_protocol == "direct_brief_v1":
+        suffix += "_brief"
     naive = root / ("naive" + suffix)
     run = root / (method + suffix if method in ("naive", "actor", "judge") else method)
     selection = naive / "reports/actor_reward_selection"
@@ -107,7 +122,7 @@ def launch(args, parser):
     if method == "select":
         if args.smoke or args.resume or args.dry_run or args.write_config:
             parser.error("select operates on completed formal naive trajectories")
-        check_judge_source(load_run_config(naive), args.judge_model, parser)
+        check_judge_source(load_run_config(naive), args, parser)
         subprocess.run([py, TOOLS / "select_actor_reward.py", "--run", naive, "--output", selection], check=True)
         return
 
@@ -123,7 +138,7 @@ def launch(args, parser):
         elif method in stages:
             frozen = load_run_config(run)
             if method in ("naive", "actor"):
-                check_judge_source(frozen, args.judge_model, parser)
+                check_judge_source(frozen, args, parser)
                 if recorded_judge(run, frozen) != judge_fingerprint(frozen):
                     parser.error("the current Judge differs from the service identity saved at training launch")
             stage = "gad" if frozen.get("budget.init_from_warmup_run") else stages[method]
@@ -145,9 +160,20 @@ def launch(args, parser):
         overlays.append(ROOT / "configs/overrides/h200_actor_n8.yaml")
     cfg = compose_config(ROOT / "configs/h200_baseline_n8.yaml", overrides=overlays)
     model_root = args.model_root.expanduser().resolve()
-    total = 271 * args.epochs
+    # Judge service control does not consume a training parquet. For actual
+    # training plans read the same metadata and apply the same drop_last as verl.
+    if method == "judge":
+        train_rows = 17405  # rows in the frozen DAPO-17k training split
+    else:
+        from pipeline import dataset_rows
+        train_rows = dataset_rows(cfg.require("data.train_file"))
+    steps_per_pass = train_rows // args.prompt_batch
+    if not steps_per_pass:
+        parser.error(f"--prompt-batch exceeds the {train_rows} training rows")
+    total = steps_per_pass * args.epochs
     cfg.data.update({
         "run.run_id": run.name, "run.output_root": str(root),
+        "data.train_batch_size": args.prompt_batch,
         "models.student": str(model_root / "Qwen3-0.6B"),
         "rubric.judge.tokenizer_path": str(model_root / "Qwen3-8B"),
         "resources.n_gpus_per_node": len(args.train_gpus),
@@ -157,20 +183,35 @@ def launch(args, parser):
         "rubric.judge.tensor_parallel_size": len(args.judge_gpus),
         "rubric.judge.gpu_memory_utilization": args.judge_memory,
         "rollout.gpu_memory_utilization": args.kv, "rollout.max_num_seqs": args.max_seqs,
+        "rollout.max_num_batched_tokens": args.rollout_batched_tokens,
+        "optim.actor_ppo_max_token_len_per_gpu": args.actor_tokens,
         "optim.critic_micro_batch_size_per_gpu": args.critic_micro,
         "budget.stage_epochs.seqkd": args.epochs, "budget.stage_epochs.gad": args.epochs,
-        "budget.seqkd_steps": total, "budget.gad_steps": total - 271,
-        "budget.gad_new_steps": total - 271, "budget.rlvr_steps": total,
-        "budget.rlvr_eval_steps": list(range(271, total + 1, 271)),
+        "budget.warmup_steps": steps_per_pass, "budget.seqkd_steps": total,
+        "budget.gad_steps": total - steps_per_pass, "budget.gad_new_steps": total - steps_per_pass,
+        "budget.rlvr_steps": total, "budget.rlvr_eval_steps": list(range(steps_per_pass, total + 1, steps_per_pass)),
     })
     if joint:
         model = JUDGE_MODELS[args.judge_model]
-        cfg.data.update({"rubric.judge.model": model, "rubric.judge.tokenizer_path": str(model_root / model)})
+        cfg.data.update({
+            "rubric.process_sampling.max_unique_per_global_minibatch": args.prompt_batch,
+            "rubric.judge.concurrency": args.judge_concurrency,
+            "rubric.judge.model": model, "rubric.judge.tokenizer_path": str(model_root / model),
+        })
         if args.judge_model == "30b-instruct":
             cfg.data.update({
                 "rubric.judge.enable_thinking": False, "rubric.judge.reasoning_parser": None,
                 "rubric.judge.base_url": "http://127.0.0.1:8153/v1",
+                "rubric.judge.max_output_tokens": 128,
                 "rubric.prompt": str(ROOT / "rubric/prompts/judge_math_process_direct_v1_instruct.txt"),
+            })
+        if args.judge_protocol == "direct_brief_v1":
+            cfg.data.update({
+                "rubric.process_protocol": args.judge_protocol,
+                "rubric.judge.base_url": "http://127.0.0.1:8154/v1",
+                "rubric.judge.max_output_tokens": 768,
+                "rubric.spec": str(ROOT / "rubric/specs/math_process_direct_brief_v1.yaml"),
+                "rubric.prompt": str(ROOT / "rubric/prompts/judge_math_process_direct_brief_v1.txt"),
             })
     if args.smoke:
         cfg.data.update({"run.engineering_smoke": True, "run.disable_validation": True,
@@ -183,18 +224,25 @@ def launch(args, parser):
         if not args.smoke or method not in ("actor", "base", "correctness", "naive"):
             parser.error("--warmup-source is for GAD smoke runs")
         source_cfg = load_run_config(args.warmup_source)
+        if source_cfg.require("data.train_batch_size") != args.prompt_batch:
+            parser.error("--warmup-source must use the same global --prompt-batch as this GAD run")
         if source_cfg.get("rubric.enabled") and "warmup" in source_cfg.get("rubric.stages"):
             if method == "base":
                 parser.error("base needs a single-head Warmup source; this run trained a four-head Critic")
             if joint and source_cfg.get("rubric.mode") == "joint":
-                check_judge_source(source_cfg, args.judge_model, parser)
+                check_judge_source(source_cfg, args, parser)
         stages[method] = "gad"
+        if args.init_step is None:
+            from pipeline import stage_step_budget, steps_per_epoch
+            init_step = stage_step_budget(source_cfg, "warmup", steps_per_epoch(source_cfg))
+        else:
+            init_step = args.init_step
         cfg.data.update({"budget.init_from_warmup_run": str(args.warmup_source.expanduser().resolve()),
-                         "budget.init_step": args.init_step})
+                         "budget.init_step": init_step})
     if method == "actor":
         if not args.warmup_source:
             cfg.data.update({"budget.init_from_warmup_run": str(naive),
-                             "budget.init_step": 2 if args.smoke else 271})
+                             "budget.init_step": 2 if args.smoke else steps_per_pass})
         if args.smoke:
             cfg.data.update({"run.max_stage_steps": 3, "rubric.actor_reward_group_weight": 0.25,
                              "rubric.actor_reward_rubric_std_floor": 0.045992180705070496,
@@ -204,11 +252,15 @@ def launch(args, parser):
             if not args.confirm_selection:
                 parser.error("first run select and inspect selection.json, then pass actor --confirm-selection")
             source_cfg = load_run_config(naive)
-            check_judge_source(source_cfg, args.judge_model, parser)
+            check_judge_source(source_cfg, args, parser)
             if recorded_judge(naive, source_cfg) != judge_fingerprint(cfg):
                 parser.error("Actor Judge settings differ from the selected naive run")
             cfg.data.update(actor_options(selection / "selection.json", naive))
-    problems = validate_config(cfg)
+    if method == "judge":
+        from extension_config import validate as validate_extensions
+        problems = validate_extensions(cfg)
+    else:
+        problems = validate_config(cfg)
     if problems:
         parser.error("\n".join(problems))
     if args.write_config:
@@ -258,23 +310,31 @@ def launch(args, parser):
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("method", choices=("seqkd", "base", "correctness", "rlvr", "naive", "select", "actor", "judge"))
-    p.add_argument("--epochs", type=int, choices=(2, 3), default=2, help="total data passes")
+    p.add_argument("--epochs", type=int, choices=(2, 3), default=3, help="total data passes (default: 3)")
+    p.add_argument("--prompt-batch", type=positive_int, default=64,
+                   help="global questions per step; rescales epoch budgets and the joint annotation quota")
     p.add_argument("--runs-root", type=Path, default=os.environ.get("H200_RUNS_ROOT", ROOT / "runs/h200_8gpu"))
     p.add_argument("--model-root", type=Path, default=ROOT / "assets/models")
     p.add_argument("--judge-model", choices=JUDGE_MODELS, default="30b-instruct",
                    help="online rubric Judge; 30B uses the same model release as the offline Teacher")
+    p.add_argument("--judge-protocol", choices=("direct_v1", "direct_brief_v1"),
+                   help="defaults to brief-check plus labels for 30B, and two direct labels for 8B")
     p.add_argument("--train-gpus", type=gpu_list, default="0,1,2,3")
     p.add_argument("--judge-gpus", type=gpu_list, default="4", help="dedicated physical indices, TP = count")
     p.add_argument("--judge-memory", type=float, default=.70, help="vLLM memory fraction on dedicated Judge cards")
+    p.add_argument("--judge-concurrency", type=positive_int, default=8, help="concurrent client requests to the Judge")
     p.add_argument("--kv", type=float, default=.40, help="student vLLM memory fraction")
-    p.add_argument("--max-seqs", type=int, default=128)
-    p.add_argument("--critic-micro", type=int, default=4)
+    p.add_argument("--max-seqs", type=positive_int, default=128)
+    p.add_argument("--rollout-batched-tokens", type=positive_int, help="student vLLM max tokens scheduled per iteration")
+    p.add_argument("--actor-tokens", type=positive_int, default=10240,
+                   help="per-GPU token budget for dynamic Actor minibatching and policy/reference log probabilities")
+    p.add_argument("--critic-micro", type=positive_int, default=4)
     p.add_argument("--smoke", action="store_true", help="full batch/length, bounded engineering budgets")
     p.add_argument("--tag", default="baseline", help="independent smoke output directory label")
     p.add_argument("--warmup-only", action="store_true",
                    help="stop at completed Warmup, e.g. to run mature GAD comparisons before --resume")
-    p.add_argument("--warmup-source", type=Path, help="read-only completed Warmup for a mature GAD smoke")
-    p.add_argument("--init-step", type=int, default=271, help="warmup checkpoint for --warmup-source")
+    p.add_argument("--warmup-source", type=Path, help="completed Warmup with matching prompt batch for mature GAD smoke")
+    p.add_argument("--init-step", type=positive_int, help="source Warmup checkpoint (default: its final step)")
     p.add_argument("--action", default="health", choices=("start", "stop", "health", "logs", "restart"),
                    help="judge service action")
     p.add_argument("--confirm-selection", action="store_true", help="use this series' recommendation for formal Actor")

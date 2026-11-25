@@ -26,7 +26,7 @@ def annotate_chains(client, requests, contexts, deadline, *, semantic=True,
         if on_state:on_state(rid,'final',result)
         if on_result:on_result(rid,result)
     def needs_review(result):
-        return process_protocol!='direct_v1' and semantic and 'parsed' in result and 'targeted_result' not in result and bool(targets(result['parsed']))
+        return process_protocol == 'events_v27' and semantic and 'parsed' in result and 'targeted_result' not in result and bool(targets(result['parsed']))
     def enqueue_review(rid,result):
         initial[rid]=result;queued[('review',rid)]=time.monotonic();review.append(rid)
     for rid in requests:

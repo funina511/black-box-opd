@@ -105,7 +105,6 @@ def annotate(owner, pairs, batch, global_mini, dp_size, step, *, scorer_results=
     import torch
     from scoring.math import correctness_label
     started = time.monotonic()
-    direct=owner.options.get('process_protocol','events_v27')=='direct_v1'
     schema_version=getattr(owner,'annotation_schema_version',V2_SCHEMA_VERSION)
     ledger_start=len(getattr(owner.judge,'api_ledger',[]))
     health_before=getattr(owner.judge,'health_get_count',0)

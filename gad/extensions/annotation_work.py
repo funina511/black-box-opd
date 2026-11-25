@@ -1,7 +1,8 @@
 """Shared annotation and immutable-cache path for prefetch and the main barrier."""
 import time
 from .common import append_json
-from .core.contracts import V2_DIMENSIONS as DIMS, validate_label, judge_messages
+from .core.contracts import V2_DIMENSIONS as DIMS, validate_label
+from .core.protocols import DIRECT_PROTOCOLS, judge_messages
 
 
 def score_pairs(owner, pairs, roles=('teacher', 'student')):
@@ -62,7 +63,7 @@ def build_labels(owner, pairs, selected_keys, schema_version, roles=('teacher', 
 
 def execute_requests(owner, unique, requests, values, step, deadline, *, phase='main'):
     from .online_v2 import persist_results, request_belongs_to, process_failure_kind
-    direct = owner.options.get('process_protocol', 'events_v27') == 'direct_v1'
+    protocol = owner.options.get('process_protocol', 'events_v27')
     ledger_start = len(getattr(owner.judge, 'api_ledger', []))
     try:
         from .annotation_scheduler import annotate_chains
@@ -110,11 +111,13 @@ def execute_requests(owner, unique, requests, values, step, deadline, *, phase='
         result = results.get(key, {'error': 'judge_result_missing', 'attempts': 0, 'failure_kind': 'technical'})
         if 'parsed' in result:
             parsed = result['parsed']
-            if direct:
-                values[key].update(process_protocol='direct_v1',review_status='not_requested',
+            if protocol in DIRECT_PROTOCOLS:
+                values[key].update(process_protocol=protocol,review_status='not_requested',
                     semantic_review=parsed['_semantic_review'],training_eligible=parsed['_training_eligible'],
                     raw_output=result.get('raw_output'),raw_labels=parsed['_raw_labels'])
                 for dim in DIMS[1:]:values[key]['labels'][dim]=dict(parsed[dim])
+                if protocol == 'direct_brief_v1':
+                    values[key]['brief_check'] = parsed['brief_check']
             else:
                 values[key].update(judge_reported_scope=parsed.get('_judge_reported_scope'),
                                    structural_validation_status=parsed.get('_structural_validation_status'),

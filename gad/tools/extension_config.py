@@ -5,7 +5,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
-from rubric.core.contracts import LAYOUT, layout_for, schema_for, digest, file_hash
+from rubric.core.contracts import LAYOUT, layout_for, digest, file_hash
+from rubric.core.protocols import DIRECT_PROTOCOLS, protocol_module, schema_for
 from gad.extensions.common import semantic_module_hash
 
 EXTENSION_DEFAULTS = {
@@ -106,8 +107,8 @@ def validate(cfg):
             problems.append(key + ' must be boolean')
     if cfg.get('execution.teacher_prefetch') or cfg.get('execution.early_annotation'):
         if (cfg.get('backends.profile') != 'gad_extensions_v1' or not cfg.get('rubric.enabled')
-                or cfg.get('rubric.mode') != 'joint' or cfg.get('rubric.process_protocol') != 'direct_v1'):
-            problems.append('annotation overlap requires gad_extensions_v1 + joint + direct_v1')
+                or cfg.get('rubric.mode') != 'joint' or cfg.get('rubric.process_protocol') not in DIRECT_PROTOCOLS):
+            problems.append('annotation overlap requires gad_extensions_v1 + joint + a direct process protocol')
     if cfg.get('execution.teacher_prefetch'):
         if not cfg.get('rubric.teacher_cache'):
             problems.append('Teacher prefetch requires rubric.teacher_cache')
@@ -149,8 +150,8 @@ def validate(cfg):
             if type(value) not in (int, float) or not math.isfinite(value) or value < 0:
                 problems.append('rubric.' + name + ' must be finite and nonnegative')
         if source in ('adv_plus_rubric', 'adv_plus_rubric_groupnorm'):
-            if cfg.get('rubric.version') != 'math_process_v2' or cfg.get('rubric.mode') != 'joint' or cfg.get('rubric.process_protocol') != 'direct_v1':
-                problems.append(source + ' requires math_process_v2 + joint + direct_v1')
+            if cfg.get('rubric.version') != 'math_process_v2' or cfg.get('rubric.mode') != 'joint' or cfg.get('rubric.process_protocol') not in DIRECT_PROTOCOLS:
+                problems.append(source + ' requires math_process_v2 + joint + a direct process protocol')
             if type(coef) in (int, float) and coef > 0 and not any(type(w) in (int, float) and math.isfinite(w) and w > 0 for w in weights):
                 problems.append('positive actor_reward_coef requires at least one positive weight')
         if source == 'adv_plus_rubric_groupnorm':
@@ -204,13 +205,14 @@ def validate(cfg):
             spec = None
             problems.append(f'rubric spec unreadable: {exc}')
         process_protocol=cfg.get('rubric.process_protocol')
-        if process_protocol not in ('events_v27','direct_v1'):problems.append('unsupported rubric.process_protocol')
-        if process_protocol=='direct_v1' and (cfg.get('rubric.semantic_check') or cfg.get('replay.enabled') or cfg.get('rubric.version')!='math_process_v2'):
-            problems.append('direct_v1 requires math_process_v2, no semantic review and no replay')
+        if process_protocol not in ('events_v27', *DIRECT_PROTOCOLS):problems.append('unsupported rubric.process_protocol')
+        if process_protocol in DIRECT_PROTOCOLS and (cfg.get('rubric.semantic_check') or cfg.get('replay.enabled') or cfg.get('rubric.version')!='math_process_v2'):
+            problems.append(f'{process_protocol} requires math_process_v2, no semantic review and no replay')
         if cfg.get('rubric.version') == 'math_process_v2':
             from rubric.core.contracts import V2_SCHEMA_VERSION, V2_INPUT_VERSION
-            if process_protocol=='direct_v1':
-                from rubric.core.process_direct import SCHEMA_VERSION as V2_SCHEMA_VERSION, INPUT_VERSION as V2_INPUT_VERSION
+            if process_protocol in DIRECT_PROTOCOLS:
+                protocol = protocol_module(process_protocol)
+                V2_SCHEMA_VERSION, V2_INPUT_VERSION = protocol.SCHEMA_VERSION, protocol.INPUT_VERSION
             try:
                 expected={'version':'math_process_v2','schema_version':V2_SCHEMA_VERSION,'input_protocol':V2_INPUT_VERSION}
                 if not isinstance(spec,dict) or any(spec.get(k)!=v for k,v in expected.items()):
@@ -219,7 +221,8 @@ def validate(cfg):
                 # Historical prompts may omit a declaration; any explicit version must match.
                 import re
                 declarations=re.findall(r'rubric\.(?:events|input)\.v[\d.]+',prompt)
-                if process_protocol=='direct_v1' and isinstance(spec,dict) and spec.get('process_protocol')!='direct_v1':problems.append('direct spec must declare process_protocol=direct_v1')
+                if process_protocol in DIRECT_PROTOCOLS and isinstance(spec,dict) and spec.get('process_protocol') != process_protocol:
+                    problems.append(f'direct spec must declare process_protocol={process_protocol}')
                 if any(v not in (V2_SCHEMA_VERSION,V2_INPUT_VERSION) for v in declarations):
                     problems.append('rubric prompt protocol declaration mismatch; use current v27 prompt')
             except (OSError,ValueError,yaml.YAMLError) as exc:
@@ -340,7 +343,8 @@ def service_identity(cfg, full=False):
         raise ValueError("judge local model weights missing")
     stats = {p.name: [p.stat().st_ino, p.stat().st_size, p.stat().st_mtime_ns, p.stat().st_ctime_ns] for p in files}
     import importlib.metadata
-    from gad.extensions.judge_client import guidance_schema, guidance_backend
+    from gad.extensions.process_client import guidance_schema
+    from gad.extensions.judge_client import guidance_backend
     identity = {"model": options["model"], "revision": options["model_revision"], "dtype": options["dtype"],
                 "tokenizer_path": str(model_dir.resolve()), "model_files": stats,
                 "vllm": importlib.metadata.version("vllm"),
@@ -357,9 +361,10 @@ def service_identity(cfg, full=False):
     identity["request_defaults"] = {key: options[key] for key in ("temperature", "top_p", "top_k", "min_p", "max_output_tokens", "max_context_tokens")}
     identity["judge_seed"] = cfg.get("rubric.seed")
     if cfg.get('rubric.version') == 'math_process_v2':
-        from rubric.core.process_v2 import protocol_identity
-        if cfg.get('rubric.process_protocol')=='direct_v1':
-            from rubric.core.process_direct import protocol_identity
+        protocol_identity = protocol_module(cfg.get('rubric.process_protocol')).protocol_identity
+        if cfg.get('rubric.process_protocol') == 'direct_brief_v1':
+            identity['protocol_client_sha256'] = file_hash(ROOT / 'gad/extensions/process_client.py')
+            identity['protocol_dispatch_sha256'] = file_hash(ROOT / 'rubric/core/protocols.py')
         identity['semantic_policy'] = {key: cfg.get('rubric.' + key) for key in ('semantic_check', 'semantic_max_extra_requests')}
         identity['semantic_module_hash'] = semantic_module_hash(cfg.get('rubric.process_protocol'))
         identity['protocol_identity'] = protocol_identity(Path(cfg.require('rubric.spec')).read_text(), Path(cfg.require('rubric.prompt')).read_text())
@@ -412,9 +417,7 @@ def hydra_overrides(cfg, stage, out_dir, start_step):
         driver["spec_hash"] = file_hash(driver["spec"])
         driver['prompt_hash'] = file_hash(driver['prompt'])
         if driver['version']=='math_process_v2':
-            from rubric.core.process_v2 import protocol_identity
-            if cfg.get('rubric.process_protocol')=='direct_v1':
-                from rubric.core.process_direct import protocol_identity
+            protocol_identity = protocol_module(driver['process_protocol']).protocol_identity
             driver['protocol_identity']=protocol_identity(Path(driver['spec']).read_text(),Path(driver['prompt']).read_text())
             driver['protocol_identity']['semantic_policy']={k:driver[k] for k in ('semantic_check','semantic_max_extra_requests')}
             driver['protocol_identity']['semantic_module_hash']=semantic_module_hash(driver['process_protocol'])

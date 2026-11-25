@@ -95,7 +95,7 @@ def prepare(cfg, run_dir, steps, smoke):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG, help="shared n=8 base recipe")
+    parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG, help="defaults to the two-epoch single-H200 recipe; use scripts/h200_8gpu.py rlvr for the eight-GPU series")
     parser.add_argument("--output", type=Path, help="new run directory, or existing run with --resume")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--steps", type=int, help="total optimizer steps (default: budget.rlvr_steps)")

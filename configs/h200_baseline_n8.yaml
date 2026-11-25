@@ -1,4 +1,4 @@
-# H200 NVL, GAD and rubric n=8 series. Base uses the original student and one-head Critic.
+# Single-H200 n=8 reference (two epochs). scripts/h200_8gpu.py derives the three-epoch node recipe.
 # Warmup and GAD each use 64 prompts x 8 student responses. SeqKD uses the offline teacher targets.
 # GAD adds 271 updates after Warmup 271. Actor-rubric starts from the naive Warmup checkpoint.
 # The H200 n=8 method overlays are in configs/overrides/.

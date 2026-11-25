@@ -9,6 +9,8 @@ VERSION = "gad.extensions.v1"
 
 
 def semantic_module_hash(process_protocol):
+    if process_protocol == 'direct_brief_v1':
+        return 'not_used'
     if process_protocol == 'direct_v1':
         # Existing direct_v1 services, label caches and annotation journals
         # include this value in their keys. The protocol never runs semantic_v24.

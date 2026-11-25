@@ -22,7 +22,7 @@ from gad.extensions.actor_reward import (DIMS, reward_scores, groupnorm_scores, 
 from gad.extensions import worker
 from config import validate_config
 from extension_config import hydra_overrides, N4_DEFAULTS
-from select_actor_reward import analyze, formal_step_range, question_half, read_shadow
+from select_actor_reward import analyze, formal_step_range, late_window_start, question_half, read_shadow, selection_config
 from cpu_fixtures import compose_cpu_config, load_cpu_config as load_config
 import pipeline
 
@@ -302,9 +302,14 @@ print('isolated_scorer_ok')
             self.assertEqual(4,f.call_count)
 
     def test_formal_budget_uses_planned_target_and_excludes_bounded_runs(self):
+        import pyarrow as pa
+        import pyarrow.parquet as pq
         cfg = load_config(ROOT / 'configs/h200_baseline_n8.yaml')
         with tempfile.TemporaryDirectory() as tmp:
             run = Path(tmp)
+            dataset = run / 'train.parquet'
+            pq.write_table(pa.table({'uid': range(17363)}), dataset)
+            cfg.data['data.train_file'] = str(dataset)
             self.assertEqual(formal_step_range(cfg, run), range(272, 543))
             cfg.data['budget.gad_new_steps'] = 542
             self.assertEqual(formal_step_range(cfg, run), range(272, 814))
@@ -315,6 +320,62 @@ print('isolated_scorer_ok')
             cfg.data['run.engineering_smoke'] = True
             with self.assertRaisesRegex(ValueError, 'bounded'):
                 formal_step_range(cfg, run)
+
+    def test_scaled_budget_and_window_with_and_without_training_parquet(self):
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+        cfg = load_config(ROOT / 'configs/h200_baseline_n8.yaml')
+        with tempfile.TemporaryDirectory() as tmp:
+            run = Path(tmp)
+            dataset = run / 'train.parquet'
+            pq.write_table(pa.table({'uid': range(17363)}), dataset)
+            cfg.data['data.train_file'] = str(dataset)
+            for batch, steps, last_start in ((64, 271, 721), (128, 135, 359), (256, 67, 179)):
+                cfg.data['data.train_batch_size'] = batch
+                cfg.data['budget.gad_new_steps'] = 2 * steps
+                cfg.data['budget.stage_epochs.gad'] = 3
+                self.assertEqual(formal_step_range(cfg, run), range(steps + 1, 3 * steps + 1))
+                self.assertEqual(late_window_start(3 * steps, steps), last_start)
+            cfg.data['budget.gad_new_steps'] = 542
+            with self.assertRaisesRegex(ValueError, 'expected one Warmup epoch'):
+                formal_step_range(cfg, run)
+            cfg.data['budget.gad_new_steps'] = None  # pure epoch recipe
+            marker = run / 'gad' / 'COMPLETED.json'
+            marker.parent.mkdir()
+            plan = {'returncode': 0, 'training_completed': True,
+                    'start_step': 67, 'total_steps': 201, 'steps_per_epoch': 135}
+            marker.write_text(json.dumps(plan))
+            with self.assertRaisesRegex(ValueError, 'steps_per_epoch differs'):
+                formal_step_range(cfg, run)
+            plan['steps_per_epoch'] = 67
+            marker.write_text(json.dumps(plan))
+            dataset.unlink()
+            (run / 'stage_gad.json').write_text(json.dumps({'returncode': 1}))
+            self.assertEqual(formal_step_range(cfg, run), range(68, 202))
+            plan['verified'] = {'last_step': 167}
+            marker.write_text(json.dumps(plan))
+            with self.assertRaisesRegex(ValueError, 'differs'):
+                formal_step_range(cfg, run)
+            marker.unlink()
+            with self.assertRaisesRegex(ValueError, 'finish successfully'):
+                formal_step_range(cfg, run)
+            (run / 'stage_gad.json').unlink()
+            with self.assertRaisesRegex(ValueError, 'need the frozen training parquet'):
+                formal_step_range(cfg, run)
+
+    def test_selector_relocates_the_pinned_run_snapshot(self):
+        import yaml
+        cfg = load_config(ROOT / 'configs/h200_baseline_n8.yaml')
+        with tempfile.TemporaryDirectory() as tmp:
+            run = Path(tmp) / cfg.require('run.run_id')
+            version_dir = run / 'reports' / 'resolved_configs'
+            version_dir.mkdir(parents=True)
+            filename = 'resolved_config_20261114T000000Z.yaml'
+            (version_dir / filename).write_text(yaml.safe_dump(cfg.to_dict()))
+            (run / 'current_resolved_config.txt').write_text('/old/machine/' + str(Path(run.name) / 'reports' / 'resolved_configs' / filename))
+            recovered = selection_config(run)
+            self.assertEqual(recovered.path, version_dir / filename)
+            self.assertEqual(recovered.require('data.train_batch_size'), 64)
 
     def test_eight_answer_shadow_groups(self):
         rows = rows_for([[i / 16, .9, .5, .1] for i in range(16)])

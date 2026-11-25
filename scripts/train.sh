@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Edit these values for NEW experiments; full configs are generated under runs/.
+# Launch the general train.yaml catalog. The three-epoch 8-H200 series uses scripts/h200_8gpu.py.
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 MODEL="" # Empty: use train.yaml selection.model; e.g. qwen3_0.6b

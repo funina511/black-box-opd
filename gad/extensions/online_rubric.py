@@ -4,7 +4,8 @@ import time
 from pathlib import Path
 from .common import DIMENSIONS, append_json, digest, file_hash, semantic_module_hash
 from .core.contracts import ANNOTATION_SCHEMA, judge_messages, validate_label
-from .judge_client import JudgeClient
+from .process_client import JudgeClient
+from .core.protocols import DIRECT_PROTOCOLS, protocol_module
 from .label_cache import LabelCache
 from .critic_batch import auxiliary_weights
 
@@ -28,14 +29,12 @@ class OnlineRubric:
         self.scorer = module.compute_score
         self.version = options.get('version', 'math_v1')
         self.process_protocol=options.get('process_protocol','events_v27')
-        self.annotation_schema_version='rubric.direct.v1' if self.process_protocol=='direct_v1' else 'rubric.events.v2.7'
+        protocol = protocol_module(self.process_protocol)
+        self.annotation_schema_version = protocol.SCHEMA_VERSION if self.process_protocol in DIRECT_PROTOCOLS else 'rubric.events.v2.7'
         if self.version == 'math_process_v2':
             from scoring.math import identity, score
-            from .core import process_v2
-            if self.process_protocol=='direct_v1':
-                from .core import process_direct as process_v2
-            self.annotation_contract_hash = file_hash(process_v2.__file__)
-            self.protocol_identity = process_v2.protocol_identity(self.spec, self.instruction)
+            self.annotation_contract_hash = file_hash(protocol.__file__)
+            self.protocol_identity = protocol.protocol_identity(self.spec, self.instruction)
             self.protocol_identity['semantic_policy'] = {key:options.get(key, default) for key,default in (('semantic_check',False),('semantic_max_extra_requests',1))}
             self.protocol_identity['semantic_module_hash'] = semantic_module_hash(self.process_protocol)
             if options.get('protocol_identity') is not None and self.protocol_identity != options['protocol_identity']:

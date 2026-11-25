@@ -202,6 +202,8 @@ def analyze(cfg,out):
 
 def judge(cfg,out):
     """At most 32 targeted references, with unchanged direct_v1 protocol."""
+    if cfg.get('rubric.process_protocol') != 'direct_v1':
+        raise ValueError("the historical Actor reference study requires a direct_v1 Judge config")
     import threading
     from transformers import AutoTokenizer
     from extension_config import service_identity
@@ -268,7 +270,8 @@ def judge(cfg,out):
 
 def main():
     p=argparse.ArgumentParser(description=__doc__)
-    p.add_argument('action',choices=['prepare','generate','merge','infer','analyze','judge'])
+    p.add_argument('action',choices=['prepare','generate','merge','infer','analyze','judge'],
+                   help='judge scores selected references with the historical direct_v1 protocol')
     p.add_argument('--config',type=Path,required=True);p.add_argument('--output',type=Path,required=True)
     p.add_argument('--questions',type=int,choices=[128,256,512],default=128)
     p.add_argument('--shard-index',type=int,default=0);p.add_argument('--shards',type=int,default=1)

@@ -63,27 +63,80 @@ def std_distribution(rows, weights):
     return torch.tensor([float(scores[ids].std()) for ids in groups.values()])
 
 
+def selection_config(run):
+    """Read the frozen snapshot beside the log, including a relocated historical run."""
+    from config import load_config, run_config_path
+    pointer = run / 'current_resolved_config.txt'
+    snapshot = None
+    if not (run / 'train.yaml').is_file() and pointer.is_file():
+        # Old runners saved absolute pointers into their own reports/resolved_configs.
+        target = Path(pointer.read_text().strip())
+        if target.parent.name == 'resolved_configs':
+            snapshot = run / 'reports' / 'resolved_configs' / target.name
+    if snapshot is None or not snapshot.is_file():
+        snapshot = run_config_path(run)
+    cfg = load_config(snapshot)
+    recorded_run = Path(cfg.require('run.output_root')) / cfg.require('run.run_id')
+    if recorded_run.resolve() != run.resolve() and not snapshot.resolve().is_relative_to(run.resolve()):
+        raise ValueError(f'copy the frozen config snapshot into the archived run {run}')
+    if Path(cfg.require('run.run_id')).name != run.name:
+        raise ValueError('run directory name differs from its frozen run ID')
+    return cfg.for_stage('gad')
+
+
 def formal_step_range(cfg, run):
-    """These calibrated protocols use a 271-step Warmup and one or two GAD epochs."""
-    from pipeline import stage_step_budget
+    """Use the frozen GAD plan and the same drop-last epoch calculation as training."""
+    from pipeline import completion_marker, stage_step_budget, steps_per_epoch
     if cfg.get('run.engineering_smoke') or cfg.get('run.max_stage_steps') is not None:
         raise ValueError('offline formal selection does not accept a bounded training run')
-    handoff = cfg.get('budget.init_step') or cfg.get('budget.handoff_step') or stage_step_budget(cfg, 'warmup', 271)
-    end = handoff + stage_step_budget(cfg, 'gad', 271, handoff_step=handoff)
-    if handoff != 271 or end not in (542, 813):
-        raise ValueError(f'unsupported formal budget: Warmup {handoff}, GAD target {end}')
+
+    plan, verified = {}, {}
+    marker = completion_marker(run, 'gad')
     stage_file = run / 'stage_gad.json'
-    if stage_file.is_file():
+    if marker.is_file():
+        plan = json.loads(marker.read_text())
+        verified = plan.get('verified', {})
+        if not plan.get('training_completed') or plan.get('returncode') != 0:
+            raise ValueError('GAD completion record does not confirm successful training')
+    elif stage_file.is_file():
         stage = json.loads(stage_file.read_text())
+        if stage['returncode'] != 0:
+            raise ValueError('GAD stage did not finish successfully')
         plan = stage['plan']
-        if stage['returncode'] != 0 or (plan['start_step'], plan['total_steps']) != (handoff, end):
-            raise ValueError('completed GAD stage differs from the frozen formal budget')
+        verified = stage.get('verification', {})
+    if verified.get('training_status') == 'failed':
+        raise ValueError('GAD completion record reports a training failure')
+
+    train_file = Path(cfg.require('data.train_file'))
+    recorded_steps = plan.get('steps_per_epoch')
+    if train_file.is_file():
+        per_epoch = steps_per_epoch(cfg)
+        if recorded_steps is not None and per_epoch != recorded_steps:
+            raise ValueError('GAD steps_per_epoch differs from the frozen data and batch size')
+    elif type(recorded_steps) is int and recorded_steps > 0:
+        per_epoch = recorded_steps
+    else:
+        raise ValueError('need the frozen training parquet or steps_per_epoch from the completed GAD stage')
+
+    handoff = cfg.get('budget.init_step') or cfg.get('budget.handoff_step') or stage_step_budget(cfg, 'warmup', per_epoch)
+    end = handoff + stage_step_budget(cfg, 'gad', per_epoch, handoff_step=handoff)
+    if handoff != per_epoch or end not in (2 * per_epoch, 3 * per_epoch):
+        raise ValueError(f'expected one Warmup epoch and one or two GAD epochs of {per_epoch} steps; '
+                         f'got Warmup {handoff}, GAD target {end}')
+    if plan and ((plan['start_step'], plan['total_steps']) != (handoff, end) or
+                 verified.get('last_step', end) != end):
+        raise ValueError('completed GAD stage differs from the frozen formal budget')
     return range(handoff + 1, end + 1)
 
 
-def analyze(rows, *, group_size=None, final_step=542):
-    # The two-epoch protocol used its final 93 steps (450..542).
-    late_start = final_step - 92
+def late_window_start(final_step, steps_per_epoch):
+    # Preserve the same fraction of the last epoch as the original 450..542 window.
+    late_steps = (93 * steps_per_epoch + 270) // 271
+    return final_step - late_steps + 1
+
+
+def analyze(rows, *, group_size=None, final_step=542, steps_per_epoch=271):
+    late_start = late_window_start(final_step, steps_per_epoch)
     late_key = f'late_{late_start}_{final_step}'
     group_size = shadow_group_size(rows, group_size)
     splits = {'selection': [r for r in rows if question_half(r['question_id']) == 0],
@@ -136,11 +189,11 @@ def main():
     metrics = run / 'gad/extension_metrics.jsonl'
     # A bounded smoke or incomplete run must never select formal parameters.
     from gad.extensions.checkpoint_state import checkpoint_problems
-    from config import load_run_config
-    cfg = load_run_config(run).for_stage('gad')
+    cfg = selection_config(run)
     step_range = formal_step_range(cfg, run)
     final_step = step_range[-1]
-    late_start = final_step - 92
+    per_epoch = step_range.start - 1  # one full Warmup epoch precedes GAD
+    late_start = late_window_start(final_step, per_epoch)
     late_key = f'late_{late_start}_{final_step}'
     checkpoint = run / 'gad' / f'global_step_{final_step}'
     if checkpoint_problems(checkpoint, required=True):
@@ -154,7 +207,7 @@ def main():
                        group_size=group_size)
     if sorted({r['step'] for r in rows}) != list(step_range):
         raise ValueError(f'need all {len(step_range)} committed naive GAD shadow steps, {step_range[0]}..{final_step}')
-    result = analyze(rows, group_size=group_size, final_step=final_step)
+    result = analyze(rows, group_size=group_size, final_step=final_step, steps_per_epoch=per_epoch)
     result['source'] = {'run': str(run), 'metrics': str(metrics), 'sha256': file_hash(metrics)}
     default_output = ROOT / 'reports/gad_n4_20261105/selection' if group_size == 4 else run / 'reports/actor_reward_selection'
     output = Path(args.output) if args.output else default_output
