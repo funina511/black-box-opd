@@ -14,7 +14,7 @@ from urllib.parse import urlparse
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from config import add_config_arguments,select_config
-from extension_config import service_identity, ROOT
+from extension_config import judge_engine_settings, service_identity, ROOT
 from rubric.core.contracts import digest
 
 
@@ -125,14 +125,21 @@ def manage(cfg, args, directory):
         return
     identity = service_identity(cfg)
     expected = digest(identity)
+    gpu_ids = str(cfg.require("resources.judge_gpus"))
+    scheduling = judge_engine_settings(cfg)
+    launch_settings = {**scheduling, "gpu_memory_utilization": options["gpu_memory_utilization"]}
     if args.action == "health":
         from gad.extensions.judge_client import JudgeClient
         # No tokenizer/GPU load is needed for identity-only health checks.
         result = JudgeClient(options, expected, tokenizer=object()).health()
+        if str(result.get("gpu_ids")) != gpu_ids:
+            raise RuntimeError(f"Running Judge uses GPUs {result.get('gpu_ids')}; expected {gpu_ids}")
+        if "launch_settings" in result and result["launch_settings"] != launch_settings:
+            raise RuntimeError("running Judge launch settings differ; stop it before changing the server configuration")
         print(json.dumps({"healthy": True, "identity_hash": result["identity_hash"], "model": options["model"],
-                          "gpu_ids": result.get("gpu_ids"), "fingerprint_file": str(fingerprint_file)}, indent=2))
+                          "gpu_ids": gpu_ids, "launch_settings": result.get("launch_settings"),
+                          "fingerprint_file": str(fingerprint_file)}, indent=2))
         return
-    gpu_ids = str(cfg.require("resources.judge_gpus"))
     if (set(gpu_ids.split(",")) & set(str(cfg.get("resources.gpus")).split(","))
             and cfg.get("resources.allow_judge_gpu_sharing") is not True):
         raise RuntimeError("judge GPU IDs overlap training")
@@ -143,8 +150,10 @@ def manage(cfg, args, directory):
             "--max-model-len", str(options["max_context_tokens"]),
             "--gpu-memory-utilization", str(options["gpu_memory_utilization"]),
             "--cpu-offload-gb", str(options["cpu_offload_gb"]),
-            "--max-num-seqs", "16", "--enforce-eager", "--disable-log-requests",
+            "--max-num-seqs", str(scheduling["max_num_seqs"]), "--disable-log-requests",
             "--guided-decoding-backend", "xgrammar"]
+    if scheduling["enforce_eager"]:
+        argv.append("--enforce-eager")
     if thinking:
         argv += ['--enable-reasoning', '--reasoning-parser', options['reasoning_parser']]
     if args.dry_run:
@@ -163,6 +172,19 @@ def manage(cfg, args, directory):
                 raise RuntimeError(f"Loopback port {port} is already owned by another process")
     elif owner and Path(f"/proc/{owner['pid']}").exists():
         if process_birth(owner["pid"]) == owner["birth"]:
+            current = json.loads(fingerprint_file.read_text())
+            if owner["identity_hash"] != expected or current.get("gpu_ids") != gpu_ids:
+                raise RuntimeError("running Judge identity or GPU allocation differs; stop it before starting another configuration")
+            if "launch_settings" in current:
+                if current["launch_settings"] != launch_settings:
+                    raise RuntimeError("running Judge launch settings differ; stop it before starting another configuration")
+            else:
+                # Legacy launches record the scheduling defaults in their
+                # known identity and the GPU memory fraction in their argv.
+                process_args = Path(f"/proc/{owner['pid']}/cmdline").read_bytes().decode().split("\0")
+                fraction = "--gpu-memory-utilization"
+                if fraction not in process_args or float(process_args[process_args.index(fraction) + 1]) != options["gpu_memory_utilization"]:
+                    raise RuntimeError("legacy Judge GPU memory fraction differs or cannot be verified; stop it before starting another configuration")
             print(f"Judge process already owned: {owner['pid']}; use --action health")
             return
     query = subprocess.run(["nvidia-smi", "--query-gpu=index,memory.used", "--format=csv,noheader,nounits"],
@@ -170,7 +192,7 @@ def manage(cfg, args, directory):
     busy = {line.split(",")[0].strip(): int(line.split(",")[1]) for line in query.stdout.splitlines()}
     if any(busy.get(gpu.strip(), 100000) > 512 for gpu in gpu_ids.split(",")):
         raise RuntimeError("judge GPUs unavailable; inspect nvidia-smi before starting")
-    fingerprint = {"identity": identity, "identity_hash": expected, "gpu_ids": gpu_ids}
+    fingerprint = {"identity": identity, "identity_hash": expected, "gpu_ids": gpu_ids, "launch_settings": launch_settings}
     fingerprint_file.write_text(json.dumps(fingerprint, indent=2))
     env = dict(os.environ, CUDA_VISIBLE_DEVICES=gpu_ids, GAD_JUDGE_FINGERPRINT_FILE=str(fingerprint_file),
                VLLM_WORKER_MULTIPROC_METHOD="spawn", TOKENIZERS_PARALLELISM="false", VLLM_USE_V1="0")

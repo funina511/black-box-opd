@@ -498,6 +498,29 @@ class MicroBatchBudgetTests(unittest.TestCase):
 
 
 class BackendPatchTests(unittest.TestCase):
+    @unittest.skipUnless(os.environ.get("GAD_TEST_EXTENSION_ROOT"), "needs generated training backends")
+    def test_deployed_checkpoint_decisions(self):
+        import ast
+        from types import SimpleNamespace
+        for stage in ("seqkd", "gad"):
+            path = Path(os.environ["GAD_TEST_EXTENSION_ROOT"]) / stage / "verl/trainer/ppo/ray_trainer.py"
+            module = ast.parse(path.read_text())
+            save_if, = (node for node in ast.walk(module) if isinstance(node, ast.If)
+                        and "self.config.trainer.checkpoint_steps" in ast.unparse(node.test))
+            self.assertIn("self._save_checkpoint()", ast.unparse(save_if.body[0]))
+            predicate = compile(ast.Expression(save_if.test), str(path), "eval")
+            trainer = SimpleNamespace(save_freq=50, checkpoint_steps=[542])
+            runner = SimpleNamespace(config=SimpleNamespace(trainer=trainer))
+            for last, forced_stop, step, expect in ((False, False, 500, True), (False, False, 541, False),
+                    (False, False, 542, True), (False, False, 543, False), (False, False, 550, True),
+                    (True, False, 813, True), (False, True, 819, stage == "gad")):
+                runner.global_steps = step
+                self.assertEqual(eval(predicate, {}, {"self": runner, "is_last_step": last,
+                                                       "extension_stop": forced_stop}), expect)
+            trainer.checkpoint_steps = []
+            runner.global_steps = 542
+            self.assertFalse(eval(predicate, {}, {"self": runner, "is_last_step": False, "extension_stop": False}))
+
     def test_patches_are_applied_and_verified_on_every_backend(self) -> None:
         for stage in ("seqkd", "warmup", "gad"):
             worktree = BACKEND_ROOT / stage
@@ -1021,6 +1044,24 @@ class HandoffTests(unittest.TestCase):
 
 
 class StageArtifactTests(unittest.TestCase):
+    def test_rotation_and_stage_verification_preserve_the_second_epoch(self):
+        from prune_checkpoints import apply_retention
+        with tempfile.TemporaryDirectory() as tmp:
+            for stage in ("seqkd", "gad"):
+                directory = Path(tmp) / stage
+                for step in (500, 542, 550, 813):
+                    self._complete_checkpoint(directory, step, stage=stage)
+                report = apply_retention(directory, keep_checkpoints=1, checkpoint_steps=[542])
+                self.assertEqual({Path(p).name for p in report["keep"]}, {"global_step_542", "global_step_813"})
+                self.assertEqual(sorted(p.name for p in directory.glob("global_step_*")), ["global_step_542", "global_step_813"])
+                check = pipeline.verify_stage_artifacts(stage, directory, expected_step=813, checkpoint_steps=[542])
+                self.assertTrue(check["ok"], check["problems"])
+                (directory / "global_step_542" / "data.pt").unlink()
+                check = pipeline.verify_stage_artifacts(stage, directory, expected_step=813, checkpoint_steps=[542])
+                self.assertFalse(check["ok"])
+                self.assertIn("required milestone 542", str(check["training_problems"]))
+                self.assertTrue(pipeline.verify_stage_artifacts(stage, directory, expected_step=813)["ok"])
+
     def test_failed_stage_log_is_preserved_before_the_next_attempt(self) -> None:
         """A restart truncates logs/<stage>.log, so a failure must leave a copy behind."""
         with tempfile.TemporaryDirectory() as tmp:
@@ -1425,6 +1466,7 @@ class HydraComposeTests(unittest.TestCase):
     def _plan_overrides(self, tmp_path: Path, stage: str) -> list[str]:
         cfg_path = tmp_path / "run.yaml"
         payload = base_config(tmp_path)
+        payload["resources"]["checkpoint_steps"] = {"seqkd": [2], "gad": [12]}
         write_yaml(cfg_path, payload)
         cfg = gad_config.load_config(cfg_path)
         handoff = None
@@ -1453,6 +1495,7 @@ with initialize_config_dir(config_dir=config_dir, version_base=None):
     cfg = compose(config_name="ppo_trainer", overrides=overrides)
 payload = {
     "total_training_steps": int(cfg.trainer.total_training_steps),
+    "checkpoint_steps": list(cfg.trainer.checkpoint_steps),
     "critic_warmup": int(cfg.trainer.critic_warmup),
     "use_kl_loss": bool(cfg.actor_rollout_ref.actor.use_kl_loss),
     "kl_loss_coef": float(cfg.actor_rollout_ref.actor.kl_loss_coef),
@@ -1487,6 +1530,7 @@ print("@@CFG@@" + json.dumps(payload))
                         payload = json.loads(line[len("@@CFG@@"):])
                 self.assertIsNotNone(payload, f"{stage}: no config payload in {result.stdout[-500:]}")
                 self.assertEqual(payload["total_training_steps"], expected_steps[stage], stage)
+                self.assertEqual(payload["checkpoint_steps"], {"seqkd": [2], "warmup": [], "gad": [12]}[stage])
                 self.assertEqual(payload["critic_warmup"], 0 if stage == "gad" else 10, stage)
                 self.assertEqual(payload["use_kl_loss"], stage != "seqkd", stage)
                 self.assertEqual(payload["val_n"], 1, stage)

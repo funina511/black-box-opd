@@ -132,6 +132,8 @@ DEFAULTS: dict[str, Any] = {
     "resources.gpus": "",
     "resources.save_freq": 50,
     "resources.keep_last_checkpoints": None,
+    "resources.checkpoint_steps.seqkd": [],
+    "resources.checkpoint_steps.gad": [],
     "resources.test_freq": 50,
     "resources.max_actor_ckpt_to_keep": None,
     "resources.max_critic_ckpt_to_keep": None,
@@ -268,6 +270,9 @@ class Config:
         if epochs <= 0:
             raise PipelineError(f"config key 'budget.stage_epochs.{stage}' must be > 0, got {epochs}")
         return epochs
+
+    def checkpoint_steps(self, stage: str) -> list[int]:
+        return self.get(f"resources.checkpoint_steps.{stage}", [])
 
     def stage_lr(self, stage: str) -> float:
         return float(self.require(STAGE_LR_KEY[stage]))
@@ -655,6 +660,13 @@ def validate_config(config: Config) -> list[str]:
         except (TypeError, ValueError):
             pass
 
+    for stage in ("seqkd", "gad"):
+        steps = config.checkpoint_steps(stage)
+        if not isinstance(steps, list) or any(type(step) is not int or step < 1 for step in steps):
+            problems.append(f"resources.checkpoint_steps.{stage} must be a list of positive global steps")
+        elif steps and config.get("resources.keep_last_checkpoints") is None and (
+                config.get("resources.max_actor_ckpt_to_keep") or config.get("resources.max_critic_ckpt_to_keep")):
+            problems.append("set resources.keep_last_checkpoints for milestone-aware checkpoint rotation")
     keep_checkpoints = config.get("resources.keep_last_checkpoints")
     if keep_checkpoints is not None:
         if isinstance(keep_checkpoints, bool) or not isinstance(keep_checkpoints, int):

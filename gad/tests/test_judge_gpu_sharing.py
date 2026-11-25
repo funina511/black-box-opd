@@ -2,6 +2,7 @@
 from contextlib import redirect_stdout
 import io
 import json
+import os
 from pathlib import Path
 import sys
 import tempfile
@@ -16,6 +17,7 @@ from gad.extensions.judge_client import JudgeClient
 from pipeline import stage_signature
 from preflight import Report, check_online_judge
 from rubric.core.contracts import digest
+from extension_config import service_identity
 import rubric_judge
 
 
@@ -103,6 +105,37 @@ class JudgeGpuSharingTests(unittest.TestCase):
                 rubric_judge.stop_owned(owner, owner_file, restart_gpus='0')
             kill.assert_not_called()
             owner_file.unlink.assert_not_called()
+
+    def test_server_caps_and_graphs_are_in_argv_and_service_identity(self):
+        self.cfg.data.update({FLAG: True, 'rubric.judge.enable_thinking': False, 'rubric.judge.reasoning_parser': None})
+        original = service_identity(self.cfg)
+        self.assertNotIn('server_scheduling', original)
+        default_args = self.launch_plan()['argv']
+        self.assertEqual('16', default_args[default_args.index('--max-num-seqs') + 1])
+        self.cfg.data['resources.judge_max_num_seqs'] = 32
+        capped = service_identity(self.cfg)
+        self.assertNotEqual(original, capped)
+        self.cfg.data['resources.judge_enforce_eager'] = False
+        self.assertNotEqual(capped, service_identity(self.cfg))
+        args = self.launch_plan()['argv']
+        self.assertNotIn('--enforce-eager', args)
+        self.assertEqual('32', args[args.index('--max-num-seqs') + 1])
+
+    def test_start_rejects_live_owner_with_different_launch_parameters(self):
+        self.cfg.data[FLAG] = True
+        with tempfile.TemporaryDirectory() as directory, patch.object(rubric_judge, 'service_identity', return_value=self.identity), \
+                patch.object(rubric_judge.subprocess, 'Popen') as popen:
+            folder = Path(directory)
+            pid = os.getpid()
+            (folder / 'owner.json').write_text(json.dumps({'pid': pid, 'birth': rubric_judge.process_birth(pid),
+                                                         'identity_hash': digest(self.identity)}))
+            args = Mock(action='start', dry_run=False)
+            for record, reason in [({'gpu_ids': '7'}, 'GPU allocation'),
+                                   ({'gpu_ids': '0', 'launch_settings': {'max_num_seqs': 32}}, 'launch settings')]:
+                (folder / 'fingerprint.json').write_text(json.dumps(record))
+                with self.assertRaisesRegex(RuntimeError, reason):
+                    rubric_judge.manage(self.cfg, args, folder)
+            popen.assert_not_called()
 
     def test_restart_waits_for_verified_service(self):
         from gad.extensions.judge_client import ServiceUnavailable

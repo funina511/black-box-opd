@@ -57,7 +57,7 @@ def checkpoint_requirements(cfg, stage):
 
 
 def plan_retention(stage_dir: Path, *, keep_checkpoints: int, extensions_required: bool = False,
-                   world_size: int | None = None) -> dict:
+                   world_size: int | None = None, checkpoint_steps=()) -> dict:
     if keep_checkpoints < 1:
         raise ValueError("keep_checkpoints must be positive")
     marker = stage_dir / "latest_checkpointed_iteration.txt"
@@ -65,7 +65,7 @@ def plan_retention(stage_dir: Path, *, keep_checkpoints: int, extensions_require
         return {"stage": str(stage_dir), "latest": None, "keep": [], "delete": [], "reason": "no latest marker"}
     latest = int(marker.read_text(encoding="utf-8").strip())
     found = checkpoint_dirs(stage_dir)
-    pins = pinned_steps(stage_dir, found)
+    pins = pinned_steps(stage_dir, found) | {step for step, _ in found if step in checkpoint_steps}
     older = [(step, path) for step, path in found if step < latest]
     if latest not in {step for step, _ in found}:
         return {"stage": str(stage_dir), "latest": latest, "keep": [], "delete": [],
@@ -107,9 +107,9 @@ def plan_retention(stage_dir: Path, *, keep_checkpoints: int, extensions_require
 
 
 def apply_retention(stage_dir: Path, *, keep_checkpoints: int, extensions_required: bool = False,
-                    world_size: int | None = None) -> dict:
+                    world_size: int | None = None, checkpoint_steps=()) -> dict:
     plan = plan_retention(stage_dir, keep_checkpoints=keep_checkpoints,
-                          extensions_required=extensions_required, world_size=world_size)
+                          extensions_required=extensions_required, world_size=world_size, checkpoint_steps=checkpoint_steps)
     removed = []
     for raw_path in plan["delete"]:
         path = Path(raw_path)
@@ -136,9 +136,11 @@ class RetentionMonitor:
     """Prune after the trainer advances its completed-checkpoint marker."""
 
     def __init__(self, stage_dir: Path, *, keep_checkpoints: int,
-                 interval_seconds: int = 30, extensions_required: bool = False, world_size: int | None = None):
+                 interval_seconds: int = 30, extensions_required: bool = False, world_size: int | None = None,
+                 checkpoint_steps=()):
         self.stage_dir = stage_dir
         self.keep_checkpoints = keep_checkpoints
+        self.checkpoint_steps = checkpoint_steps
         self.extensions_required = extensions_required
         self.world_size = world_size
         self.interval_seconds = interval_seconds
@@ -148,7 +150,8 @@ class RetentionMonitor:
     def _once(self) -> None:
         try:
             plan = apply_retention(self.stage_dir, keep_checkpoints=self.keep_checkpoints,
-                                   extensions_required=self.extensions_required, world_size=self.world_size)
+                                   extensions_required=self.extensions_required, world_size=self.world_size,
+                                   checkpoint_steps=self.checkpoint_steps)
             if plan["delete"]:
                 print(f"[gad] checkpoint retention: removed {len(plan['delete'])} old "
                       f"checkpoint(s) under {self.stage_dir}", flush=True)
@@ -213,7 +216,8 @@ def main() -> None:
             raise ValueError(f"unknown stage: {stage}")
         stage_dir = run_dir / stage
         action = apply_retention if args.apply else plan_retention
-        plan = action(stage_dir, keep_checkpoints=int(keep_checkpoints), **checkpoint_requirements(cfg, stage))
+        plan = action(stage_dir, keep_checkpoints=int(keep_checkpoints),
+                      checkpoint_steps=cfg.for_stage(stage).checkpoint_steps(stage), **checkpoint_requirements(cfg, stage))
         print(f"[prune] {stage}: latest={plan['latest']}, keep={len(plan['keep'])}, "
               f"delete={len(plan['delete'])}", flush=True)
         if plan.get("reason"):

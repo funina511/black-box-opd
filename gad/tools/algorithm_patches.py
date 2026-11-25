@@ -193,8 +193,8 @@ def apply(worktree, stage):
         "                is_last_step = self.global_steps >= self.total_training_steps\n"
         "                _gad_invocation_limit = self.config.trainer.get('gad_extensions', {}).get('max_invocation_steps')\n"
         "                extension_stop = bool(_gad_invocation_limit and self.global_steps - _gad_invocation_start_step >= _gad_invocation_limit)\n", "invocation limit")
-    texts[key] = replace(texts[key], "                    if self.config.trainer.save_freq > 0 and (is_last_step or self.global_steps % self.config.trainer.save_freq == 0):\n",
-        "                    if is_last_step or extension_stop or (self.config.trainer.save_freq > 0 and self.global_steps % self.config.trainer.save_freq == 0):\n", "limit checkpoint")
+    texts[key] = replace(texts[key], "                    if self.global_steps in self.config.trainer.checkpoint_steps or (self.config.trainer.save_freq > 0 and (is_last_step or self.global_steps % self.config.trainer.save_freq == 0)):\n",
+        "                    if is_last_step or extension_stop or self.global_steps in self.config.trainer.checkpoint_steps or (self.config.trainer.save_freq > 0 and self.global_steps % self.config.trainer.save_freq == 0):\n", "limit checkpoint")
     texts[key] = replace(texts[key], "                if is_last_step:\n                    pprint(f\"Final validation metrics: {last_val_metrics}\")",
         "                if is_last_step or extension_stop:\n                    pprint(f\"Final validation metrics: {last_val_metrics}\")", "limit return")
     texts[key] = replace(texts[key], "        # latest checkpointed iteration tracker (for atomic usage)\n",

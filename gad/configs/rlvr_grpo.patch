@@ -144,17 +144,14 @@
                          # reward_tensor: (bsz, response_length)
  
                      with (self.gad_extensions.timed_phase(marked_timer, "adv", timing_raw, color="brown") if self.gad_extensions is not None else marked_timer("adv", timing_raw, color="brown")):
-@@ -1500,7 +1497,9 @@
-                                 last_val_metrics = val_metrics
-                         metrics.update(val_metrics)
- 
--                    if is_last_step or extension_stop or (self.config.trainer.save_freq > 0 and self.global_steps % self.config.trainer.save_freq == 0):
-+                    periodic_save = self.config.trainer.save_freq > 0 and self.global_steps % self.config.trainer.save_freq == 0
-+                    eval_save = self.global_steps in self.config.trainer.rlvr_eval_steps
-+                    if is_last_step or extension_stop or periodic_save or eval_save:
+@@ -1503,4 +1500,7 @@
                          with (self.gad_extensions.timed_phase(marked_timer, "save_checkpoint", timing_raw, color="green") if self.gad_extensions is not None else marked_timer("save_checkpoint", timing_raw, color="green")):
                              self._save_checkpoint()
++                    elif self.global_steps in self.config.trainer.rlvr_eval_steps:
++                        with marked_timer("save_checkpoint", timing_raw, color="green"):
++                            self._save_checkpoint()
  
+                 # training metrics
 --- a/verl/utils/checkpoint/fsdp_checkpoint_manager.py
 +++ b/verl/utils/checkpoint/fsdp_checkpoint_manager.py
 @@ -143,6 +143,9 @@

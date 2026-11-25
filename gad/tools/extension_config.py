@@ -69,6 +69,7 @@ EXTENSION_DEFAULTS = {
     "replay.sampling": "uniform_without_replacement", "replay.eviction": "oldest_first",
     "replay.insert_after_step": True, "replay.store_labels": True, "replay.seed": 43,
     "resources.judge_gpus": None,
+    "resources.judge_max_num_seqs": 16, "resources.judge_enforce_eager": True,
     "resources.allow_judge_gpu_sharing": False,
 }
 
@@ -87,7 +88,8 @@ N4_DEFAULTS = {key: EXTENSION_DEFAULTS[key] for key in (
     'execution.teacher_prefetch', 'execution.early_annotation',
     'actor_reward.fp32', 'actor_reward.scorer_monitor', 'rubric.actor_reward_shadow',
     'rubric.actor_reward_group_weight', 'rubric.actor_reward_rubric_std_floor',
-    'rubric.actor_reward_selection_confirmed', 'resources.allow_judge_gpu_sharing')}
+    'rubric.actor_reward_selection_confirmed', 'resources.allow_judge_gpu_sharing',
+    'resources.judge_max_num_seqs', 'resources.judge_enforce_eager')}
 
 
 ACTOR_REWARD_DEFAULTS = {key: value for key, value in EXTENSION_DEFAULTS.items()
@@ -97,6 +99,16 @@ ACTOR_REWARD_DEFAULTS = {key: value for key, value in EXTENSION_DEFAULTS.items()
 def legacy_reward_defaults(cfg):
     return cfg.get('rubric.reward_source') == 'adv_only' and all(
         cfg.get(key, default) == default for key, default in ACTOR_REWARD_DEFAULTS.items())
+
+
+def judge_engine_settings(cfg):
+    max_seqs = cfg.get("resources.judge_max_num_seqs", 16)
+    eager = cfg.get("resources.judge_enforce_eager", True)
+    if type(max_seqs) is not int or max_seqs < 1:
+        raise ValueError("resources.judge_max_num_seqs must be a positive integer")
+    if type(eager) is not bool:
+        raise ValueError("resources.judge_enforce_eager must be boolean")
+    return {"max_num_seqs": max_seqs, "enforce_eager": eager}
 
 
 def validate(cfg):
@@ -232,6 +244,10 @@ def validate(cfg):
             problems.append('rubric.max_empty_student_process_steps must be a positive integer')
         if cfg.get("rubric.mode") == "joint":
             import math
+            try:
+                judge_engine_settings(cfg)
+            except ValueError as exc:
+                problems.append(str(exc))
             thinking = cfg.get('rubric.judge.enable_thinking')
             parser = cfg.get('rubric.judge.reasoning_parser')
             if type(thinking) is not bool:
@@ -359,6 +375,11 @@ def service_identity(cfg, full=False):
                 "guidance_schema_hash": digest(guidance_schema(cfg.get('rubric.version'),process_protocol=cfg.get('rubric.process_protocol'))),
                 "cpu_offload_gb": options["cpu_offload_gb"]}
     identity["request_defaults"] = {key: options[key] for key in ("temperature", "top_p", "top_k", "min_p", "max_output_tokens", "max_context_tokens")}
+    # These settings were hard-coded in the original service. Keep its
+    # published service and cache fingerprints for that exact combination.
+    server = judge_engine_settings(cfg)
+    if server != {"max_num_seqs": 16, "enforce_eager": True}:
+        identity["server_scheduling"] = server
     identity["judge_seed"] = cfg.get("rubric.seed")
     if cfg.get('rubric.version') == 'math_process_v2':
         protocol_identity = protocol_module(cfg.get('rubric.process_protocol')).protocol_identity

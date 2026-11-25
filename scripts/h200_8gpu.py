@@ -134,6 +134,9 @@ def launch(args, parser):
         if args.write_config:
             parser.error("--write-config materializes a new recipe; --resume uses the existing frozen config")
         if method == "rlvr":
+            if not (run / "rlvr_plan.json").is_file():
+                parser.error(f"no frozen rlvr_plan.json under {run}; if the initial setup failed, "
+                             "keep that attempt and start with a new --runs-root or smoke --tag")
             cmd = [py, TOOLS / "train_rlvr.py", "--output", run, "--resume"]
         elif method in stages:
             frozen = load_run_config(run)
@@ -191,11 +194,17 @@ def launch(args, parser):
         "budget.gad_steps": total - steps_per_pass, "budget.gad_new_steps": total - steps_per_pass,
         "budget.rlvr_steps": total, "budget.rlvr_eval_steps": list(range(steps_per_pass, total + 1, steps_per_pass)),
     })
+    if not args.smoke and args.epochs == 3 and method in stages:
+        # Freeze GAD's milestone even for --warmup-only, so --resume retains it.
+        stage = "seqkd" if method == "seqkd" else "gad"
+        cfg.data[f"resources.checkpoint_steps.{stage}"] = [2 * steps_per_pass]
     if joint:
         model = JUDGE_MODELS[args.judge_model]
         cfg.data.update({
             "rubric.process_sampling.max_unique_per_global_minibatch": args.prompt_batch,
             "rubric.judge.concurrency": args.judge_concurrency,
+            "resources.judge_max_num_seqs": args.judge_max_seqs,
+            "resources.judge_enforce_eager": args.judge_execution == "eager",
             "rubric.judge.model": model, "rubric.judge.tokenizer_path": str(model_root / model),
         })
         if args.judge_model == "30b-instruct":
@@ -203,6 +212,8 @@ def launch(args, parser):
                 "rubric.judge.enable_thinking": False, "rubric.judge.reasoning_parser": None,
                 "rubric.judge.base_url": "http://127.0.0.1:8153/v1",
                 "rubric.judge.max_output_tokens": 128,
+                "rubric.judge.temperature": 0.0, "rubric.judge.top_p": 1.0,
+                "rubric.judge.top_k": -1, "rubric.judge.min_p": 0.0,
                 "rubric.prompt": str(ROOT / "rubric/prompts/judge_math_process_direct_v1_instruct.txt"),
             })
         if args.judge_protocol == "direct_brief_v1":
@@ -274,7 +285,8 @@ def launch(args, parser):
         print(output)
         return
     if method != "judge" and not args.dry_run and run.exists():
-        parser.error(f"{run} already exists; use --resume, a new smoke tag, or a different --runs-root")
+        parser.error(f"{run} already exists; use --resume to retry its frozen config, "
+                     "or choose a new --runs-root or smoke --tag for changed settings")
 
     # Actual launches keep their resolved input (also for RLVR); plans and
     # service control need a config only for the lifetime of the subprocess.
@@ -323,6 +335,10 @@ def main():
     p.add_argument("--judge-gpus", type=gpu_list, default="4", help="dedicated physical indices, TP = count")
     p.add_argument("--judge-memory", type=float, default=.70, help="vLLM memory fraction on dedicated Judge cards")
     p.add_argument("--judge-concurrency", type=positive_int, default=8, help="concurrent client requests to the Judge")
+    p.add_argument("--judge-max-seqs", type=positive_int, default=16,
+                   help="maximum sequences scheduled together by the Judge vLLM server (default: 16)")
+    p.add_argument("--judge-execution", choices=("eager", "graph"), default="eager",
+                   help="Judge execution (default: eager); graph enables vLLM hybrid CUDA Graph/eager execution")
     p.add_argument("--kv", type=float, default=.40, help="student vLLM memory fraction")
     p.add_argument("--max-seqs", type=positive_int, default=128)
     p.add_argument("--rollout-batched-tokens", type=positive_int, help="student vLLM max tokens scheduled per iteration")

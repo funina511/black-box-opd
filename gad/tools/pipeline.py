@@ -351,6 +351,9 @@ def build_overrides(cfg: Config, stage: str, *, model_path: str, critic_path: st
     ]
     backend = backend_path(cfg, stage)
     backend_config = backend / "verl/trainer/config/ppo_trainer.yaml"
+    milestones = cfg.checkpoint_steps(stage)
+    if milestones:
+        overrides.append(f"trainer.checkpoint_steps={json.dumps(milestones, separators=(',', ':'))}")
     if (backend / ".gad_backend_used").exists() and "validation_rouge_l_enabled" not in backend_config.read_text():
         overrides = [a for a in overrides if not a.startswith("trainer.validation_rouge_l_enabled=")]
     # RetentionMonitor rotates whole checkpoints and can preserve exported models.
@@ -459,6 +462,13 @@ def plan_stage(cfg: Config, run_dir: Path, stage: str, *, steps_per_epoch_value:
         added_steps = stage_step_budget(cfg, stage, steps_per_epoch_value)
         total_steps = added_steps
         epochs = epochs_for(total_steps, steps_per_epoch_value)
+    checkpoint_steps = cfg.checkpoint_steps(stage)
+    if any(step <= start_step or step > total_steps for step in checkpoint_steps):
+        raise PipelineError(f"{stage} checkpoint steps {checkpoint_steps} must be in {start_step + 1}..{total_steps}")
+    if checkpoint_steps and (backend / ".gad_backend_used").exists():
+        trainer_config = backend / "verl/trainer/config/ppo_trainer.yaml"
+        if "  checkpoint_steps: []" not in trainer_config.read_text():
+            raise PipelineError(f"{stage} backend predates checkpoint milestones; prepare a new backends.root")
     epoch_budget = cfg.stage_epochs(stage)
 
     override = cfg.get(f"budget.epochs_override.{stage}")
@@ -544,6 +554,7 @@ def plan_stage(cfg: Config, run_dir: Path, stage: str, *, steps_per_epoch_value:
         "total_steps": total_steps,
         "epochs": epochs,
         "epoch_budget": epoch_budget,
+        "checkpoint_steps": checkpoint_steps,
         "steps_per_epoch": steps_per_epoch_value,
         "resume": resume or {"requested": False, "mode": "fresh", "from_step": None},
         'warmup_handoff':handoff_identity(cfg,run_dir) if stage=='gad' else None,
@@ -570,12 +581,18 @@ def verify_stage_artifacts(stage: str, out_dir: Path, *, expected_step: int | No
                            math_metrics_reason: str = "",
                            require_final_full: bool = False, full_count: int | None = None,
                            strict_evaluation: bool = False, extensions_required: bool = False,
-                           world_size: int | None = None) -> dict:
+                           world_size: int | None = None, checkpoint_steps=()) -> dict:
     roles = ("actor",) if stage == "seqkd" else ("actor", "critic")
     steps = checkpoint_dirs(out_dir)
     last_step, last_dir = steps[-1] if steps else (None, None)
     checkpoint_problems = verify_checkpoint_dir(last_dir, roles=roles, extensions_required=extensions_required,
                                                world_size=world_size) if last_dir else [f"{out_dir}: no global_step_* checkpoint was written"]
+    for step in checkpoint_steps:
+        if last_step is not None and step < last_step:
+            checkpoint = out_dir / f"global_step_{step}"
+            problems = verify_checkpoint_dir(checkpoint, roles=roles, extensions_required=extensions_required,
+                                             world_size=world_size)
+            checkpoint_problems.extend(f"required milestone {step}: {problem}" for problem in problems)
     training_problems = list(checkpoint_problems)
     if expected_step is not None and last_step != expected_step:
         training_problems.append(f"last checkpoint is global_step_{last_step} but the budget requires global_step_{expected_step}")
@@ -823,7 +840,8 @@ def _stage_signature(cfg: Config, stage: str, *, legacy: bool, handoff_identity:
                 "run.resume_worker_state",
                 "data.val_batch_size", "data.teacher_index", "data.manifest",
                 "backends.source_repo", "backends.root", "validation.scorer_path"}
-    excluded.update({"run.max_stage_steps", "run.wandb_mode", "execution.warmup_forward_diagnostics"})
+    excluded.update({"run.max_stage_steps", "run.wandb_mode", "execution.warmup_forward_diagnostics",
+                     "resources.checkpoint_steps.gad", "resources.checkpoint_steps.seqkd"})
     excluded.update(key for key in ('models.actor_param_offload','models.actor_optimizer_offload',
         'models.critic_param_offload','models.critic_optimizer_offload',
         'models.actor_gradient_checkpointing','models.critic_gradient_checkpointing') if cfg.get(key) is None)
@@ -1024,6 +1042,7 @@ def recover_completed_stage(cfg: Config, run_dir: Path, stage: str) -> tuple[boo
                                  for k in ("train_file_sha256", "train_rows")):
         return False, "historical training data digest differs"
     verification = verify_stage_artifacts(stage, stage_out_dir(cfg, run_dir, stage),
+        checkpoint_steps=cfg.checkpoint_steps(stage),
         expected_step=current["total_steps"], math_metrics_expected=validation_metrics_expected(cfg)[0],
         require_final_full=bool(cfg.get('validation.final_full')),
         full_count=dataset_rows(cfg.require('data.val_file')) * int(cfg.get('rollout.val_n') or 1),
@@ -1063,6 +1082,7 @@ def check_skip(cfg: Config, run_dir: Path, stage: str) -> tuple[bool, str]:
     start=expected['warmup_handoff']['step'] if stage=='gad' else 0
     target=start+stage_step_budget(cfg,stage,steps_per_epoch(cfg),handoff_step=start)
     verified=verify_stage_artifacts(stage,stage_out_dir(cfg,run_dir,stage),
+        checkpoint_steps=cfg.checkpoint_steps(stage),
         expected_step=target,
         math_metrics_expected=validation_metrics_expected(cfg)[0],
         require_final_full=bool(cfg.get('validation.final_full')),
@@ -1280,6 +1300,7 @@ def run_stage(cfg: Config, run_dir: Path, stage: str, *, dry_run: bool,
     keep_checkpoints = cfg.get("resources.keep_last_checkpoints")
     retention = (
         RetentionMonitor(Path(plan["out_dir"]), keep_checkpoints=int(keep_checkpoints),
+                         checkpoint_steps=cfg.checkpoint_steps(stage),
                          **checkpoint_requirements(cfg, stage))
         if keep_checkpoints is not None else nullcontext()
     )
@@ -1338,6 +1359,7 @@ def finish_stage(cfg: Config, run_dir: Path, stage: str, plan: dict, *, process,
         stage_record_path = run_dir / "reports" / f"resume_complete_{stage}_{stamp}.json"
     verification = verify_stage_artifacts(
         stage, Path(plan["out_dir"]), expected_step=plan["total_steps"],
+        checkpoint_steps=cfg.checkpoint_steps(stage),
         math_metrics_expected=math_expected, math_metrics_reason=math_reason,
         require_final_full=bool(cfg.get("validation.final_full")),
         strict_evaluation=bool(cfg.get("validation.block_training_on_incomplete")),
@@ -1473,7 +1495,12 @@ def print_plan(cfg: Config, run_dir: Path, plans: list[dict], *, steps_per_epoch
         first=max(plan['start_step']+1,0 if plan['stage']=='gad' else int(cfg.get('optim.critic_warmup')))
         actor_calls=max(0,plan['total_steps']-first+1)
         added=plan['added_steps'];batch=int(cfg.get('data.train_batch_size'));n=stage_rollout_n(cfg,plan['stage'])
-        saves=sum(s%int(cfg.get('resources.save_freq'))==0 or s==plan['total_steps'] for s in range(plan['start_step']+1,plan['total_steps']+1)) if cfg.get('resources.save_freq') else 1
+        freq = int(cfg.for_stage(plan['stage']).get('resources.save_freq') or 0)
+        if plan.get('checkpoint_steps'):
+            print(f"  retain steps : {plan['checkpoint_steps']}")
+        special_saves = set(plan.get('checkpoint_steps', ())) | {plan['total_steps']}
+        saves = sum(s in special_saves or (freq > 0 and s % freq == 0)
+                    for s in range(plan['start_step'] + 1, plan['total_steps'] + 1))
         tests=sum(s%int(cfg.get('resources.test_freq'))==0 or (s==plan['total_steps'] and cfg.get('validation.final_full')) for s in range(plan['start_step']+1,plan['total_steps']+1)) if cfg.get('resources.test_freq') else 0
         print(f"  planned calls: actor={actor_calls}, critic={0 if plan['stage']=='seqkd' else added}; "
               f"prompts={batch*added}, online student responses={0 if plan['stage']=='seqkd' else batch*n*added}; saves={saves}, validations={tests}")

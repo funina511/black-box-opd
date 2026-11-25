@@ -68,6 +68,7 @@ def prepare(cfg, run_dir, steps, smoke):
                               epochs=epochs_for(steps, steps_per_epoch(cfg)))
     overrides = {key: value for key, value in (x.split("=", 1) for x in options)
                  if not key.startswith("critic.")}
+    overrides.pop("trainer.checkpoint_steps", None)  # RLVR publishes its own eval_steps.
     # Native FSDP rotation deletes first and saves second. Keep the preceding
     # complete actor available if a later save is interrupted.
     retained = cfg.get("resources.keep_last_checkpoints")

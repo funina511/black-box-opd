@@ -1249,6 +1249,35 @@ class ReferenceOffloadPatch(BackendPatch):
         return ok, [] if ok else [self.FILE+': reference FSDP offload switch missing']
 
 
+class CheckpointStepsPatch(BackendPatch):
+    name = "gad-checkpoint-steps"
+    description = "save extra checkpoints at configured global steps"
+    trainer = "verl/trainer/ppo/ray_trainer.py"
+    config = "verl/trainer/config/ppo_trainer.yaml"
+    milestone = "self.global_steps in self.config.trainer.checkpoint_steps"
+
+    def apply(self, worktree):
+        runner, cfg = worktree / self.trainer, worktree / self.config
+        source, yaml = _read(runner), _read(cfg)
+        changed = False
+        if self.milestone not in source:
+            periodic = "self.config.trainer.save_freq > 0 and (is_last_step or self.global_steps % self.config.trainer.save_freq == 0)"
+            if "if " + periodic + ":" not in source:
+                # prepare_backends may first encounter an unused prior extension build.
+                periodic = "is_last_step or extension_stop or (self.config.trainer.save_freq > 0 and self.global_steps % self.config.trainer.save_freq == 0)"
+            source = replace_once(source, "if " + periodic + ":", f"if {self.milestone} or ({periodic}):", what=self.name)
+            _write(runner, source)
+            changed = True
+        if "  checkpoint_steps: []" not in yaml:
+            _write(cfg, insert_after(yaml, "trainer:\n", "  checkpoint_steps: []\n", what=self.name))
+            changed = True
+        return PatchResult(self.name, changed, [self.trainer, self.config])
+
+    def verify(self, worktree):
+        ok = self.milestone in _read(worktree / self.trainer) and "  checkpoint_steps: []" in _read(worktree / self.config)
+        return ok, [] if ok else ["checkpoint scheduling support missing"]
+
+
 class LearningRateLoggingPatch(BackendPatch):
     name='gad-learning-rate-logging'
     FILE='verl/utils/logger/aggregate_logger.py'
@@ -1324,6 +1353,7 @@ ALL_PATCHES: tuple[BackendPatch, ...] = (
     VllmEngineLimitsPatch(),
     ReferenceOffloadPatch(),
     LearningRateLoggingPatch(),
+    CheckpointStepsPatch(),
 )
 
 
